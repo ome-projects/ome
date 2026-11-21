@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -59,21 +60,6 @@ func TestInstanceMeetsThreshold(t *testing.T) {
 					tt.observed, tt.sat, tt.desired, got, tt.want)
 			}
 		})
-	}
-}
-
-// TestDesiredFor pins the lookup-with-fallback semantic: present in the
-// map → use the value; absent (or nil map) → fall back to observed.
-func TestDesiredFor(t *testing.T) {
-	m := map[int32]int32{0: 2, 1: 3}
-	if got := status.DesiredFor(m, 0, 7); got != 2 {
-		t.Errorf("present: got %d want 2", got)
-	}
-	if got := status.DesiredFor(m, 99, 7); got != 7 {
-		t.Errorf("absent: got %d want fallback 7", got)
-	}
-	if got := status.DesiredFor(nil, 0, 7); got != 7 {
-		t.Errorf("nil map: got %d want fallback 7", got)
 	}
 }
 
@@ -515,10 +501,11 @@ func TestReachedDesiredShape(t *testing.T) {
 }
 
 // TestCountAvailablePods_MinReadySecondsWindow pins the Available counter's
-// two inputs — EndpointSlice rotation membership always, and the Ready-age
-// window only when the Component sets minReadySeconds — and the wake it
-// reports: the remaining window of the earliest in-rotation pod still inside
-// it, nothing once every such pod is Available or when no window applies.
+// three inputs — EndpointSlice rotation membership and the pod's Ready
+// condition always, and the Ready-age window only when the Component sets
+// minReadySeconds — and the wake it reports: the remaining window of the
+// earliest in-rotation pod still inside it, nothing once every such pod is
+// Available or when no window applies.
 func TestCountAvailablePods_MinReadySecondsWindow(t *testing.T) {
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
 	readyPod := func(name string, readyAt time.Time) *corev1.Pod {
@@ -538,7 +525,14 @@ func TestCountAvailablePods_MinReadySecondsWindow(t *testing.T) {
 	inRotation := map[string]struct{}{aged.Name: {}, fresh.Name: {}}
 
 	if got, wake := status.CountAvailablePods(pods, inRotation, status.AvailabilityWindow{Now: now}); got != 2 || wake != 0 {
-		t.Fatalf("zero window: got %d/%s want 2/0s (rotation membership alone, nothing pending)", got, wake)
+		t.Fatalf("zero window: got %d/%s want 2/0s (the two Ready pods in rotation, nothing pending)", got, wake)
+	}
+	// A headless Service that publishes not-ready addresses lists a pod
+	// that is not Ready; membership does not make it Available.
+	starting := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "starting"}}
+	listed := map[string]struct{}{aged.Name: {}, starting.Name: {}}
+	if got, wake := status.CountAvailablePods([]*corev1.Pod{aged, starting}, listed, status.AvailabilityWindow{Now: now}); got != 1 || wake != 0 {
+		t.Fatalf("zero window, listed pod not Ready: got %d/%s want 1/0s (only the Ready pod)", got, wake)
 	}
 	window := status.AvailabilityWindow{MinReadySeconds: 20, Now: now}
 	if got, wake := status.CountAvailablePods(pods, inRotation, window); got != 1 || wake != 15*time.Second {
@@ -658,13 +652,13 @@ func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
 	leader := servingPod("engine-0-leader-0")
 	worker := servingPod("engine-0-worker-0")
 	gang := []*corev1.Pod{leader, worker}
-	desired := map[int32]int32{0: 2}
+	plan := fixture.PlanWithDesiredPods(map[int32]int32{0: 2})
 
 	whole, _ := status.CountersForInstance(gang, map[string]struct{}{leader.Name: {}, worker.Name: {}}, status.AvailabilityWindow{}, nil)
 	if whole.PodCount != 2 || whole.ServingPodCount != 2 || whole.AvailablePodCount != 2 {
 		t.Fatalf("whole gang: %s, want pods=2 serving=2 available=2", whole)
 	}
-	if !status.InstanceMeetsThreshold(whole.PodCount, whole.ServingPodCount, status.DesiredFor(desired, 0, whole.PodCount)) {
+	if !status.InstanceMeetsThreshold(whole.PodCount, whole.ServingPodCount, plan.DesiredPodsFor(0, whole.PodCount)) {
 		t.Fatalf("the whole gang is short of the serving threshold, want a serving Instance")
 	}
 
@@ -682,7 +676,7 @@ func TestCountServingPods_ExcludesAMemberLeavingTheGang(t *testing.T) {
 	if leaving.AvailablePodCount != 1 {
 		t.Fatalf("AvailablePodCount = %d, want 1", leaving.AvailablePodCount)
 	}
-	if status.InstanceMeetsThreshold(leaving.PodCount, leaving.ServingPodCount, status.DesiredFor(desired, 0, leaving.PodCount)) {
+	if status.InstanceMeetsThreshold(leaving.PodCount, leaving.ServingPodCount, plan.DesiredPodsFor(0, leaving.PodCount)) {
 		t.Fatalf("a gang with a member leaving meets the serving threshold, want no serving Instance")
 	}
 }
@@ -781,9 +775,9 @@ func TestCountServingPods_ReadsAGangWithoutItsLeaderAsServingNothing(t *testing.
 	// Component applies to them follow the same rule: a gang with its leader
 	// gone is as far out of rotation as one with no pod at all, and a gang
 	// with a worker gone is short of its desired count as before.
-	desired := map[int32]int32{0: 8}
+	plan := fixture.PlanWithDesiredPods(map[int32]int32{0: 8})
 	serving := func(c status.InstanceCounters) bool {
-		return status.InstanceMeetsThreshold(c.PodCount, c.ServingPodCount, status.DesiredFor(desired, 0, c.PodCount))
+		return status.InstanceMeetsThreshold(c.PodCount, c.ServingPodCount, plan.DesiredPodsFor(0, c.PodCount))
 	}
 	whole, _ := status.CountersForInstance(withLeader(leader(), workers(7)), nil, status.AvailabilityWindow{}, nil)
 	if whole.PodCount != 8 || whole.ServingPodCount != 8 || !serving(whole) {

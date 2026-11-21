@@ -572,13 +572,100 @@ func TestUpdateEntryStamps_OpenANewAttemptOverAParkedOne(t *testing.T) {
 	}
 
 	w = newRowWriter(parked())
-	if err := StampUpdatingInPlace(context.Background(), w.input(now), 0, "rev-b", types.UpdateStrategyInPlaceIfPossible, time.Hour); err != nil {
-		t.Fatal(err)
+	read := parked()
+	if entry, err := StampUpdatingInPlace(context.Background(), w.input(now), 0, "rev-b", types.UpdateStrategyInPlaceIfPossible, time.Hour, &read); err != nil || !entry.Open || !entry.Began {
+		t.Fatalf("in-place entry: %+v err=%v, want the attempt opened and reported as begun", entry, err)
 	}
 	row = w.rows[0]
 	if row.Operation == nil || row.Operation.ID == "update-0-1" || row.Operation.Waiting != "" ||
 		row.Operation.Deadline.IsZero() || row.Operation.Step != types.UpdateStepInPlace {
 		t.Fatalf("in-place over a parked attempt = %+v, want a fresh attempt with its own deadline", row)
+	}
+}
+
+// The in-place entry opens a new attempt only on a row that still reads as
+// the pass's copy of it does. A pass that read the row mid-roll, or before
+// its roll began, and finds it finished on the target opens nothing; so
+// does a pass that finds the row taken by another operation, or opened
+// toward another revision, since. A row already rolling toward the pass's
+// target goes on whatever the copy reads, with nothing written. The entry
+// reports a start as begun only from the write that takes a row no update
+// owned into the roll: a pass behind that write goes on and reports no
+// second start.
+func TestInPlaceEntry_OpensANewAttemptOnlyOnTheRowThePassRead(t *testing.T) {
+	now := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
+	before := types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "rev-a"}
+	midRoll := types.InstanceStatus{
+		Index: 0, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "rev-a", TargetRevision: "rev-b",
+		Operation: &types.InstanceOperation{ID: "update-0-1", Type: types.InstanceOperationUpdate, Step: types.UpdateStepInPlace, TargetRevision: "rev-b", Strategy: types.UpdateStrategyInPlaceIfPossible},
+	}
+	finished := types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "rev-b"}
+	repaired := types.InstanceStatus{
+		Index: 0, Incarnation: 2, Phase: types.InstancePhaseRestarting, RunningRevision: "rev-a",
+		Operation: &types.InstanceOperation{ID: "restart-0-1", Type: types.InstanceOperationRestart, Step: types.RestartStepDrain},
+	}
+	elsewhere := types.InstanceStatus{
+		Index: 0, Incarnation: 1, Phase: types.InstancePhaseUpdating, RunningRevision: "rev-a", TargetRevision: "rev-c",
+		Operation: &types.InstanceOperation{ID: "update-0-2", Type: types.InstanceOperationUpdate, Step: types.UpdateStepInPlace, TargetRevision: "rev-c", Strategy: types.UpdateStrategyInPlaceIfPossible},
+	}
+	cases := []struct {
+		name       string
+		read, live types.InstanceStatus
+		want       InPlaceEntry
+		wantWrite  bool
+	}{
+		{name: "the row as the pass read it opens the attempt", read: before, live: before, want: InPlaceEntry{Open: true, Began: true}, wantWrite: true},
+		{name: "a later pass of the attempt finds it open", read: midRoll, live: midRoll, want: InPlaceEntry{Open: true}},
+		{name: "a row read mid-roll and finished since is left alone", read: midRoll, live: finished},
+		{name: "a row read before its roll and finished since is left alone", read: before, live: finished},
+		{name: "a row read before its roll and rolling toward the target since goes on with no second start", read: before, live: midRoll, want: InPlaceEntry{Open: true}},
+		{name: "a row a repair took since is left alone", read: before, live: repaired},
+		{name: "a row opened toward another revision since is left alone", read: before, live: elsewhere},
+		{name: "a row read rolling toward another revision opens the attempt toward this one", read: elsewhere, live: elsewhere, want: InPlaceEntry{Open: true}, wantWrite: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newRowWriter(tc.live)
+			entry, err := StampUpdatingInPlace(context.Background(), w.input(now), 0, "rev-b", types.UpdateStrategyInPlaceIfPossible, time.Hour, &tc.read)
+			if err != nil || entry != tc.want || (w.writes == 1) != tc.wantWrite {
+				t.Fatalf("entry=%+v err=%v writes=%d, want %+v and a write=%v", entry, err, w.writes, tc.want, tc.wantWrite)
+			}
+			if row := w.rows[0]; !tc.wantWrite && !Capture(&tc.live).Matches(row) {
+				t.Fatalf("the live row moved to %+v; want it left as it was", row)
+			}
+		})
+	}
+}
+
+// A refused in-place entry starts nothing on the target's RetryBlock. The
+// row was left as it is and no attempt opened, so a block in Backoff that
+// has come due stays in Backoff for the attempt a later pass opens.
+func TestInPlaceEntry_ARefusedEntryStartsNoAttemptOnTheRetryBlock(t *testing.T) {
+	const target = "rev-b"
+	now := time.Date(2026, time.September, 21, 0, 0, 0, 0, time.UTC)
+	read := types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "rev-a"}
+	live := types.InstanceStatus{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: target}
+	due := metav1.NewTime(now.Add(-time.Second))
+	failed := metav1.NewTime(now.Add(-time.Minute))
+	block := types.RetryBlock{TargetRevision: target, State: types.RetryBlockBackoff, AttemptsStarted: 1,
+		NextRetryAt: &due, FirstFailureAt: &failed, LastFailureAt: &failed}
+	in := types.ReconcileInput{
+		Clock: clocktesting.NewFakeClock(now),
+		MutateInstance: func(_ context.Context, _ int32, mutate func(*types.InstanceStatus) bool) error {
+			mutate(&live)
+			return nil
+		},
+		MutateRetryBlock: func(_ context.Context, _ string, mutate func(*types.RetryBlock) types.RetryBlockDisposition) error {
+			mutate(&block)
+			return nil
+		},
+	}
+	entry, err := StampUpdatingInPlace(context.Background(), in, 0, target, types.UpdateStrategyInPlaceIfPossible, time.Hour, &read)
+	if err != nil || entry.Open {
+		t.Fatalf("entry=%+v err=%v, want the entry refused", entry, err)
+	}
+	if block.State != types.RetryBlockBackoff {
+		t.Fatalf("the refused entry moved the target's RetryBlock to %s, want it left in Backoff", block.State)
 	}
 }
 
@@ -676,17 +763,18 @@ func TestEntryStamps_LadderFlipFollowsTheAttempt(t *testing.T) {
 	stamps := []struct {
 		name  string
 		step  string
-		stamp func(types.ReconcileInput) error
+		stamp func(in types.ReconcileInput, read *types.InstanceStatus) error
 	}{
-		{name: "surge", step: types.UpdateStepSurge, stamp: func(in types.ReconcileInput) error {
+		{name: "surge", step: types.UpdateStepSurge, stamp: func(in types.ReconcileInput, _ *types.InstanceStatus) error {
 			return StampSurging(context.Background(), in, 0, target, types.UpdateStrategySurgeThenDrain, time.Hour)
 		}},
-		{name: "recreate", step: types.UpdateStepDrain, stamp: func(in types.ReconcileInput) error {
+		{name: "recreate", step: types.UpdateStepDrain, stamp: func(in types.ReconcileInput, _ *types.InstanceStatus) error {
 			_, err := StampRecreating(context.Background(), in, 0, target, "revision rev-a -> rev-b", types.UpdateStrategyRecreatePod, time.Hour, false)
 			return err
 		}},
-		{name: "in-place", step: types.UpdateStepInPlace, stamp: func(in types.ReconcileInput) error {
-			return StampUpdatingInPlace(context.Background(), in, 0, target, types.UpdateStrategyInPlaceIfPossible, time.Hour)
+		{name: "in-place", step: types.UpdateStepInPlace, stamp: func(in types.ReconcileInput, read *types.InstanceStatus) error {
+			_, err := StampUpdatingInPlace(context.Background(), in, 0, target, types.UpdateStrategyInPlaceIfPossible, time.Hour, read)
+			return err
 		}},
 	}
 	cases := []struct {
@@ -731,7 +819,8 @@ func TestEntryStamps_LadderFlipFollowsTheAttempt(t *testing.T) {
 					},
 				}
 
-				if err := st.stamp(in); err != nil {
+				read := row
+				if err := st.stamp(in, &read); err != nil {
 					t.Fatalf("stamp: %v", err)
 				}
 				if flipped := block.State == types.RetryBlockRetryInProgress; flipped != tc.wantFlip {

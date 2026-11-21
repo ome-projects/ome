@@ -252,9 +252,10 @@ type ReconcileInput struct {
 	// Nil is treated as always-allowed.
 	DrainGate func(sourcePods []string) (allowed bool, gate RolloutHoldGate, denyReason string)
 
-	// DrainHolds receives the holds DrainGate produced this pass; the
-	// dispatcher allocates it before the Update pass and reports the first
-	// one through RecordRolloutHold.
+	// DrainHolds receives the holds DrainGate produced this pass, and the
+	// hold of an in-place start not made on a copy of the row older than
+	// the row; the dispatcher allocates it before the Update pass and
+	// reports the first one through RecordRolloutHold.
 	DrainHolds *DrainHolds
 
 	// PauseNewSurge holds fresh migration reservations while an external
@@ -349,6 +350,16 @@ type ReconcileInput struct {
 	// (lifecycle.abandonedReplacementGracePeriod); zero or negative leaves
 	// every abandoned replacement its own grace.
 	AbandonedReplacementGrace time.Duration
+
+	// GangRestartGrace is the termination grace a Restart gives the old
+	// pods of a multi-pod Instance it rebuilds. The restart has already
+	// taken them out of traffic, and without the member the gang lost they
+	// cannot finish the requests they hold. Their own
+	// terminationGracePeriodSeconds would only keep the rebuilt pods, which
+	// reuse their names, waiting. Operator config
+	// (lifecycle.gangRestartGracePeriod); zero or negative leaves every old
+	// pod its own grace.
+	GangRestartGrace time.Duration
 
 	// MigrationAudit bounds migration admission against the owner's
 	// migration records. nil = unconfigured → a request is held until

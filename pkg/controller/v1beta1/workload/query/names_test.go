@@ -2,28 +2,30 @@ package query
 
 import (
 	"fmt"
+	"math"
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation"
 
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
-// TestPodHostname covers the per-incarnation pod hostname: the plain
-// <pod-name>-i<incarnation> form within the DNS-label limit, the bounded
-// {hash}-{suffix} form beyond it, and cross-incarnation distinctness in
-// both regimes — the property that keeps a rebuilt Instance's peer DNS
-// from resolving to the previous incarnation's pods.
+// TestPodHostname covers the pod hostname that carries the recreation
+// count: the plain <pod-name>-i<count> form within the DNS label limit, the
+// bounded {hash}-{suffix} form beyond it, and distinct hostnames per
+// rebuild in both forms, which keeps a rebuilt Instance's peer DNS off the
+// pods of the previous build.
 func TestPodHostname(t *testing.T) {
 	const max = validation.DNS1123LabelMaxLength // 63
 
-	short1 := PodHostname("llama-70b-engine-0-leader-0", 1)
-	if short1 != "llama-70b-engine-0-leader-0-i1" {
-		t.Errorf("short name: got %q want llama-70b-engine-0-leader-0-i1", short1)
+	short1 := PodHostname("example-engine-0-leader-0", 1)
+	if want := "example-engine-0-leader-0-i1"; short1 != want {
+		t.Errorf("short name: got %q want %q", short1, want)
 	}
-	if short2 := PodHostname("llama-70b-engine-0-leader-0", 2); short2 == short1 {
-		t.Errorf("short names of two incarnations collide at %q", short1)
+	if short2 := PodHostname("example-engine-0-leader-0", 2); short2 == short1 {
+		t.Errorf("short names of two rebuilds collide at %q", short1)
 	}
 
 	longPod := strings.Repeat("a", 49) + "-engine-0-leader-0" // 67 chars, over the limit
@@ -32,10 +34,81 @@ func TestPodHostname(t *testing.T) {
 		t.Errorf("long name: got %d chars %q, want exactly %d", len(long1), long1, max)
 	}
 	if errs := validation.IsDNS1123Label(long1); len(errs) > 0 {
-		t.Errorf("long name %q is not a DNS1123 label: %v", long1, errs)
+		t.Errorf("long name %q is not a DNS label: %v", long1, errs)
 	}
 	if long2 := PodHostname(longPod, 2); long2 == long1 {
-		t.Errorf("truncated names of two incarnations collide at %q", long1)
+		t.Errorf("bounded names of two rebuilds collide at %q", long1)
+	}
+}
+
+// TestReadPodSetHostnames covers the reading of what a pod set's live pods
+// answer to, through the hostname the reading gives a pod made beside them
+// under a row at recreation count 7. A live leader or worker that answers
+// to its pod name gives the pod name. One whose hostname ends in a count
+// gives that count, whatever count its own label names, in the plain and
+// in the bounded form. A terminal pod, a single-pod Instance's pod and a
+// hostname PodHostname did not write say nothing, and with nothing read
+// the hostname carries the row's count. Where live pods disagree, the
+// first by name decides, in either order.
+func TestReadPodSetHostnames(t *testing.T) {
+	const (
+		leader   = "example-engine-0-leader-0"
+		worker   = "example-engine-0-worker-0"
+		made     = "example-engine-0-worker-1" // the pod made beside the others
+		rowCount = 7
+	)
+	pod := func(name, hostname, countLabel string, phase corev1.PodPhase) *corev1.Pod {
+		p := &corev1.Pod{}
+		p.Name = name
+		p.Spec.Hostname = hostname
+		p.Status.Phase = phase
+		p.Labels = map[string]string{LabelRunner: workload.RunnerLeader}
+		if countLabel != "" {
+			p.Labels[LabelInstanceIncarnation] = countLabel
+		}
+		return p
+	}
+	singlePod := pod(leader, leader, "2", corev1.PodRunning)
+	singlePod.Labels[LabelRunner] = workload.RunnerDefault
+	longName := strings.Repeat("a", 49) + "-engine-0-leader-0" // 67 chars, so its hostname is bounded
+	atRowCount := PodHostname(made, rowCount)
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+		want string
+	}{
+		{name: "no pod", want: atRowCount},
+		{name: "a nil entry", pods: []*corev1.Pod{nil}, want: atRowCount},
+		{name: "a running pod answers to its pod name", pods: []*corev1.Pod{pod(leader, leader, "7", corev1.PodRunning)}, want: made},
+		{name: "a pending pod answers to its pod name", pods: []*corev1.Pod{pod(leader, leader, "7", corev1.PodPending)}, want: made},
+		{name: "a pod of an earlier count answers to its pod name", pods: []*corev1.Pod{pod(leader, leader, "6", corev1.PodRunning)}, want: made},
+		{name: "the hostname carries the row's count", pods: []*corev1.Pod{pod(leader, PodHostname(leader, 7), "7", corev1.PodRunning)}, want: atRowCount},
+		{name: "the hostname carries an earlier count, as the label does", pods: []*corev1.Pod{pod(leader, PodHostname(leader, 6), "6", corev1.PodRunning)}, want: PodHostname(made, 6)},
+		{name: "the hostname carries an earlier count than the label", pods: []*corev1.Pod{pod(leader, PodHostname(leader, 6), "7", corev1.PodRunning)}, want: PodHostname(made, 6)},
+		{name: "the hostname carries a count and the label names none", pods: []*corev1.Pod{pod(leader, PodHostname(leader, 3), "", corev1.PodRunning)}, want: PodHostname(made, 3)},
+		{name: "the hostname is bounded", pods: []*corev1.Pod{pod(longName, PodHostname(longName, 4), "4", corev1.PodRunning)}, want: PodHostname(made, 4)},
+		{name: "the hostname carries the largest count", pods: []*corev1.Pod{pod(leader, PodHostname(leader, math.MaxInt64), "1", corev1.PodRunning)}, want: PodHostname(made, math.MaxInt64)},
+		{name: "the pod failed", pods: []*corev1.Pod{pod(leader, leader, "7", corev1.PodFailed)}, want: atRowCount},
+		{name: "the pod succeeded", pods: []*corev1.Pod{pod(leader, PodHostname(leader, 6), "6", corev1.PodSucceeded)}, want: atRowCount},
+		{name: "the pod is a single-pod Instance's", pods: []*corev1.Pod{singlePod}, want: atRowCount},
+		{name: "the pod has no hostname", pods: []*corev1.Pod{pod(leader, "", "6", corev1.PodRunning)}, want: atRowCount},
+		{name: "the hostname is another pod's", pods: []*corev1.Pod{pod(leader, PodHostname(worker, 6), "6", corev1.PodRunning)}, want: atRowCount},
+		{name: "the hostname spells its count another way", pods: []*corev1.Pod{pod(leader, leader+"-i06", "6", corev1.PodRunning)}, want: atRowCount},
+		{name: "live pods disagree, the leader listed first", pods: []*corev1.Pod{
+			pod(leader, PodHostname(leader, 6), "6", corev1.PodRunning), pod(worker, worker, "7", corev1.PodRunning),
+		}, want: PodHostname(made, 6)},
+		{name: "live pods disagree, the leader listed last", pods: []*corev1.Pod{
+			pod(worker, worker, "7", corev1.PodRunning), pod(leader, PodHostname(leader, 6), "6", corev1.PodRunning),
+		}, want: PodHostname(made, 6)},
+		{name: "the first pod by name says nothing", pods: []*corev1.Pod{
+			pod(leader, "", "6", corev1.PodRunning), pod(worker, PodHostname(worker, 6), "6", corev1.PodRunning),
+		}, want: PodHostname(made, 6)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := ReadPodSetHostnames(tc.pods).Hostname(made, rowCount); got != tc.want {
+				t.Errorf("a pod made beside these gets hostname %q, want %q", got, tc.want)
+			}
+		})
 	}
 }
 
@@ -148,6 +221,47 @@ func TestPodGroupName_Bounded(t *testing.T) {
 	// tail includes the index).
 	if other := PodGroupName(longIsvc, workload.ComponentEngine, 13); other == b1 {
 		t.Errorf("distinct instance indices produced identical bounded names: %q", b1)
+	}
+}
+
+// TestKueuePodGroupName checks the Kueue pod-group name: one group per build of
+// an Instance, a valid label value of at most 63 characters, and distinct
+// names for distinct Instances and builds of the same long owner.
+func TestKueuePodGroupName(t *testing.T) {
+	const max = validation.LabelValueMaxLength
+
+	if got, want := KueuePodGroupName("example-model", workload.ComponentEngine, 3, 2), "example-model-engine-3-2"; got != want {
+		t.Errorf("short Kueue pod-group name = %q, want %q", got, want)
+	}
+	if KueuePodGroupName("example-model", workload.ComponentEngine, 3, 2) == KueuePodGroupName("example-model", workload.ComponentEngine, 3, 3) {
+		t.Error("a rebuilt Instance kept the Kueue pod-group name of its previous build")
+	}
+	if KueuePodGroupName("example-model", workload.ComponentEngine, 3, 1) == PodGroupName("example-model", workload.ComponentEngine, 3) {
+		t.Error("the Kueue pod-group name must differ from the scheduler PodGroup name")
+	}
+
+	longIsvc := strings.Repeat("x", 70)
+	bounded := KueuePodGroupName(longIsvc, workload.ComponentDecoder, 12, 4)
+	if len(bounded) > max {
+		t.Errorf("bounded Kueue pod-group name has %d chars, want <= %d", len(bounded), max)
+	}
+	if errs := validation.IsValidLabelValue(bounded); len(errs) > 0 {
+		t.Errorf("bounded Kueue pod-group name %q is not a valid label value: %v", bounded, errs)
+	}
+	// Kueue names the group's Workload after the group.
+	if errs := validation.IsDNS1123Subdomain(bounded); len(errs) > 0 {
+		t.Errorf("bounded Kueue pod-group name %q is not a valid Workload name: %v", bounded, errs)
+	}
+	if bounded != KueuePodGroupName(longIsvc, workload.ComponentDecoder, 12, 4) {
+		t.Error("KueuePodGroupName is not deterministic")
+	}
+	for _, other := range []string{
+		KueuePodGroupName(longIsvc, workload.ComponentDecoder, 13, 4),
+		KueuePodGroupName(longIsvc, workload.ComponentDecoder, 12, 5),
+	} {
+		if other == bounded {
+			t.Errorf("distinct Instances or builds produced the same bounded name %q", bounded)
+		}
 	}
 }
 

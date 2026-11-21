@@ -13,6 +13,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	fakeclient "sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -77,6 +79,17 @@ func (f *singleMoveFixture) allocation(name string) *v1beta1.CandidateAllocation
 		}
 	}
 	return nil
+}
+
+// refusingMember puts a cluster whose client refuses every read behind the
+// named cluster.
+func (f *singleMoveFixture) refusingMember(name string) {
+	refusing := fakeclient.NewClientBuilder().WithScheme(f.scheme).WithInterceptorFuncs(interceptor.Funcs{
+		Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+			return errors.New("the member refuses the read")
+		},
+	}).Build()
+	f.connections.m[name] = workloadcluster.NewNeverCachingClient(refusing)
 }
 
 // standingMember puts a serving copy of the source on the named cluster.
@@ -162,6 +175,33 @@ var singleMoveRows = []singleMoveRow{
 			member(want, "member-a", func(a *v1beta1.CandidateAllocationStatus) { a.Matched = true; keepsPlacement(a) })
 			member(want, "member-b", noTarget)
 			member(want, "member-c", noTarget)
+		},
+	},
+	{
+		name: "a selected chosen cluster whose copy is gone is given a fresh target",
+		edit: func(_ *testing.T, f *singleMoveFixture) {
+			f.standing.matches["member-a"] = true
+			f.standing.members = map[string]memberObservation{"member-a": {state: memberAbsent}}
+			f.eligible = append(f.eligible, "member-a")
+		},
+		want: func(_ *singleMoveFixture, want *plan.Proposal) {
+			want.SingleMove.Selected = "member-a"
+			member(want, "member-a", func(a *v1beta1.CandidateAllocationStatus) {
+				a.Matched = true
+				a.CurrentReplicas, a.CurrentHome = 0, nil
+				a.DesiredReplicas, a.DesiredHome = 3, minimumOf(want.InputDigest, 3)
+			})
+			member(want, "member-b", noTarget)
+			member(want, "member-c", noTarget)
+		},
+	},
+	{
+		name: "a cluster whose resolution fails keeps its target and stays pending",
+		edit: func(_ *testing.T, f *singleMoveFixture) { f.refusingMember("member-b") },
+		want: func(_ *singleMoveFixture, want *plan.Proposal) {
+			member(want, "member-b", func(a *v1beta1.CandidateAllocationStatus) {
+				a.HomeInputsPending, a.DesiredHome = true, minimumOf("intent", 3)
+			})
 		},
 	},
 	{

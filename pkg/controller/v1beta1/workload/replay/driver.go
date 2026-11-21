@@ -11,6 +11,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	discoveryv1 "k8s.io/api/discovery/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	k8stypes "k8s.io/apimachinery/pkg/types"
@@ -124,6 +125,9 @@ type driver struct {
 	// recordedTarget is the spec target the last tick reported as the
 	// owner's update revision, which is what the owner's status names.
 	recordedTarget string
+	// rollTarget is the revision the last pass rolled toward: the spec
+	// target, or the revision a rollback names.
+	rollTarget string
 
 	// quiet suppresses effect recording while the driver itself is
 	// staging a scenario event.
@@ -146,9 +150,9 @@ type driver struct {
 	// wrote onto each row from that pass's pod observation; the engine
 	// reads it on the rows at the start of the next pass.
 	published map[int32]publishedCounters
-	// desiredPodsByInstance is the pass's desired pod count per Instance,
-	// which the stand-in group gate counts serving Instances against.
-	desiredPodsByInstance map[int32]int32
+	// plan is the pass's plan, whose desired pod count per Instance the
+	// stand-in group gate counts serving Instances against.
+	plan types.ComponentPlan
 	// migrationRequests counts the requests the scenario has made, so an
 	// unnamed one gets a stable identity.
 	migrationRequests int
@@ -382,14 +386,20 @@ func (d *driver) podTemplate(image string) *corev1.PodSpec {
 	if image == "" {
 		image = "registry.example.com/runtime:v1"
 	}
-	return &corev1.PodSpec{
+	template := &corev1.PodSpec{
 		SchedulerName: d.spec.SchedulerName,
 		Containers: []corev1.Container{{
-			Name:  d.containerName(),
-			Image: image,
-			Env:   sortedEnv(d.spec.Env),
+			Name:      d.containerName(),
+			Image:     image,
+			Env:       sortedEnv(d.spec.Env),
+			Resources: corev1.ResourceRequirements{Requests: requestList(d.spec.Requests)},
 		}},
 	}
+	if grace := d.spec.TerminationGracePeriodSeconds; grace != nil {
+		seconds := *grace
+		template.TerminationGracePeriodSeconds = &seconds
+	}
+	return template
 }
 
 // podMeta renders the pod template's own labels and annotations, nil when
@@ -432,6 +442,37 @@ func sortedEnv(env map[string]string) []corev1.EnvVar {
 	return out
 }
 
+// requestList parses the scenario's resource requests for the rendered
+// container. A scenario that sets none renders a container that asks for
+// nothing. Parse and the spec.revision event refuse an amount that is no
+// quantity, so every amount here parses.
+func requestList(requests map[string]string) corev1.ResourceList {
+	if len(requests) == 0 {
+		return nil
+	}
+	out := make(corev1.ResourceList, len(requests))
+	for name, amount := range requests {
+		out[corev1.ResourceName(name)] = resource.MustParse(amount)
+	}
+	return out
+}
+
+// validRequests refuses a resource request whose amount is no quantity,
+// and names the first such resource in name order.
+func validRequests(requests map[string]string) error {
+	names := make([]string, 0, len(requests))
+	for name := range requests {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		if _, err := resource.ParseQuantity(requests[name]); err != nil {
+			return fmt.Errorf("the request for %s is %q, which is no quantity: %w", name, requests[name], err)
+		}
+	}
+	return nil
+}
+
 // desiredSpec projects the driver's mutable spec onto the engine's input.
 func (d *driver) desiredSpec() (types.WorkloadDesiredSpec, error) {
 	strategy := types.UpdateStrategy{Type: types.UpdateStrategyType(d.spec.Strategy)}
@@ -465,6 +506,13 @@ func (d *driver) desiredSpec() (types.WorkloadDesiredSpec, error) {
 			return types.WorkloadDesiredSpec{}, err
 		}
 		lifecycle.InstanceReadyTimeout = &metav1.Duration{Duration: timeout}
+	}
+	if d.spec.LeaderGoneGracePeriod != "" {
+		grace, err := ParseDuration("spec.leaderGoneGracePeriod", d.spec.LeaderGoneGracePeriod)
+		if err != nil {
+			return types.WorkloadDesiredSpec{}, err
+		}
+		lifecycle.LeaderGoneGracePeriod = &metav1.Duration{Duration: grace}
 	}
 	if d.spec.MigrationMode != "" {
 		lifecycle.MigrationPolicy = &types.MigrationPolicy{Mode: types.MigrationMode(d.spec.MigrationMode)}
@@ -956,7 +1004,7 @@ func (d *driver) renderPod(spec PodSpec, rev *appsv1.ControllerRevision) (*corev
 	}
 	pod, err := workloadops.RenderWithRevision(
 		d.owner, v1beta1.SchemeGroupVersion.WithKind("InferenceReplica"), d.key(),
-		d.podTemplate(image), d.podMeta(), plan, inst, runner, spec.Ordinal,
+		d.podTemplate(image), d.podMeta(), plan, inst, query.PodSetHostnames{}, runner, spec.Ordinal,
 		query.RevisionHashFromControllerRevisionName(rev.Name), nil,
 	)
 	if err != nil {
@@ -1063,6 +1111,7 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 		}
 		target = pinned
 	}
+	d.rollTarget = target.Name
 
 	rows, podObservation, err := d.publishedRows(ctx)
 	if err != nil {
@@ -1090,7 +1139,7 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 	if err != nil {
 		return fmt.Errorf("replay: build plan: %w", err)
 	}
-	d.desiredPodsByInstance = status.DesiredPodCountByInstance(plan)
+	d.plan = plan
 
 	input, err := d.buildInput(ctx, desired, observed, target)
 	if err != nil {
@@ -1197,6 +1246,9 @@ func (d *driver) observe(ctx context.Context, tick int, desired types.WorkloadDe
 		spec.MaxSurge = strategy.RollingUpdate.MaxSurge
 		spec.Partition = strategy.RollingUpdate.Partition
 	}
+	if desired.Pacing != nil {
+		spec.StepPartition = desired.Pacing.Partition
+	}
 	migrations := make([]types.MigrationRecord, 0, len(d.migrations))
 	for _, record := range d.migrations {
 		migrations = append(migrations, cloneMigrationRecord(record))
@@ -1221,6 +1273,7 @@ func (d *driver) observe(ctx context.Context, tick int, desired types.WorkloadDe
 		StuckPodGrace:   stuckPodGrace,
 		PodWrites:       append([]PodWrite(nil), d.tickPodWrites...),
 		Revisions:       revisions,
+		RollTarget:      d.rollTarget,
 	})
 	return nil
 }
@@ -1243,9 +1296,15 @@ func (d *driver) revisionTemplates(ctx context.Context) (map[string]RevisionTemp
 		if payload == nil {
 			continue
 		}
-		template := RevisionTemplate{Images: imagesByContainer(payload.PodSpec)}
+		template := RevisionTemplate{
+			Images:   imagesByContainer(payload.PodSpec),
+			Env:      literalEnvByContainer(payload.PodSpec),
+			Requests: requestsByContainer(payload.PodSpec),
+		}
 		if payload.WorkerPodSpec != nil {
 			template.WorkerImages = imagesByContainer(payload.WorkerPodSpec)
+			template.WorkerEnv = literalEnvByContainer(payload.WorkerPodSpec)
+			template.WorkerRequests = requestsByContainer(payload.WorkerPodSpec)
 		}
 		if payload.PodMeta != nil {
 			template.Labels = payload.PodMeta.Labels
@@ -1263,6 +1322,46 @@ func imagesByContainer(spec *corev1.PodSpec) map[string]string {
 	out := make(map[string]string, len(spec.Containers))
 	for _, container := range spec.Containers {
 		out[container.Name] = container.Image
+	}
+	return out
+}
+
+// templateContainers are a template's containers, init containers first.
+// An absent template has none.
+func templateContainers(spec *corev1.PodSpec) []corev1.Container {
+	if spec == nil {
+		return nil
+	}
+	return append(append([]corev1.Container(nil), spec.InitContainers...), spec.Containers...)
+}
+
+// literalEnvByContainer lists the env values a template sets by a literal,
+// by container and by name. A value the template reads from another source
+// has no literal and is not listed.
+func literalEnvByContainer(spec *corev1.PodSpec) map[string]map[string]string {
+	out := map[string]map[string]string{}
+	for _, container := range templateContainers(spec) {
+		literals := map[string]string{}
+		for _, env := range container.Env {
+			if env.ValueFrom == nil {
+				literals[env.Name] = env.Value
+			}
+		}
+		if len(literals) > 0 {
+			out[container.Name] = literals
+		}
+	}
+	return out
+}
+
+// requestsByContainer lists the resource requests a template sets, by
+// container.
+func requestsByContainer(spec *corev1.PodSpec) map[string]corev1.ResourceList {
+	out := map[string]corev1.ResourceList{}
+	for _, container := range templateContainers(spec) {
+		if len(container.Resources.Requests) > 0 {
+			out[container.Name] = container.Resources.Requests
+		}
 	}
 	return out
 }
@@ -1523,7 +1622,7 @@ func (d *driver) publish(ctx context.Context, pods workload.PodObservation, plan
 	if target != nil {
 		targetName = target.Name
 	}
-	rows, _, err := observation.TakeInlineV1Publication(status.DesiredPodCountByInstance(plan), targetName)
+	rows, _, err := observation.TakeInlineV1Publication(plan, targetName)
 	if err != nil {
 		return nil, nil, fmt.Errorf("replay: consume publication observation: %w", err)
 	}
@@ -1619,6 +1718,10 @@ func (d *driver) buildInput(ctx context.Context, desired types.WorkloadDesiredSp
 	if err != nil {
 		return types.ReconcileInput{}, err
 	}
+	gangRestartGrace, err := ParseDuration("config.gangRestartGrace", d.cfg.GangRestartGrace)
+	if err != nil {
+		return types.ReconcileInput{}, err
+	}
 
 	input := types.ReconcileInput{
 		OwnerObject:               d.owner,
@@ -1632,6 +1735,7 @@ func (d *driver) buildInput(ctx context.Context, desired types.WorkloadDesiredSp
 		UnschedulableGrace:        unschedulableGrace,
 		GangDomainFullGrace:       gangDomainFullGrace,
 		AbandonedReplacementGrace: abandonedReplacementGrace,
+		GangRestartGrace:          gangRestartGrace,
 		Requeue:                   types.RequeueIntervals{Operation: requeueOperation, Gate: requeueGate},
 		Gangs:                     types.NewGangObservations(),
 		DrainHolds:                &types.DrainHolds{},
@@ -1880,7 +1984,7 @@ func (d *driver) groupUnavailabilityHold(gate groupGateStandIn, strategy types.U
 	budget := utils.ScaledCountFromIntOrString(&budgetSpec, d.spec.Replicas, true)
 	var serving int32
 	for i := range gate.rows {
-		if status.InstanceMeetsThreshold(gate.rows[i].PodCount, gate.rows[i].ServingPodCount, d.desiredPodsByInstance[gate.rows[i].Index]) {
+		if status.InstanceMeetsThreshold(gate.rows[i].PodCount, gate.rows[i].ServingPodCount, d.plan.DesiredPodsFor(gate.rows[i].Index, gate.rows[i].PodCount)) {
 			serving++
 		}
 	}
@@ -1892,7 +1996,7 @@ func (d *driver) groupUnavailabilityHold(gate groupGateStandIn, strategy types.U
 		targetName, targetBorn = gate.target.Name, gate.target.CreationTimestamp.Time
 	}
 	down, reasons, _ := workloadops.ServingInstancesDown(gate.rows, gate.pods,
-		func(row *types.InstanceStatus) int32 { return d.desiredPodsByInstance[row.Index] }, targetName, targetBorn, gate.window, d.clock.Now())
+		func(row *types.InstanceStatus) int32 { return d.plan.DesiredPodsFor(row.Index, row.PodCount) }, targetName, targetBorn, gate.window, d.clock.Now())
 	unavailable := max(d.spec.Replicas-serving, 0) + int32(len(down))
 	if unavailable+inFlightUnavail+1 > budget {
 		return true, coordination.UnavailableBudgetHold(budget, unavailable, inFlightUnavail, "", reasons)

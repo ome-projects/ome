@@ -3,6 +3,7 @@ package inferenceservice
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -158,7 +159,8 @@ type InferenceServiceReconciler struct {
 	Log       logr.Logger
 	Scheme    *runtime.Scheme
 	Recorder  record.EventRecorder
-	// Clock measures spec.ttlSecondsAfterCreation. Nil means the real clock.
+	// Clock measures spec.ttlSecondsAfterCreation and dates the rollout run
+	// and the canary's steps. Nil means the real clock.
 	Clock           clock.PassiveClock
 	RuntimeSelector runtimeselector.Selector
 	// AcceleratorClassSelector resolves the AcceleratorClass for each
@@ -364,6 +366,7 @@ func (p *servicePass) run(ctx context.Context) (ctrl.Result, error) {
 		p.reconcileRolloutRun,
 		p.bindCanaryToOpenedRun,
 		p.flushRunBoundary,
+		p.settleCanaryForces,
 		p.resolveScalingTargets,
 		p.buildComponentReconcilers,
 		p.chooseIngressMode,
@@ -855,6 +858,7 @@ func (p *servicePass) reconcileRolloutRun(ctx context.Context) (bool, error) {
 		Reader:                   p.reconciler.APIReader,
 		Recorder:                 p.reconciler.Recorder,
 		ISVC:                     p.isvc,
+		Now:                      p.reconciler.now(),
 		FeatureEnabled:           p.reconciler.RolloutPolicyEnabled,
 		BoundProviders:           bound,
 		RouteCapabilities:        isvcutils.ResolveIngressConfig(routeConfig, p.isvc.Annotations).RouteCapabilities(),
@@ -988,6 +992,7 @@ func (p *servicePass) inputsFor(piece *render.Piece, component v1beta1.Component
 	in := componentInputs(piece, p.policyResolver, canary.PartitionResolver(p.isvc, p.policies, component), p.follows(component),
 		p.scalingTargets.Replicas(component), p.scalingTargets.Released(component))
 	in.RollbackToRevision = canary.StableSideTarget(p.isvc, p.policies, component)
+	in.UpdateStrategyOverride = canary.UpdateStrategyOverride(p.isvc, p.policies, component)
 	return in
 }
 
@@ -1078,6 +1083,7 @@ func (p *servicePass) runScalingCoordinator(ctx context.Context) (bool, error) {
 // pass, so a ConfigMap edit applies without a restart; only analysis steps
 // read them.
 func (p *servicePass) dispatchCanaryGroups(ctx context.Context) (bool, error) {
+	defer p.refuseUnclaimedForce()
 	canaryGroups := rollout.CanaryGroups(p.isvc, p.policies)
 	if len(canaryGroups) == 0 {
 		return true, nil
@@ -1099,6 +1105,36 @@ func (p *servicePass) dispatchCanaryGroups(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
+// settleCanaryForces ends every running canary force the pass no longer
+// allows before the component reconcilers write the replicas, so a force
+// whose run, request, time limit or configuration is gone, or whose rollout
+// is paused, never projects its partition 0 and 100% budget for one more
+// pass. The annotations it removes join the canary's, removed after the
+// status flush.
+func (p *servicePass) settleCanaryForces(context.Context) (bool, error) {
+	var maxDuration time.Duration
+	if p.rolloutConfig != nil && p.rolloutConfig.ForceComplete != nil {
+		maxDuration = p.rolloutConfig.ForceComplete.MaxDuration
+	}
+	for _, key := range canary.SettleForces(p.isvc, p.policies, p.reconciler.Recorder, p.reconciler.now(), maxDuration) {
+		if !slices.Contains(p.canaryConsume, key) {
+			p.canaryConsume = append(p.canaryConsume, key)
+		}
+	}
+	return true, nil
+}
+
+// refuseUnclaimedForce removes a canary force request no canary group can
+// act on, such as one on a service whose rollout has no canary, so an
+// accepted request that can never run does not stay on the object.
+func (p *servicePass) refuseUnclaimedForce() {
+	for _, key := range canary.RefuseUnclaimedForce(p.isvc, p.policies, p.reconciler.Recorder) {
+		if !slices.Contains(p.canaryConsume, key) {
+			p.canaryConsume = append(p.canaryConsume, key)
+		}
+	}
+}
+
 // canaryDispatchDeps is what one canary group's dispatch reads: the live
 // reader with the configured row decoder, because the crash reading decodes
 // per-Instance rows; the analysis source, timeout and providers; and the
@@ -1109,6 +1145,7 @@ func (p *servicePass) canaryDispatchDeps(group *v1beta1.RolloutGroup, analysisCo
 		Client:                   p.reconciler.Client,
 		Reader:                   irstatus.NewReader(p.reconciler.APIReader, p.reconciler.InstanceStatusDecoder),
 		Recorder:                 p.reconciler.Recorder,
+		Now:                      p.reconciler.now(),
 		Sampler:                  p.reconciler.CanarySampler,
 		BundledPrometheusAddress: analysisConfig.BundledPrometheusAddress,
 		QueryTimeout:             analysisConfig.QueryTimeoutDuration(),
@@ -1125,6 +1162,9 @@ func (p *servicePass) canaryDispatchDeps(group *v1beta1.RolloutGroup, analysisCo
 		deps.DefaultReadyTimeout = p.rolloutConfig.DefaultReadyTimeout
 		deps.Requeue = p.rolloutConfig.CanaryRequeue
 		deps.ParkedRequeue = p.rolloutConfig.CanaryParkedRequeue
+		if p.rolloutConfig.ForceComplete != nil {
+			deps.ForceMaxDuration = p.rolloutConfig.ForceComplete.MaxDuration
+		}
 	}
 	return deps
 }

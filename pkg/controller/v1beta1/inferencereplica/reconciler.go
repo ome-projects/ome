@@ -62,7 +62,6 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/revision"
 	workloadservice "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/service"
-	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 	"sigs.k8s.io/ome/pkg/runtimeselector"
 	"sigs.k8s.io/ome/pkg/utils"
@@ -79,6 +78,7 @@ import (
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=kueue.x-k8s.io,resources=workloads,verbs=get;delete
 // +kubebuilder:rbac:groups=accelerator.gke.io,resources=slices,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ome.io,resources=basemodels;clusterbasemodels;servingruntimes;clusterservingruntimes;finetunedweights,verbs=get;list;watch
@@ -285,16 +285,24 @@ func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	// its pods drain and escalate through the scale-down pipeline before the
 	// finalizer comes off; whatever remains is garbage collected through the
 	// children's owner references.
-	if ir.DeletionTimestamp != nil {
-		return r.reconcileTeardown(ctx, log, ir)
-	}
+	return r.releasingKueuePodGroups(ctx, ir, func() (ctrl.Result, error) {
+		if ir.DeletionTimestamp != nil {
+			return r.reconcileTeardown(ctx, log, ir)
+		}
+		return r.reconcileLive(ctx, req, log, ir)
+	})
+}
+
+// reconcileLive runs one pass over a replica that is not being deleted. The
+// teardown finalizer goes on before any other work, so a later delete runs
+// through the teardown.
+func (r *Reconciler) reconcileLive(ctx context.Context, req ctrl.Request, log logr.Logger, ir *v1beta1.InferenceReplica) (ctrl.Result, error) {
 	if err := validatePlacementReplicaLimit(ir); err != nil {
 		return ctrl.Result{}, err
 	}
 
-	// The teardown finalizer goes on before any other work, so a later
-	// delete runs through the teardown. The validating webhook admits a
-	// finalizer-only update without the controller-write annotation.
+	// The validating webhook admits a finalizer-only update without the
+	// controller-write annotation.
 	if !controllerutil.ContainsFinalizer(ir, TeardownFinalizer) {
 		controllerutil.AddFinalizer(ir, TeardownFinalizer)
 		if err := r.Update(ctx, ir); err != nil {
@@ -771,6 +779,7 @@ func (p *replicaPass) buildPlan(context.Context) (bool, error) {
 			p.ir.Namespace, p.ir.Name, err)
 	}
 	plan.GangScheduleTimeout = p.settings.GangScheduleTimeout
+	plan.KueuePodGroups = p.settings.KueuePodGroups
 	plan.InstanceReadyTimeout = p.instanceReadyTimeout
 	p.plan = plan
 	return true, nil
@@ -1102,7 +1111,7 @@ func (p *replicaPass) promoteCurrentRevision(ctx context.Context, passErr error,
 	if p.specTarget == nil {
 		return false, ctrl.Result{}, nil
 	}
-	perr := promoteCurrentRevisionOverPods(ctx, p.reconciler.statusWriter(), p.reconciler.liveReader(), p.ir, p.specTarget.Name, workloadstatus.PodRevisionsByInstance(byInstance))
+	perr := promoteCurrentRevisionOverPods(ctx, p.reconciler.statusWriter(), p.reconciler.liveReader(), p.ir, p.specTarget.Name, byInstance)
 	if perr == nil {
 		return false, ctrl.Result{}, nil
 	}
@@ -1423,6 +1432,10 @@ type lifecycleSettings struct {
 	// pod a rollout abandons before it ever served. Zero leaves such a pod
 	// its own grace.
 	AbandonedReplacement time.Duration
+	// GangRestart bounds the termination grace a Restart gives the old pods
+	// of a multi-pod Instance it rebuilds. Zero leaves each pod its own
+	// grace.
+	GangRestart time.Duration
 	// SchedulingRetry bounds the writes that ask the scheduler again for
 	// a gang pod left Pending with no node. Nil never writes one.
 	SchedulingRetry *workloadtypes.SchedulingRetryPolicy
@@ -1430,6 +1443,9 @@ type lifecycleSettings struct {
 	// scheduler accepts, which bounds the placement grace a gang's
 	// PodGroup carries as its timeout. Nil passes the grace through.
 	GangScheduleTimeout *workloadtypes.GangScheduleTimeoutClamp
+	// KueuePodGroups puts a queued multi-pod Instance's pods into one Kueue
+	// pod group. False leaves each pod its own Kueue Workload.
+	KueuePodGroups bool
 	// MigrationAudit bounds migration admission and the status-record
 	// horizon. Nil holds every migration request and ages out no record.
 	MigrationAudit *workloadtypes.MigrationAuditPolicy
@@ -1465,6 +1481,9 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 	if settings.AbandonedReplacement, err = cfg.ToAbandonedReplacementGracePeriod(); err != nil {
 		log.V(1).Info("abandoned-replacement grace invalid; an abandoned replacement keeps its own grace this pass", "error", err.Error())
 	}
+	if settings.GangRestart, err = cfg.ToGangRestartGracePeriod(); err != nil {
+		log.V(1).Info("gang-restart grace invalid; the old pods of a restarted gang keep their own grace this pass", "error", err.Error())
+	}
 	if settings.StuckPod == 0 {
 		log.V(1).Info("stuck-pod grace unconfigured (no lifecycle.stuckPodGracePeriod); skipping fast escalation this pass")
 	}
@@ -1474,6 +1493,10 @@ func (r *Reconciler) resolveLifecycleSettings(log logr.Logger) lifecycleSettings
 	if settings.AbandonedReplacement == 0 {
 		log.V(1).Info("abandoned-replacement grace unconfigured (no lifecycle.abandonedReplacementGracePeriod); an abandoned replacement keeps its own termination grace")
 	}
+	if settings.GangRestart == 0 {
+		log.V(1).Info("gang-restart grace unconfigured (no lifecycle.gangRestartGracePeriod); the old pods of a restarted gang keep their own termination grace")
+	}
+	settings.KueuePodGroups = cfg.KueuePodGroupsEnabled()
 	if settings.SchedulingRetry, err = cfg.SchedulingRetry.ToPolicy(); err != nil {
 		log.V(1).Info("scheduling retry invalid; no pod is written for the scheduler this pass", "error", err.Error())
 	}
@@ -1979,7 +2002,12 @@ func (r *Reconciler) applyRollbackPayload(ctx context.Context, ir *v1beta1.Infer
 	currentTopology := desired.TopologyKey
 	desired.PodSpec = payload.PodSpec
 	desired.WorkerPodSpec = payload.WorkerPodSpec
-	desired.PodTemplateObjectMeta = payload.PodMeta
+	// The keys a revision records come from the stored revision. Every other
+	// key keeps following the current template, so a pod rendered from the
+	// stored revision still carries the replica's queue labels, which Kueue
+	// reads only when the pod is created.
+	current := desired.PodTemplateObjectMeta
+	desired.PodTemplateObjectMeta = revision.ComposeMeta(current, hashedTemplateMeta(ir, current), payload.PodMeta)
 	// The width is revision-owned too: a stored revision's gang renders at
 	// the worker count it recorded.
 	if payload.WorkerSize != nil {
@@ -2281,6 +2309,18 @@ func (r *Reconciler) observedWorkerWidth(ctx context.Context, ir *v1beta1.Infere
 		}
 		return revision.ObservedWorkerWidth(rows, pods, revisionName)
 	}
+}
+
+// hashedTemplateMeta is the part of the pod-template metadata a revision
+// records, as revisionTemplate hashes it: the metadata without the excluded
+// annotation keys and the controller-written keys. A nil replica excludes no
+// annotation key beyond the controller-written ones.
+func hashedTemplateMeta(ir *v1beta1.InferenceReplica, meta *metav1.ObjectMeta) *metav1.ObjectMeta {
+	var excluded map[string]struct{}
+	if ir != nil {
+		excluded = hashExcludedAnnotationKeys(ir)
+	}
+	return revision.TemplateMeta(v1beta1convert.StripExcludedAnnotations(meta, excluded))
 }
 
 // hashExcludedAnnotationKeys returns the pod-template annotation keys omitted

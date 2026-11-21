@@ -1,0 +1,16 @@
+{
+  "recordedOn": {
+    "date": "2026-11-11",
+    "machine": "linux/amd64, 192 cores, go1.26.7"
+  },
+  "reason": "One write pass at rest over each per-revision Service of a revision, stored as the apiserver holds it after the create, and over the pair through EnsurePerRevisionServices, which reads the revision's ControllerRevision as well. The cache stand-in hands out a copy on every Get, as the manager's cache does; the pass renders the desired Service and compares its five owned fields with the copy field by field, so nothing is copied or walked by reflection. A pass at rest writes nothing.",
+  "tolerancePercent": 10,
+  "budgets": {
+    "headless/at-rest/allocations": 27,
+    "headless/at-rest/bytes": 3376,
+    "pair/at-rest/allocations": 89,
+    "pair/at-rest/bytes": 9136,
+    "routing/at-rest/allocations": 35,
+    "routing/at-rest/bytes": 4256
+  }
+}

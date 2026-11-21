@@ -507,3 +507,100 @@ func TestEvaluateUpdateGate_ProtocolChangeKeepsOneMoverAndTheFloor(t *testing.T)
 		}
 	}
 }
+
+// keptSurgePicture is a fleet in which a surge the drain-time gate keeps
+// and the pairable minimum hold each other. Two engines surge one at a time
+// with none allowed out of pairing, so the engine's minimum is 2 of 2. The
+// decoders step with no surge. The engine Instance at index surging has a
+// replacement that serves the target cohort beside its old pod, and no
+// decoder serves that cohort.
+type keptSurgePicture struct {
+	name     string
+	protocol string
+	// engines and decoders are the revisions the Instances run, by index.
+	engines, decoders []string
+	surging           int
+	// decoderStrategy is how a decoder steps, as its replica declares it
+	// and as its start is asked of the gate.
+	decoderStrategy v1beta1.UpdateStrategyType
+	decoderStart    workloadtypes.UpdateStrategyType
+}
+
+// objects are the revisions of the picture, the two replicas with their
+// rows, and the routable pods the drain-time gate reads.
+func (p keptSurgePicture) objects() []client.Object {
+	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	objs := threeCohortCRs(p.protocol)
+	rows := make([]v1beta1.OMENativeInstanceStatus, 0, len(p.engines))
+	for i, hash := range p.engines {
+		objs = append(objs, drainPod("llama", eng, fmt.Sprintf("llama-engine-%d-default-0", i), "default", "pair-"+hash, true))
+		if i != p.surging {
+			rows = append(rows, settledRow("llama", eng, i, hash))
+			continue
+		}
+		rows = append(rows, surgingRow("llama", eng, i, hash, "target", workloadtypes.UpdateStepSurge, 2))
+		objs = append(objs, drainPod("llama", eng, fmt.Sprintf("llama-engine-%d-default-1", i), "default", p.protocol, true))
+	}
+	engines := sizedPairingIR("prod", "llama", eng, rows, v1beta1.UpdateStrategySurgeThenDrain, len(p.engines), 0)
+	engines.Status.UpdateRevision = "llama-engine-target"
+	engines.Status.Replicas = int32(len(p.engines))
+	engines.Status.ServingReplicas = int32(len(p.engines))
+	engines.Status.ReadyReplicas = int32(len(p.engines))
+	objs = append(objs, engines, rolledPairingIR(dec, p.decoderStrategy, len(p.decoders), 1, p.decoders...))
+	for i, hash := range p.decoders {
+		objs = append(objs, drainPod("llama", dec, fmt.Sprintf("llama-decoder-%d-default-0", i), "default", "pair-"+hash, true))
+	}
+	return objs
+}
+
+// A surge the drain-time gate keeps and the pairable minimum hold each
+// other, and the cheapest-step rule does not see it. The engine's
+// replacement serves the target cohort with no partner, so the drain-time
+// gate keeps its old pod in rotation, and that kept surge is an open
+// attempt. Every decoder step would take the only partner of one engine
+// and is held on the engine's minimum of 2. The cheapest-step rule asks
+// for a picture with no attempt open, so it admits nothing. The one start
+// the gate admits is the engine's next surge, and the engine's surge
+// budget of one is spent on the kept surge. Nothing moves again. The
+// answers below are the ones the gates give in this state.
+func TestCheckPairing_AKeptSurgeAndThePairableMinimumHoldEachOther(t *testing.T) {
+	eng, dec := v1beta1.EngineComponent, v1beta1.DecoderComponent
+	for _, pic := range []keptSurgePicture{
+		{
+			name: "one change, 2 engines beside 1 decoder patched in place", protocol: "pair-v2",
+			engines: []string{"v1", "v1"}, surging: 0, decoders: []string{"v1"},
+			decoderStrategy: v1beta1.UpdateStrategyInPlaceIfPossible, decoderStart: workloadtypes.UpdateStrategyInPlaceIfPossible,
+		},
+		{
+			name: "a third protocol, 2 engines beside 2 decoders rebuilt", protocol: "pair-v3",
+			engines: []string{"v2", "v1"}, surging: 1, decoders: []string{"v2", "v1"},
+			decoderStrategy: v1beta1.UpdateStrategyRecreatePod, decoderStart: workloadtypes.UpdateStrategyRecreatePod,
+		},
+	} {
+		t.Run(pic.name, func(t *testing.T) {
+			isvc := pairingISVC(pic.protocol)
+			objs := pic.objects()
+
+			old := fmt.Sprintf("llama-engine-%d-default-0", pic.surging)
+			allowed, gate, reason := drainGate(t, isvc, eng, []string{old}, objs...)
+			t.Logf("the drain of %s: allowed=%v gate=%q %s", old, allowed, gate, reason)
+			if allowed || gate != v1beta1.RolloutHoldGatePairing || !strings.Contains(reason, "the replacement engine cannot pair") {
+				t.Errorf("the drain-time gate keeps the old engine pod while no decoder serves %s: allowed=%v gate=%q %s", pic.protocol, allowed, gate, reason)
+			}
+			c := fakeclient.New(t, fakeclient.WithObjects(objs...))
+			for _, hash := range pic.decoders {
+				allowed, gate, reason := EvaluateUpdateGate(context.Background(), c, isvc, dec, "llama-decoder-"+hash, forwardTarget(isvc, dec), nil, GroupDefaults{}, pic.decoderStart, 0, 0)
+				t.Logf("the decoder on %s: allowed=%v gate=%q %s", hash, allowed, gate, reason)
+				if allowed || gate != v1beta1.RolloutHoldGatePairing || !strings.Contains(reason, "engine with 1 pairable") || !strings.Contains(reason, "(desired 2 minus maxUnavailable 0)") {
+					t.Errorf("the decoder on %s is held on the engine's pairable minimum: allowed=%v gate=%q %s", hash, allowed, gate, reason)
+				}
+			}
+			next := pic.engines[1-pic.surging]
+			ok, reason := pairingGate(t, isvc, eng, objs...).CheckPairing("llama-engine-"+next, workloadtypes.UpdateStrategySurgeThenDrain, 0, 0)
+			t.Logf("the engine's next surge from %s: allowed=%v %s", next, ok, reason)
+			if !ok {
+				t.Errorf("the engine's next surge keeps its old pod in rotation and is the one start the gate admits: %s", reason)
+			}
+		})
+	}
+}

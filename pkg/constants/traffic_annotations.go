@@ -167,6 +167,27 @@ var (
 	// to the member object.
 	RolloutResumeAnnotation = OMEAPIGroupName + "/rollout-resume"
 
+	// RolloutForceModeAnnotation asks OME to drive one open canary run to
+	// 100% at once, and names how: RolloutForceModeDisruptive or
+	// RolloutForceModeBlueGreen. It needs RolloutForceRunAnnotation, which
+	// binds the request to one run, and RolloutForceReasonAnnotation.
+	// Removing it ends the force and the run continues as a normal canary.
+	// Like the other rollout verbs it is stripped at derive, so on a placed
+	// InferenceService it is applied to the member object.
+	RolloutForceModeAnnotation = OMEAPIGroupName + "/rollout-force-mode"
+
+	// RolloutForceRunAnnotation is the ID of the open rollout run a force
+	// applies to, copied from status.rollout.activeRun.runID. A force acts
+	// only on that run, so a request left on the object never forces the run
+	// a later push opens.
+	RolloutForceRunAnnotation = OMEAPIGroupName + "/rollout-force-run"
+
+	// RolloutForceReasonAnnotation is the operator's reason for a force,
+	// recorded in status and on every event the force emits. Required with
+	// RolloutForceModeAnnotation; non-empty and at most
+	// RolloutForceReasonMaxLength characters.
+	RolloutForceReasonAnnotation = OMEAPIGroupName + "/rollout-force-reason"
+
 	// RolloutPlanSourceAnnotation carries per-group policy provenance on a
 	// DERIVED InferenceService whose rollout groups were inflated from
 	// RolloutPolicy refs at derive time. Members copy it into the pinned
@@ -176,6 +197,22 @@ var (
 	// (derived objects only) — never set by users.
 	RolloutPlanSourceAnnotation = OMEAPIGroupName + "/rollout-plan-source"
 )
+
+// The values of RolloutForceModeAnnotation.
+const (
+	// RolloutForceModeDisruptive replaces every Instance of the canary group
+	// still on the old revision at once, ignoring the update strategy's
+	// budget, so the service serves nothing until the new pods are Ready.
+	RolloutForceModeDisruptive = "Disruptive"
+	// RolloutForceModeBlueGreen brings up a full set of new Instances beside
+	// the old ones and moves the traffic once they are Ready.
+	RolloutForceModeBlueGreen = "BlueGreen"
+)
+
+// RolloutForceReasonMaxLength bounds RolloutForceReasonAnnotation, which OME
+// copies into status and events. It is a size guard on a copied string, not a
+// behavioural value.
+const RolloutForceReasonMaxLength = 256
 
 // RolloutPauseState interprets PausedRolloutAnnotation on the given
 // annotations map. paused reports whether any pause is in effect;

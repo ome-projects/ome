@@ -20,15 +20,15 @@ import (
 // reading the member again.
 
 // TestDispatchReadsEachMembersReplicaLiveOnce holds the live reads of a
-// pass at rest to one replica read and one pod list per member, settled
-// and holding.
+// pass at rest to one replica read per member and no pod list, settled
+// and holding; the pods come through the cache.
 func TestDispatchReadsEachMembersReplicaLiveOnce(t *testing.T) {
 	shape := dispatchFleetShapes()[3]
 	for _, state := range []dispatchFleetState{dispatchSettled, dispatchHolding} {
 		f := buildDispatchFleet(t, shape, state)
 		f.pass(t)
-		if members := int64(len(shape.members)); f.live.gets != members || f.live.lists != members {
-			t.Fatalf("%s/%s: a pass read %d replicas and %d pod lists live, want %d of each", shape.name, state, f.live.gets, f.live.lists, members)
+		if members := int64(len(shape.members)); f.live.gets != members || f.live.lists != 0 {
+			t.Fatalf("%s/%s: a pass read %d replicas and %d pod lists live, want %d replicas and no pod list", shape.name, state, f.live.gets, f.live.lists, members)
 		}
 	}
 }

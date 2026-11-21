@@ -2094,6 +2094,60 @@ func TestCreate_PodlessRowUnderAHeldRollRendersItsRevision(t *testing.T) {
 	}
 }
 
+// planGateHolds is a plan gate that admits no start: no run records the
+// plan, or the plan does not resolve.
+func planGateHolds() (bool, workload.RolloutHoldGate, string) {
+	return false, workload.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "the plan gate admits no start: no run records the plan"
+}
+
+// A promoted Instance that lost every pod while the plan gate holds is
+// rebuilt on the revision it ran and stays there pass after pass: the first
+// pass opens the attempt on that revision and renders its whole set
+// from the stored template, and the passes after neither retire the attempt
+// onto the held target nor build a pod there. Once the gate admits a start,
+// the refill in flight, nothing of it up, is retired onto the target.
+func TestCreate_PodlessRowUnderAHeldPlanGateKeepsItsRevisionAcrossPasses(t *testing.T) {
+	f := newRefillFixture(t, time.Now(), v1beta1.OMENativeInstanceStatus{
+		Index: 0, Incarnation: 1, Phase: v1beta1.OMENativeInstancePending,
+	}, true)
+	f.input.PlanGate = planGateHolds
+	rec := record.NewFakeRecorder(16)
+	deps := legacyTestDeps(f.client)
+	deps.Recorder = rec
+	for pass := 1; pass <= 3; pass++ {
+		if pass > 1 {
+			f.reobserve(t)
+		}
+		f.run(t, deps)
+		pods := createGatePods(t, f.client, f.isvc.Namespace)
+		if len(pods) != 2 {
+			t.Fatalf("pass %d: got %d pod(s), want the whole gang on the revision the Instance ran", pass, len(pods))
+		}
+		for i := range pods {
+			image := "test:v0"
+			if pods[i].Labels[query.LabelRunner] == "worker" {
+				image = "test:v0-worker"
+			}
+			requireRenderedAt(t, &pods[i], f.running, image, "proto-v0")
+		}
+		row := f.row(t)
+		if row.Operation == nil || row.Operation.Type != v1beta1.InstanceOperationCreate || row.Operation.TargetRevision != runningRevisionName {
+			t.Fatalf("pass %d: the attempt must stay on %s while the plan gate holds, got %+v", pass, runningRevisionName, row.Operation)
+		}
+		for _, e := range drainEvents(rec) {
+			if strings.Contains(e, string(workload.EventReasonCreateAttemptSuperseded)) {
+				t.Fatalf("pass %d retired the attempt onto the held target: %q", pass, e)
+			}
+		}
+	}
+	f.input.PlanGate = nil
+	f.reobserve(t)
+	f.run(t, deps)
+	if row := f.row(t); row.Operation == nil || row.Operation.TargetRevision != f.target.Name {
+		t.Fatalf("once the gate admits a start the refill in flight is retired onto %s, got %+v", f.target.Name, row.Operation)
+	}
+}
+
 // A row that lost every pod while the roll's partition holds its Instance
 // is the held side of the split: the rebuild renders the revision the row
 // records and pins it, so the held set keeps its size and only a release of
@@ -2660,7 +2714,7 @@ func TestCreateMissingPods_RequiresANamedRevision(t *testing.T) {
 			plan := legacyComponentPlan(workload.UpdateStrategySurgeThenDrain, nil)
 			inst := plan.Instances[0]
 			targets := expectedPodNamesForInstance(input, plan, inst)
-			created, err := createMissingPods(context.Background(), workload.Deps{Client: c}, input, plan, inst, inst.Index, targets, desiredTemplate(input, plan, rev))
+			created, err := createMissingPods(context.Background(), workload.Deps{Client: c}, input, plan, inst, inst.Index, targets, nil, desiredTemplate(input, plan, rev))
 			if created != 0 || !errors.Is(err, query.ErrRevisionUnknown) {
 				t.Fatalf("created=%d error=%v, want no pods and an unknown revision error", created, err)
 			}
@@ -2688,7 +2742,7 @@ func TestCreateMissingPods_RejectsARevisionLabelChangedByTheRenderHook(t *testin
 				pod.Labels[query.LabelRevisionHash] = hash
 			}}
 			rev := query.RevisionFromName("example-model-engine-v1")
-			created, err := createMissingPods(context.Background(), deps, input, plan, inst, inst.Index, expectedPodNamesForInstance(input, plan, inst), desiredTemplate(input, plan, rev))
+			created, err := createMissingPods(context.Background(), deps, input, plan, inst, inst.Index, expectedPodNamesForInstance(input, plan, inst), nil, desiredTemplate(input, plan, rev))
 			if created != 0 || err == nil || !strings.Contains(err.Error(), "revision label") {
 				t.Fatalf("created=%d error=%v, want the changed label rejected", created, err)
 			}
@@ -2844,6 +2898,79 @@ func TestSurgeFreeIndex_AFailedRowJoinsTheFreshScopeOnTheTargetOrUnderTheHold(t 
 			input := workload.ReconcileInput{ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{tc.row}}}
 			if got := surgeFreeIndex(input, 0, target, tc.held); got != tc.want {
 				t.Fatalf("surgeFreeIndex = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStoppedAttemptGoneOnTheTarget_JoinsTheFreshScope: a row that runs the
+// roll target and keeps an Update stopped toward another revision is a
+// fresh start once no live pod of its set is left, so the fresh scope
+// rebuilds it. A live pod keeps it the roll's, a row off the target is the
+// roll's to re-open, and an Update still in flight is its owner's.
+func TestStoppedAttemptGoneOnTheTarget_JoinsTheFreshScope(t *testing.T) {
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-target"}}
+	update := func(step string) *workload.InstanceOperation {
+		return &workload.InstanceOperation{Type: workload.InstanceOperationUpdate, Step: step, TargetRevision: "svc-engine-left",
+			Waiting: string(workload.RolloutHoldGateRetryBlock)}
+	}
+	row := func(rev string, op *workload.InstanceOperation) workload.InstanceStatus {
+		return workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: rev, TargetRevision: "svc-engine-left", Operation: op}
+	}
+	live := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "live"}, Status: corev1.PodStatus{Phase: corev1.PodRunning}}
+	exited := &corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "exited"}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}
+	cases := []struct {
+		name   string
+		row    workload.InstanceStatus
+		pods   []*corev1.Pod
+		target *appsv1.ControllerRevision
+		want   bool
+	}{
+		{name: "on the target with its set gone it is rebuilt", row: row(target.Name, update(workload.UpdateStepParked)), target: target, want: true},
+		{name: "on the target with only exited pods left it is rebuilt", row: row(target.Name, update(workload.UpdateStepParked)), pods: []*corev1.Pod{exited}, target: target, want: true},
+		{name: "a live pod of the set keeps it the roll's", row: row(target.Name, update(workload.UpdateStepParked)), pods: []*corev1.Pod{live}, target: target, want: false},
+		{name: "off the target it is the roll's to re-open", row: row("svc-engine-prior", update(workload.UpdateStepParked)), target: target, want: false},
+		{name: "an Update in flight is its owner's", row: row(target.Name, update(workload.UpdateStepDrain)), target: target, want: false},
+		{name: "with no target nothing is admitted", row: row(target.Name, update(workload.UpdateStepParked)), want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{ObservedState: workload.WorkloadObservedState{InstanceStatuses: []workload.InstanceStatus{tc.row}}}
+			if got := stoppedAttemptGoneOnTheTarget(input, 0, tc.pods, tc.target); got != tc.want {
+				t.Fatalf("stoppedAttemptGoneOnTheTarget = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestCreateRevision_ALostPromotedInstanceKeepsItsRevisionWhileThePlanGateHolds:
+// a promoted Instance that lost every pod is rebuilt at the roll target
+// only when the plan gate admits a start on it. While no run records the
+// plan, or the plan does not resolve, the refill renders the revision the
+// Instance ran, as a repair does, and the roll takes it once a start is
+// admitted.
+func TestCreateRevision_ALostPromotedInstanceKeepsItsRevisionWhileThePlanGateHolds(t *testing.T) {
+	const running = "svc-engine-v1"
+	target := &appsv1.ControllerRevision{ObjectMeta: metav1.ObjectMeta{Name: "svc-engine-v2"}}
+	admits := func() (bool, workload.RolloutHoldGate, string) { return true, "", "" }
+	holds := func() (bool, workload.RolloutHoldGate, string) {
+		return false, workload.RolloutHoldGate(v1beta1.RolloutHoldGatePlan), "the plan gate admits no start: no run records the plan"
+	}
+	cases := []struct {
+		name string
+		gate func() (bool, workload.RolloutHoldGate, string)
+		want string
+	}{
+		{name: "no plan gate wired", want: target.Name},
+		{name: "the plan gate admits", gate: admits, want: target.Name},
+		{name: "the plan gate holds", gate: holds, want: running},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			input := workload.ReconcileInput{PlanGate: tc.gate}
+			input.ObservedState.InstanceStatuses = []workload.InstanceStatus{{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: running}}
+			if got := createRevision(input, 0, nil, target, false); got != tc.want {
+				t.Fatalf("createRevision = %q, want %q", got, tc.want)
 			}
 		})
 	}

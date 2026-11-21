@@ -815,8 +815,8 @@ func (w *surgeDrainWorld) playOut() {
 	}
 }
 
-// knownSurgeDrainClasses are the finding classes the model shows on main
-// today, each with the picture behind it. A finding in a known class is
+// knownSurgeDrainClasses are the finding classes the model shows on the
+// current engine, each with the picture behind it. A finding in a known class is
 // reported and does not fail the run; a change of behaviour removes its entry and the lock
 // test that holds the picture.
 var knownSurgeDrainClasses = map[string]string{

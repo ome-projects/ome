@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -120,7 +121,8 @@ var pairingComponents = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1
 // bypasses it: its net capacity change is ~0, but the instance still crosses
 // cohorts, which is exactly what this gate paces. In-flight starts from the
 // same wake-up are charged pessimistically against each cohort under
-// simulation.
+// simulation. A pod of a surge counts only while the drain-time gate would
+// keep it in rotation (withoutSurgePodsLetGo).
 //
 // A start that would put the first new-cohort Instance on its side waits
 // while no step of the other side to the new cohort keeps this side at its
@@ -152,7 +154,8 @@ var pairingComponents = []v1beta1.ComponentType{v1beta1.EngineComponent, v1beta1
 // Fails closed (deny, retryable reason) when the target revision is unknown
 // or IR status or a serving instance's ControllerRevision cannot be read —
 // approving a cohort-draining step on unreadable protocol data is how the
-// last pair dies silently.
+// last pair dies silently. The same holds when the pods of a row that
+// counts them late cannot be listed.
 func (ctx GateContext) CheckPairing(fromRevision string, strategy workloadtypes.UpdateStrategyType, inFlightSurge, inFlightUnavail int32) (allowed bool, reason string) {
 	v := ctx.pairingVerdict(fromRevision, strategy, inFlightSurge, inFlightUnavail)
 	return v.allowed, v.reason
@@ -220,6 +223,10 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		return p, ""
 	}
 	transition := false
+	late := lateRows{}
+	// bothPods reports a surge whose replacement is in rotation beside its
+	// old pods, the state in which the drain-time gate is asked about either.
+	bothPods := false
 	for _, comp := range pairingComponents {
 		serving[comp] = map[string]int32{}
 		instances[comp] = map[string][]string{}
@@ -233,9 +240,15 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		replicas[comp] = ir
 		for i := range ir.Status.InstanceStatuses {
 			inst := &ir.Status.InstanceStatuses[i]
+			key := strconv.Itoa(int(inst.Index))
+			if rowComingUp(inst) {
+				late.add(comp, key, inst.RunningRevision != "" && inst.RunningRevision != ctx.TargetRevision.Name)
+				continue
+			}
 			if inst.ServingPodCount <= 0 {
 				continue
 			}
+			bothPods = bothPods || replacementServesBesideOldPods(inst, ir)
 			for _, revision := range servingRevisions(inst) {
 				proto := ""
 				if revision != "" {
@@ -245,12 +258,26 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 					}
 				}
 				serving[comp][proto]++
-				key := strconv.Itoa(int(inst.Index))
 				instances[comp][key] = append(instances[comp][key], proto)
 				if proto != "" && proto != target {
 					transition = true
 				}
 			}
+		}
+	}
+	// A row counts its pods one status write late, which only makes this gate
+	// refuse more. Two places need the pods: before it finds no pair to
+	// protect, and when it asks the drain-time gate's rule (drainHeld).
+	var behind latePods
+	noPair := !pairableServingPairExists(serving)
+	if late.any() && (transition || (noPair && late.offTarget)) && (noPair || bothPods) {
+		var reason string
+		if behind, reason = ctx.podsOfLateRows(late, target); reason != "" {
+			return pairingVerdict{reason: reason}
+		}
+		if noPair {
+			behind.addTo(serving, instances)
+			transition, behind = transition || behind.transition, latePods{}
 		}
 	}
 	if !transition {
@@ -283,7 +310,9 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		},
 		protocols: protoByRevision,
 		firstSide: ctx.namedFirstSide(),
+		late:      behind,
 	}
+	picture = picture.withoutSurgePodsLetGo(replicas)
 	// A dead end needs a settled picture: nothing in flight on either side,
 	// this pass's starts included.
 	settled := inFlightSurge+inFlightUnavail == 0 && !attemptOpen(replicas[component]) && !attemptOpen(replicas[peer])
@@ -310,7 +339,7 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 	// charge them against the cohort under simulation (worst case they all
 	// came from it). Surge in-flights carry their own replacement credit.
 	inFlightLoss := inFlightSurge + inFlightUnavail
-	for proto, n := range serving[component] {
+	for proto, n := range picture.serving[component] {
 		if proto == target || n <= 0 {
 			continue
 		}
@@ -321,7 +350,7 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		if loss == 0 {
 			continue
 		}
-		sim := copyServing(serving)
+		sim := copyServing(picture.serving)
 		sim[component][proto] -= loss
 		if sim[component][proto] < 0 {
 			sim[component][proto] = 0
@@ -345,6 +374,96 @@ func (ctx GateContext) pairingVerdict(fromRevision string, strategy workloadtype
 		return pairingVerdict{reason: reason}
 	}
 	return allow("")
+}
+
+// lateRows are the Instance rows whose pods may take requests before the
+// row counts them (rowComingUp), per side and Instance.
+type lateRows struct {
+	rows map[v1beta1.ComponentType]map[string]bool
+	// offTarget reports one that runs another revision than the roll target.
+	offTarget bool
+}
+
+func (l *lateRows) add(side v1beta1.ComponentType, instance string, offTarget bool) {
+	if l.rows == nil {
+		l.rows = map[v1beta1.ComponentType]map[string]bool{}
+	}
+	if l.rows[side] == nil {
+		l.rows[side] = map[string]bool{}
+	}
+	l.rows[side][instance] = true
+	l.offTarget = l.offTarget || offTarget
+}
+
+func (l lateRows) any() bool { return len(l.rows) > 0 }
+
+// latePods are the pods of the late rows that take requests, counted the
+// way the drain-time gate counts pods: per side and protocol, and per
+// Instance.
+type latePods struct {
+	serving   map[v1beta1.ComponentType]map[string]int32
+	instances map[v1beta1.ComponentType]map[string][]string
+	// transition reports one on another protocol than the target.
+	transition bool
+}
+
+// podsOfLateRows reads the pods of the late rows that take requests. It
+// returns a reason when a list fails, and the gate then fails closed.
+func (ctx GateContext) podsOfLateRows(late lateRows, target string) (latePods, string) {
+	out := latePods{serving: map[v1beta1.ComponentType]map[string]int32{}, instances: map[v1beta1.ComponentType]map[string][]string{}}
+	for side, rows := range late.rows {
+		pods, err := ctx.pairingPods(side)
+		if err != nil {
+			return latePods{}, fmt.Sprintf("pairing gate: cannot list %s pods, failing closed: %v", side, err)
+		}
+		out.serving[side], out.instances[side] = map[string]int32{}, map[string][]string{}
+		prefix := prefixFor(ctx.ISVC, side)
+		for _, pod := range pods {
+			key := instanceKeyForPod(pod)
+			proto, inRotation := servedProtocol(prefix, side, pod)
+			if !inRotation || !rows[key] {
+				continue
+			}
+			out.serving[side][proto]++
+			out.instances[side][key] = append(out.instances[side][key], proto)
+			out.transition = out.transition || (proto != "" && proto != target)
+		}
+	}
+	return out, ""
+}
+
+// addTo adds the late pods to the counts given.
+func (l latePods) addTo(serving map[v1beta1.ComponentType]map[string]int32, instances map[v1beta1.ComponentType]map[string][]string) {
+	for side, byProtocol := range l.serving {
+		for proto, n := range byProtocol {
+			serving[side][proto] += n
+		}
+	}
+	for side, byInstance := range l.instances {
+		for key, protos := range byInstance {
+			instances[side][key] = append(instances[side][key], protos...)
+		}
+	}
+}
+
+// over returns the counts given with the late pods added, as copies: the
+// pods the drain-time gate reads.
+func (l latePods) over(serving map[v1beta1.ComponentType]map[string]int32, instances map[v1beta1.ComponentType]map[string][]string) (map[v1beta1.ComponentType]map[string]int32, map[v1beta1.ComponentType]map[string][]string) {
+	if len(l.serving) == 0 {
+		return serving, instances
+	}
+	serving, instances = copyServing(serving), copyInstances(instances)
+	l.addTo(serving, instances)
+	return serving, instances
+}
+
+// pairingPods is one pairing side's pods: the pass's own list for this
+// Component, and a list through the gate's reader for the other side.
+func (ctx GateContext) pairingPods(side v1beta1.ComponentType) ([]*corev1.Pod, error) {
+	if side == ctx.Component {
+		return ctx.componentPods()
+	}
+	return pairingSidePods(ctx.Ctx, ctx.Reads, ctx.ISVC, side)
 }
 
 // namedFirstSide is the pairing side the operator names to move first
@@ -414,7 +533,9 @@ func rowAttemptOpen(row *v1beta1.OMENativeInstanceStatus) bool {
 // pairingPicture is the serving state a protocol transition is judged on:
 // serving Instances per side and cohort, each side's Instances with the
 // cohorts of their serving pods, each side's pairable floor, how each
-// side's starts move, and the cohort of every serving revision.
+// side's starts move, and the cohort of every serving revision. A start is
+// answered on it without the pods of a surge that the drain-time gate would
+// let leave rotation (withoutSurgePodsLetGo).
 type pairingPicture struct {
 	target    string
 	serving   map[v1beta1.ComponentType]map[string]int32
@@ -427,6 +548,12 @@ type pairingPicture struct {
 	// inside every batch, empty when none is named. The batch step orders
 	// the two sides when one is named; this gate does when none is.
 	firstSide v1beta1.ComponentType
+	// letGo marks, per side, the Instances whose surge has a pod left out
+	// of serving and instances (withoutSurgePodsLetGo).
+	letGo map[v1beta1.ComponentType]map[int32]bool
+	// late holds the pods that take requests before their row counts them.
+	// Only the drain-time gate's rule reads them (drainHeld).
+	late latePods
 }
 
 // candidateStart is one start a side could open: the cohort its Instance
@@ -631,54 +758,138 @@ func rowComingUp(row *v1beta1.OMENativeInstanceStatus) bool {
 // handOverHeld reports a surge whose replacement serves beside its old
 // pods and whose old pods the drain-time gate keeps in rotation, for
 // whichever of its reasons: the replacement cannot pair yet, the other
-// side's floor, or the last pair. A single pod's replacement is its second
-// serving pod; a gang's is the row in the slot its attempt points at,
-// serving whole. It asks the drain gate's own rule
-// (pairingDrainPicture.hold) over this picture, with the old pods as the
-// ones leaving; only the other side's own moves can change the answer.
+// side's floor, or the last pair. Only the other side's own moves can
+// change the answer. A surge with a pod left out of the counts is not one
+// (withoutSurgePodsLetGo).
 func (p pairingPicture) handOverHeld(side v1beta1.ComponentType, row *v1beta1.OMENativeInstanceStatus, ir *v1beta1.InferenceReplica) bool {
+	if !replacementServesBesideOldPods(row, ir) || p.letGo[side][row.Index] {
+		return false
+	}
+	from, cohort, ok := p.surgeCohorts(row)
+	return ok && p.drainHeld(side, row.Index, from, cohort)
+}
+
+// replacementServesBesideOldPods reports a surge whose replacement is in
+// rotation beside its old pods. A single pod's replacement is its second
+// serving pod. A gang's is the row its surge builds, serving whole.
+func replacementServesBesideOldPods(row *v1beta1.OMENativeInstanceStatus, ir *v1beta1.InferenceReplica) bool {
 	op := row.Operation
 	if op == nil || op.Type != v1beta1.InstanceOperationUpdate || op.Step != workloadtypes.UpdateStepSurge || row.ServingPodCount < 1 {
 		return false
 	}
 	if op.SurgeIndex == nil {
-		if row.ServingPodCount < 2 {
-			return false
-		}
-	} else if !gangReplacementServes(ir, *op.SurgeIndex, op.TargetRevision) {
-		return false
+		return row.ServingPodCount >= 2
 	}
+	return gangReplacementServes(ir, *op.SurgeIndex, op.TargetRevision)
+}
+
+// surgeCohorts names the protocol the old pods of a surge run and the
+// protocol of the revision the surge moves them to. It reports false when
+// the first is unknown or the second is empty: no gate holds such a surge.
+func (p pairingPicture) surgeCohorts(row *v1beta1.OMENativeInstanceStatus) (from, cohort string, ok bool) {
 	from, known := p.protocolOf(row.RunningRevision)
 	if !known {
-		return false
+		return "", "", false
 	}
-	// The cohort the old pods are traded for: the one the attempt is pinned
-	// to, which is the target's unless a later edit moved the target while
-	// the hand-over was under way.
-	cohort := p.target
-	if proto, ok := p.protocolOf(op.TargetRevision); ok && op.TargetRevision != "" {
-		cohort = proto
+	cohort = p.target
+	if own := row.Operation.TargetRevision; own != "" {
+		if proto, resolved := p.protocolOf(own); resolved {
+			cohort = proto
+		}
 	}
-	if cohort == "" {
-		return false
+	return from, cohort, cohort != ""
+}
+
+// drainHeld reports whether the drain-time gate's own rule
+// (pairingDrainPicture.hold) keeps in rotation the pods of one protocol that
+// a surge of one Instance trades for another. The late pods count, as there.
+func (p pairingPicture) drainHeld(side v1beta1.ComponentType, index int32, leaving, cohort string) bool {
+	key := strconv.Itoa(int(index))
+	serving, instances := p.late.over(p.serving, p.instances)
+	after := copyServing(serving)
+	if after[side][leaving] > 0 {
+		after[side][leaving]--
 	}
-	key := strconv.Itoa(int(row.Index))
-	after := copyServing(p.serving)
-	if after[side][from] > 0 {
-		after[side][from]--
-	}
-	afterInstances := copyInstances(p.instances)
-	afterInstances[side][key] = withoutOneCohort(afterInstances[side][key], from)
+	afterInstances := copyInstances(instances)
+	afterInstances[side][key] = withoutOneCohort(afterInstances[side][key], leaving)
 	drain := pairingDrainPicture{
 		component: side,
 		cohort:    cohort,
-		serving:   p.serving, after: after,
-		instances: p.instances, afterInstances: afterInstances,
-		leaving: map[string]struct{}{from: {}},
+		serving:   serving, after: after,
+		instances: instances, afterInstances: afterInstances,
+		leaving: map[string]struct{}{leaving: {}},
 		floors:  p.floors,
 	}
 	held, _ := drain.hold()
 	return held
+}
+
+// withoutSurgePodsLetGo leaves out of the counts every pod of a surge that
+// the drain-time gate would let leave rotation now. Such a pod leaves with
+// no further question, so a start must not count it as a partner.
+func (p pairingPicture) withoutSurgePodsLetGo(replicas map[v1beta1.ComponentType]*v1beta1.InferenceReplica) pairingPicture {
+	p.serving, p.instances = copyServing(p.serving), copyInstances(p.instances)
+	p.letGo = map[v1beta1.ComponentType]map[int32]bool{}
+	for _, side := range pairingComponents {
+		p.letGo[side] = map[int32]bool{}
+	}
+	// One pod that leaves can free another, so both sides are asked again
+	// until no answer changes.
+	for again := true; again; {
+		again = false
+		for _, side := range pairingComponents {
+			again = p.letSurgePodsGo(side, replicas[side]) || again
+		}
+	}
+	return p
+}
+
+// letSurgePodsGo leaves out of the counts the pods of one side's surges
+// that the drain-time gate would let leave now (surgePodsThatLeave). It
+// reports whether it left any out.
+func (p pairingPicture) letSurgePodsGo(side v1beta1.ComponentType, ir *v1beta1.InferenceReplica) bool {
+	if ir == nil {
+		return false
+	}
+	left := false
+	for i := range ir.Status.InstanceStatuses {
+		row := &ir.Status.InstanceStatuses[i]
+		index, cohort, leave := p.surgePodsThatLeave(side, row, ir)
+		if !leave {
+			continue
+		}
+		if p.serving[side][cohort] > 0 {
+			p.serving[side][cohort]--
+		}
+		key := strconv.Itoa(int(index))
+		p.instances[side][key] = withoutOneCohort(p.instances[side][key], cohort)
+		p.letGo[side][row.Index] = true
+		left = true
+	}
+	return left
+}
+
+// surgePodsThatLeave reports the pods of one surge that the drain-time gate
+// would let leave rotation now: their Instance row and their protocol. When
+// the roll target left the surge's protocol, its replacement is asked first.
+func (p pairingPicture) surgePodsThatLeave(side v1beta1.ComponentType, row *v1beta1.OMENativeInstanceStatus, ir *v1beta1.InferenceReplica) (int32, string, bool) {
+	if p.letGo[side][row.Index] || !replacementServesBesideOldPods(row, ir) {
+		return 0, "", false
+	}
+	from, cohort, ok := p.surgeCohorts(row)
+	if !ok {
+		return 0, "", false
+	}
+	if cohort != p.target {
+		replacement := row.Index
+		if slot := row.Operation.SurgeIndex; slot != nil {
+			replacement = *slot
+		}
+		if !p.drainHeld(side, replacement, cohort, cohort) {
+			return replacement, cohort, true
+		}
+	}
+	return row.Index, from, !p.drainHeld(side, row.Index, from, cohort)
 }
 
 // gangSurgeSlot reports the row a gang surge builds its replacement in,
@@ -786,10 +997,10 @@ func (p pairingPicture) floorShortfall(sim map[v1beta1.ComponentType]map[string]
 // empty one is the empty cohort, which pairs with anything. A single-pod
 // surge keeps its replacement inside the source's Instance until the
 // promote, so once both pods are in rotation the row serves the running
-// revision and the one the surge is pinned to, and past the hand-over, with
-// the source out of rotation, the replacement is the row's serving pod. A
-// gang surge's replacement is its own row: it runs nothing yet and serves
-// the pinned revision.
+// revision and the surge's own. From the drain step on only the replacement
+// counts: the old pod is out of rotation, and the row's count follows one
+// status write later. A gang surge's replacement is its own row: it runs
+// nothing yet and serves the revision its surge moves to.
 func servingRevisions(inst *v1beta1.OMENativeInstanceStatus) []string {
 	op := inst.Operation
 	if op == nil || op.Type != v1beta1.InstanceOperationUpdate || op.TargetRevision == "" {
@@ -804,9 +1015,6 @@ func servingRevisions(inst *v1beta1.OMENativeInstanceStatus) []string {
 		}
 	case workloadtypes.UpdateStepSurgeDrain, workloadtypes.UpdateStepSurgeDrainSettle:
 		if op.SurgeIndex == nil {
-			if inst.ServingPodCount >= 2 {
-				return []string{inst.RunningRevision, op.TargetRevision}
-			}
 			return []string{op.TargetRevision}
 		}
 	}

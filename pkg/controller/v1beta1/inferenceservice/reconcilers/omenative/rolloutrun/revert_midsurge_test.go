@@ -7,6 +7,7 @@ import (
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload"
 	workloadstatus "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
+	fixture "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/testfixture"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -29,7 +30,7 @@ func irPublished(t *testing.T, current, target string, rows []workloadtypes.Inst
 	for _, row := range rows {
 		desired[row.Index] = 1
 	}
-	_, counters, err := observation.TakeInlineV1Publication(desired, target)
+	_, counters, err := observation.TakeInlineV1Publication(fixture.PlanWithDesiredPods(desired), target)
 	if err != nil {
 		t.Fatalf("TakeInlineV1Publication: %v", err)
 	}

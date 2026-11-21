@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	types "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
@@ -404,5 +405,47 @@ func TestObserverViewCarriesTheReadingsWindows(t *testing.T) {
 	if view.Spec.PodsPerInstance != 3 || view.Spec.MinReadySeconds != 5 || view.StuckPodGrace != 90*time.Second {
 		t.Fatalf("view carries podsPerInstance=%d minReadySeconds=%d stuckPodGrace=%s; want 3, 5, 90s",
 			view.Spec.PodsPerInstance, view.Spec.MinReadySeconds, view.StuckPodGrace)
+	}
+}
+
+// TestRevisionTemplateListsLiteralEnvAndRequests states what a tick's view
+// lists of a stored revision beside its images: the env values a template
+// sets by a literal and its resource requests, by container, init
+// containers included. A value read from another source is not listed, a
+// name set to the empty value is, and an absent template lists nothing.
+func TestRevisionTemplateListsLiteralEnvAndRequests(t *testing.T) {
+	spec := &corev1.PodSpec{
+		InitContainers: []corev1.Container{{
+			Name:      "fetch",
+			Env:       []corev1.EnvVar{{Name: "SOURCE", Value: "a"}},
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceCPU: resource.MustParse("1")}},
+		}},
+		Containers: []corev1.Container{
+			{
+				Name: "main",
+				Env: []corev1.EnvVar{
+					{Name: "MODE", Value: "a"},
+					{Name: "EMPTY"},
+					{Name: "NODE", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "spec.nodeName"}}},
+				},
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("8Gi")}},
+			},
+			{Name: "sidecar"},
+		},
+	}
+	env := literalEnvByContainer(spec)
+	if len(env) != 2 || len(env["fetch"]) != 1 || env["fetch"]["SOURCE"] != "a" || len(env["main"]) != 2 || env["main"]["MODE"] != "a" {
+		t.Fatalf("the literal env by container: %v", env)
+	}
+	if value, set := env["main"]["EMPTY"]; !set || value != "" {
+		t.Fatalf("a name set to the empty value is listed: %v", env["main"])
+	}
+	requests := requestsByContainer(spec)
+	cpu, memory := requests["fetch"][corev1.ResourceCPU], requests["main"][corev1.ResourceMemory]
+	if len(requests) != 2 || cpu.String() != "1" || memory.String() != "8Gi" {
+		t.Fatalf("the requests by container: %v", requests)
+	}
+	if len(literalEnvByContainer(nil)) != 0 || len(requestsByContainer(nil)) != 0 {
+		t.Fatalf("an absent template lists nothing")
 	}
 }

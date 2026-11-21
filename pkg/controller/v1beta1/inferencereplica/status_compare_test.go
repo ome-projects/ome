@@ -262,7 +262,6 @@ func (f *statusPublicationFixture) publicationInput(tb testing.TB) statusPublica
 	return statusPublication{
 		plan:             f.plan,
 		target:           f.target,
-		desiredByIdx:     workloadstatus.DesiredPodCountByInstance(f.plan),
 		pods:             workload.NewCachedSelectorPodObservation(pods, query.BucketPodsByInstanceIdx(pods)),
 		availableByPod:   availableByPod,
 		templateHash:     templateHashOf(f.passCopy),

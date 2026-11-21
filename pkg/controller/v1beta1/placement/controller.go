@@ -297,189 +297,335 @@ func normalizeRetryPriority(res ctrl.Result, err error) ctrl.Result {
 	return res
 }
 
+// placementPass is one reconcile pass over one source: what the pass has read
+// and decided so far, and the result a step ended it with. reconcile lists
+// the steps of a pass in order.
+type placementPass struct {
+	reconciler *Reconciler
+	request    ctrl.Request
+	// ctx carries what later steps and the status writes read: the backend
+	// verification and the placement input condition.
+	ctx context.Context
+	// source is the InferenceService the pass acts on: the cached copy first,
+	// the live copy once the direct read is done.
+	source *v1beta1.InferenceService
+	// clusters are the registered WorkloadClusters.
+	clusters []v1beta1.WorkloadCluster
+	// observations are the members the status records, read once per pass.
+	observations *placementObservations
+	// candidates are the clusters the pass may place on, narrowed by each gate.
+	candidates []string
+	// split reports a Split or SplitByCapacity source.
+	split bool
+	// autoscaler and rollout are the outcomes of the two policy gates; nil
+	// while a gate has not run or the source refers to no policy of its kind.
+	autoscaler *policyPreflightOutcome
+	rollout    *policyPreflightOutcome
+	// result is what the pass returns when a step ends it.
+	result ctrl.Result
+}
+
+// placementStep is one step of a pass. It reports whether the pass goes on;
+// a step that ends the pass has recorded the result through end.
+type placementStep func() (bool, error)
+
+// reconcile runs one pass over the source the request names: the steps in
+// order, stopping at the first one that ends the pass or fails.
 func (r *Reconciler) reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
-	isvc := &v1beta1.InferenceService{}
-	if err := r.Get(ctx, request.NamespacedName, isvc); err != nil {
-		if apierrors.IsNotFound(err) {
-			r.forgetCapacity(request.NamespacedName)
-			DeleteForISVC(request.Namespace, request.Name)
-			// Source already gone. The winner-lost grace marker is keyed by UID
-			// (unknown here) and is cleared in reconcileDelete once the finalizer
-			// runs; the worst case if that never ran is one stale map entry that
-			// never grows (a re-created ISVC gets a fresh UID), so nothing to do.
-			return ctrl.Result{}, nil
+	pass := &placementPass{reconciler: r, request: request, ctx: ctx}
+	for _, step := range []placementStep{
+		pass.readSource,
+		pass.readSourceLive,
+		pass.answerOutdatedCleanupRelease,
+		pass.readFleet,
+		pass.checkIntent,
+		pass.holdModeChange,
+		pass.addFinalizer,
+		pass.matchCandidates,
+		pass.gateAutoscalerPolicies,
+		pass.gateRolloutPolicies,
+		pass.place,
+	} {
+		if next, err := step(); !next || err != nil {
+			return pass.result, err
 		}
-		return ctrl.Result{}, err
 	}
+	return pass.result, nil
+}
 
+// end records the result a step ends the pass with and reports that the pass
+// does not go on.
+func (p *placementPass) end(result ctrl.Result, err error) (bool, error) {
+	p.result = result
+	return false, err
+}
+
+// forget drops the capacity history and the metrics of a source the pass
+// does not place.
+func (p *placementPass) forget() {
+	p.reconciler.forgetCapacity(p.request.NamespacedName)
+	DeleteForISVC(p.request.Namespace, p.request.Name)
+}
+
+// readSource reads the source from the cache. A source that is gone ends the
+// pass with nothing to do: the grace clock of a lost serving cluster is keyed
+// by UID, unknown here, and reconcileDelete clears it once the finalizer runs;
+// at worst one entry that never grows stays behind.
+func (p *placementPass) readSource() (bool, error) {
+	isvc := &v1beta1.InferenceService{}
+	if err := p.reconciler.Get(p.ctx, p.request.NamespacedName, isvc); err != nil {
+		if apierrors.IsNotFound(err) {
+			p.forget()
+			return p.end(ctrl.Result{}, nil)
+		}
+		return p.end(ctrl.Result{}, err)
+	}
+	return p.admit(isvc)
+}
+
+// admit decides whether a copy of the source may carry the pass on: a
+// deleting source is cleaned up, and only a placement source goes on. The
+// primary watch and queued status events can include local services, which
+// must acquire no placement state or remote allocations.
+func (p *placementPass) admit(isvc *v1beta1.InferenceService) (bool, error) {
 	if !isvc.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, isvc)
+		return p.end(p.reconciler.reconcileDelete(p.ctx, isvc))
 	}
-	// The primary watch and queued status events can include local services.
-	// Only placement sources may acquire placement state or remote allocations.
 	if !IsPlacementEligible(isvc) {
-		r.forgetCapacity(request.NamespacedName)
-		DeleteForISVC(request.Namespace, request.Name)
-		return ctrl.Result{}, nil
+		p.forget()
+		return p.end(ctrl.Result{}, nil)
 	}
+	p.source = isvc
+	return true, nil
+}
 
-	// The committed winner is placement authority; informer lag cannot reopen
-	// its race or discard a terminal winner between status writes.
-	if r.APIReader == nil {
-		return ctrl.Result{}, fmt.Errorf("placement requires a direct source reader")
+// readSourceLive reads the source again, live from the apiserver, and that
+// copy carries the pass on: the committed placement is the authority, and
+// informer lag must not reopen a race or discard a chosen cluster between
+// status writes.
+func (p *placementPass) readSourceLive() (bool, error) {
+	if p.reconciler.APIReader == nil {
+		return p.end(ctrl.Result{}, fmt.Errorf("placement requires a direct source reader"))
 	}
 	current := &v1beta1.InferenceService{}
-	if err := r.APIReader.Get(ctx, request.NamespacedName, current); err != nil {
+	if err := p.reconciler.APIReader.Get(p.ctx, p.request.NamespacedName, current); err != nil {
 		if apierrors.IsNotFound(err) {
-			DeleteForISVC(request.Namespace, request.Name)
+			DeleteForISVC(p.request.Namespace, p.request.Name)
 		}
-		return ctrl.Result{}, client.IgnoreNotFound(err)
+		return p.end(ctrl.Result{}, client.IgnoreNotFound(err))
 	}
-	if !current.DeletionTimestamp.IsZero() {
-		return r.reconcileDelete(ctx, current)
-	}
-	if !IsPlacementEligible(current) {
-		r.forgetCapacity(request.NamespacedName)
-		DeleteForISVC(request.Namespace, request.Name)
-		return ctrl.Result{}, nil
-	}
-	isvc = current
-	// A cleanup release request that cannot act on the stored plan is removed
-	// before any plan write, and the next pass reads the updated source. A failed
-	// removal stops the pass only for a revision the plan has not reached.
-	answered, err := r.answerOutdatedCleanupRelease(ctx, isvc)
+	return p.admit(current)
+}
+
+// answerOutdatedCleanupRelease removes a cleanup release request that cannot
+// act on the stored plan before any plan write, and ends the pass so the next
+// one reads the updated source. A failed removal stops the pass only for a
+// revision the plan has not reached.
+func (p *placementPass) answerOutdatedCleanupRelease() (bool, error) {
+	answered, err := p.reconciler.answerOutdatedCleanupRelease(p.ctx, p.source)
 	if err != nil {
-		return ctrl.Result{}, err
+		return p.end(ctrl.Result{}, err)
 	}
 	if answered {
-		return ctrl.Result{RequeueAfter: r.requeue()}, nil
+		return p.end(ctrl.Result{RequeueAfter: p.reconciler.requeue()}, nil)
 	}
-	ctx = unverifiedBackend(ctx, isvc)
-	if placementMode(isvc) != v1beta1.PlacementModeSplitByCapacity {
-		r.forgetCapacity(request.NamespacedName)
+	return true, nil
+}
+
+// readFleet lists the registered clusters and reads every member the status
+// records. Member observation is independent from placement eligibility: the
+// gates after it can stop actuation while the source's view of serving health
+// still moves.
+func (p *placementPass) readFleet() (bool, error) {
+	p.ctx = unverifiedBackend(p.ctx, p.source)
+	if placementMode(p.source) != v1beta1.PlacementModeSplitByCapacity {
+		p.reconciler.forgetCapacity(p.request.NamespacedName)
 	}
 	clusters := &v1beta1.WorkloadClusterList{}
-	if err := r.List(ctx, clusters); err != nil {
-		return ctrl.Result{}, err
+	if err := p.reconciler.List(p.ctx, clusters); err != nil {
+		return p.end(ctrl.Result{}, err)
 	}
-	ctx = withPlacementInputCondition(ctx, isvc, clusters.Items)
-	// Member observation is independent from placement eligibility. The members
-	// the status records are read before any readiness or policy gate, so those
-	// gates can stop actuation without freezing the source's view of serving health.
-	observations := r.observeStandingMembers(ctx, isvc, clusters.Items)
-	if err := validation.ValidatePlacementIntent(isvc); err != nil {
-		return r.writeObservedPlacement(ctx, isvc, observations)
-	}
-	if isvc.Status.Placement != nil && isvc.Status.Placement.Plan != nil && isvc.Status.Placement.Plan.Mode != "" && placementMode(isvc) != isvc.Status.Placement.Plan.Mode {
-		observations.projectAll = true
-		return r.writeSplitHold(ctx, isvc, observations, "PlacementModeChangeBlocked", fmt.Errorf("standing full-policy homes require their accepted execution mode"))
-	}
-	// Validate before a full-object write can normalize or prune invalid intent.
-	if controllerutil.AddFinalizer(isvc, PlacementFinalizer) {
-		if err := r.Update(ctx, isvc); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
+	p.clusters = clusters.Items
+	p.ctx = withPlacementInputCondition(p.ctx, p.source, p.clusters)
+	p.observations = p.reconciler.observeStandingMembers(p.ctx, p.source, p.clusters)
+	return true, nil
+}
 
-	candidates, reason, err := MatchCandidates(isvc, clusters.Items)
-	split := placementMode(isvc) == v1beta1.PlacementModeSplit || placementMode(isvc) == v1beta1.PlacementModeSplitByCapacity
-	if split || placementMode(isvc) == v1beta1.PlacementModeAll {
-		// Outgoing members still serve during a move. Unreadable peers cannot
-		// prevent discovery of health on the remaining matched members.
-		observations.projectAll = true
-		for _, cluster := range clusters.Items {
-			if split && observations.matches[cluster.Name] && !slices.Contains(observations.standing, cluster.Name) {
-				observations.standing = append(observations.standing, cluster.Name)
-				observations.refresh(ctx, r, isvc, cluster.Name)
-			}
-		}
+// checkIntent writes the observed placement and ends the pass for a source
+// whose placement intent is invalid.
+func (p *placementPass) checkIntent() (bool, error) {
+	if err := validation.ValidatePlacementIntent(p.source); err != nil {
+		return p.end(p.reconciler.writeObservedPlacement(p.ctx, p.source, p.observations))
 	}
-	retainedSingle := placementMode(isvc) == v1beta1.PlacementModeSingle && winnerCluster(isvc) != ""
-	if err != nil || (len(candidates) == 0 && !split && placementMode(isvc) != v1beta1.PlacementModeAll && !retainedSingle) {
-		// Surface WHY there are no candidates (malformed selector / no
-		// requirements declared / no Ready clusters / no match) so the empty
-		// set is diagnosable instead of an indistinguishable Pending.
-		r.Log.Info("no placement candidates", "isvc", isvc.Namespace+"/"+isvc.Name,
-			"reason", reason, "error", err)
-		if isvc.Status.Placement != nil && len(observations.standing) > 0 {
-			// WorkloadCluster readiness is sampled independently from the derived
-			// workload. Keep reconciling standing status while the current fleet
-			// view blocks new placement.
-			return r.writeObservedPlacement(ctx, isvc, observations)
-		}
-		return r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
-	}
+	return true, nil
+}
 
-	// AutoscalerPolicy preflight: for a source that references policies, gate
-	// the candidate set on member capability, policy presence, and digest
-	// equality against the control-plane anchor, and hold Split entirely while
-	// its per-cluster ceiling is unbounded. Nil (candidates untouched) for the
-	// common no-ref ISVC.
-	pf := r.preflightPolicies(ctx, isvc, candidates, clusters.Items)
-	if pf != nil && pf.holdAsIs {
-		return r.writeObservedPlacement(ctx, isvc, observations)
+// holdModeChange holds a source whose spec asks for another mode than its
+// accepted plan runs under.
+func (p *placementPass) holdModeChange() (bool, error) {
+	placement := p.source.Status.Placement
+	if placement == nil || placement.Plan == nil || placement.Plan.Mode == "" || placementMode(p.source) == placement.Plan.Mode {
+		return true, nil
 	}
-	if pf != nil && !pf.hold {
-		candidates = pf.eligible
-	}
+	p.observations.projectAll = true
+	return p.end(p.reconciler.writeSplitHold(p.ctx, p.source, p.observations, "PlacementModeChangeBlocked", fmt.Errorf("standing full-policy homes require their accepted execution mode")))
+}
 
-	// RolloutPolicy preflight: resolve ref-only rollout groups against the
-	// control-plane policy copies (the bodies fan-out inflates into the
-	// derived spec) and gate candidates on the rollout capability label. Runs
-	// on the autoscaler-narrowed candidate set; skipped while the autoscaler
-	// preflight already holds (nothing fans out either way). Nil for the
-	// common rollout-less ISVC.
-	var rf *policyPreflightOutcome
-	if pf == nil || !pf.hold {
-		rf = r.preflightRolloutPolicies(ctx, isvc, candidates, clusters.Items)
-		if rf != nil && rf.holdAsIs {
-			return r.writeObservedPlacement(ctx, isvc, observations)
-		}
-		if rf != nil && !rf.hold {
-			candidates = rf.eligible
+// addFinalizer adds the placement finalizer. It runs after the intent check,
+// so a full-object write cannot normalize or prune invalid intent.
+func (p *placementPass) addFinalizer() (bool, error) {
+	if controllerutil.AddFinalizer(p.source, PlacementFinalizer) {
+		if err := p.reconciler.Update(p.ctx, p.source); err != nil {
+			return p.end(ctrl.Result{}, err)
 		}
 	}
+	return true, nil
+}
 
-	var res ctrl.Result
-	if (pf != nil && pf.hold) || (rf != nil && rf.hold) {
-		res, err = r.writeObservedPlacement(ctx, isvc, observations)
-	} else {
-		ctx, err = r.preflightBackends(ctx, isvc, clusters.Items, candidates)
-		if err != nil {
-			r.forgetCapacity(request.NamespacedName)
-			observations.projectAll = true
-			for _, name := range observations.standing {
-				if _, exists := observations.get(name); !exists {
-					observations.refresh(ctx, r, isvc, name)
-				}
-			}
-			return r.writeObservedPlacement(ctx, isvc, observations)
-		}
-		backendEligible := verifiedBackendCandidates(ctx, candidates)
-		// Branch on placement mode. Each mode owns its own reconcile: Single keeps one
-		// winner, All keeps every member that admits, and Split apportions the requested
-		// replicas across its candidate set.
-		switch mode := placementMode(isvc); mode {
-		case v1beta1.PlacementModeSingle:
-			res, err = r.reconcileSinglePlanned(ctx, isvc, clusters.Items, backendEligible, observations)
-		case v1beta1.PlacementModeAll:
-			res, err = r.reconcileAllPlanned(ctx, isvc, clusters.Items, backendEligible, observations)
-		case v1beta1.PlacementModeSplit, v1beta1.PlacementModeSplitByCapacity:
-			res, err = r.reconcileSplit(ctx, isvc, clusters.Items, backendEligible, observations)
-		default:
-			r.Log.Info("placement mode not supported by this build; holding Pending",
-				"mode", mode, "isvc", isvc.Namespace+"/"+isvc.Name)
-			res, err = r.writePlacement(ctx, isvc, placementResult{phase: v1beta1.PlacementPhasePending})
+// matchCandidates matches the fleet against the source's affinity. A Split or
+// All source also observes every matched member. A Single source without a
+// candidate and without a chosen cluster says why and ends the pass, keeping
+// its standing members observed.
+func (p *placementPass) matchCandidates() (bool, error) {
+	candidates, reason, err := MatchCandidates(p.source, p.clusters)
+	p.candidates = candidates
+	mode := placementMode(p.source)
+	p.split = mode == v1beta1.PlacementModeSplit || mode == v1beta1.PlacementModeSplitByCapacity
+	if p.split || mode == v1beta1.PlacementModeAll {
+		p.observeMatchedMembers()
+	}
+	retainedSingle := mode == v1beta1.PlacementModeSingle && winnerCluster(p.source) != ""
+	if err == nil && (len(candidates) != 0 || p.split || mode == v1beta1.PlacementModeAll || retainedSingle) {
+		return true, nil
+	}
+	// Say why there is no candidate (a malformed selector, no requirements, no
+	// Ready cluster, no match), so the empty set reads apart from a plain Pending.
+	p.reconciler.Log.Info("no placement candidates", "isvc", p.source.Namespace+"/"+p.source.Name,
+		"reason", reason, "error", err)
+	if p.source.Status.Placement != nil && len(p.observations.standing) > 0 {
+		// WorkloadCluster readiness is sampled apart from the derived workload:
+		// the standing status keeps being written while the fleet view blocks
+		// new placement.
+		return p.end(p.reconciler.writeObservedPlacement(p.ctx, p.source, p.observations))
+	}
+	return p.end(p.reconciler.writePlacement(p.ctx, p.source, placementResult{phase: v1beta1.PlacementPhasePending}))
+}
+
+// observeMatchedMembers projects every standing member and, for a Split
+// source, reads each matched cluster that is not standing yet. Outgoing
+// members still serve during a move, and an unreadable peer must not hide the
+// health of the other matched members.
+func (p *placementPass) observeMatchedMembers() {
+	p.observations.projectAll = true
+	for _, cluster := range p.clusters {
+		if p.split && p.observations.matches[cluster.Name] && !slices.Contains(p.observations.standing, cluster.Name) {
+			p.observations.standing = append(p.observations.standing, cluster.Name)
+			p.observations.refresh(p.ctx, p.reconciler, p.source, cluster.Name)
 		}
 	}
-	transient := (pf != nil && pf.transient) || (rf != nil && rf.transient)
-	if err == nil && transient && res.RequeueAfter > r.requeue() {
-		// A preflight verdict this pass rests on a transient member or anchor
-		// read error: re-verify at the poll cadence rather than waiting out
-		// the long steady-state backstop.
-		res.RequeueAfter = r.requeue()
+}
+
+// gateAutoscalerPolicies runs the AutoscalerPolicy preflight for a source that
+// refers to policies: member capability, policy presence and digest equality
+// against the control-plane copy, and a hold of Split while its per-cluster
+// ceiling is unbounded. Nil for a source without a ref.
+func (p *placementPass) gateAutoscalerPolicies() (bool, error) {
+	p.autoscaler = p.reconciler.preflightPolicies(p.ctx, p.source, p.candidates, p.clusters)
+	return p.narrowBy(p.autoscaler)
+}
+
+// gateRolloutPolicies runs the RolloutPolicy preflight on the candidates the
+// autoscaler gate left: the control-plane policy copies resolve, and the
+// candidates carry the rollout capability label. It is skipped while the
+// autoscaler gate already holds, since nothing fans out either way. Nil for a
+// source without a rollout ref.
+func (p *placementPass) gateRolloutPolicies() (bool, error) {
+	if p.autoscaler != nil && p.autoscaler.hold {
+		return true, nil
 	}
-	return res, err
+	p.rollout = p.reconciler.preflightRolloutPolicies(p.ctx, p.source, p.candidates, p.clusters)
+	return p.narrowBy(p.rollout)
+}
+
+// narrowBy applies one gate's outcome: nil leaves the candidates as they are,
+// a hold of the serving cluster itself ends the pass with the placement
+// observed as it is, and a passed gate narrows the candidates to the eligible
+// ones. A plain hold is read by place.
+func (p *placementPass) narrowBy(outcome *policyPreflightOutcome) (bool, error) {
+	if outcome == nil {
+		return true, nil
+	}
+	if outcome.holdAsIs {
+		return p.end(p.reconciler.writeObservedPlacement(p.ctx, p.source, p.observations))
+	}
+	if !outcome.hold {
+		p.candidates = outcome.eligible
+	}
+	return true, nil
+}
+
+// place observes the source while a policy gate holds, otherwise verifies the
+// member backends and runs the mode's own reconcile. The pass ends here.
+func (p *placementPass) place() (bool, error) {
+	if p.held() {
+		res, err := p.reconciler.writeObservedPlacement(p.ctx, p.source, p.observations)
+		return p.end(p.shortenedForTransient(res, err), err)
+	}
+	ctx, err := p.reconciler.preflightBackends(p.ctx, p.source, p.clusters, p.candidates)
+	p.ctx = ctx
+	if err != nil {
+		return p.end(p.observeAfterBackendFailure())
+	}
+	res, err := p.placeByMode(verifiedBackendCandidates(p.ctx, p.candidates))
+	return p.end(p.shortenedForTransient(res, err), err)
+}
+
+// held reports that a policy gate holds fan-out this pass.
+func (p *placementPass) held() bool {
+	return (p.autoscaler != nil && p.autoscaler.hold) || (p.rollout != nil && p.rollout.hold)
+}
+
+// observeAfterBackendFailure writes the observed placement after the backend
+// preflight failed, with every standing member read.
+func (p *placementPass) observeAfterBackendFailure() (ctrl.Result, error) {
+	p.reconciler.forgetCapacity(p.request.NamespacedName)
+	p.observations.projectAll = true
+	for _, name := range p.observations.standing {
+		if _, exists := p.observations.get(name); !exists {
+			p.observations.refresh(p.ctx, p.reconciler, p.source, name)
+		}
+	}
+	return p.reconciler.writeObservedPlacement(p.ctx, p.source, p.observations)
+}
+
+// placeByMode runs the mode's own reconcile over the candidates whose
+// backends verified: Single keeps one chosen cluster, All keeps every member
+// that admits, and Split apportions the requested replicas across its
+// candidates. A mode this build does not know holds Pending.
+func (p *placementPass) placeByMode(eligible []string) (ctrl.Result, error) {
+	switch mode := placementMode(p.source); mode {
+	case v1beta1.PlacementModeSingle:
+		return p.reconciler.reconcileSinglePlanned(p.ctx, p.source, p.clusters, eligible, p.observations)
+	case v1beta1.PlacementModeAll:
+		return p.reconciler.reconcileAllPlanned(p.ctx, p.source, p.clusters, eligible, p.observations)
+	case v1beta1.PlacementModeSplit, v1beta1.PlacementModeSplitByCapacity:
+		return p.reconciler.reconcileSplit(p.ctx, p.source, p.clusters, eligible, p.observations)
+	default:
+		p.reconciler.Log.Info("placement mode not supported by this build; holding Pending",
+			"mode", mode, "isvc", p.source.Namespace+"/"+p.source.Name)
+		return p.reconciler.writePlacement(p.ctx, p.source, placementResult{phase: v1beta1.PlacementPhasePending})
+	}
+}
+
+// shortenedForTransient re-checks at the poll cadence a pass whose gate rested
+// on a transient member or control-plane read error, instead of waiting out
+// the long steady-state backstop.
+func (p *placementPass) shortenedForTransient(res ctrl.Result, err error) ctrl.Result {
+	transient := (p.autoscaler != nil && p.autoscaler.transient) || (p.rollout != nil && p.rollout.transient)
+	if err == nil && transient && res.RequeueAfter > p.reconciler.requeue() {
+		res.RequeueAfter = p.reconciler.requeue()
+	}
+	return res
 }
 
 // placementMode returns explicit source intent without a mode default.

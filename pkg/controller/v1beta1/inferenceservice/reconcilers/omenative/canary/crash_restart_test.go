@@ -10,6 +10,8 @@ import (
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/evidence"
+	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
 // A crash loop parks the canary; a single restart does not. The readings
@@ -140,6 +142,63 @@ func TestCrashedCanaryPod_OneRestartIsNotACrashLoop(t *testing.T) {
 		{"a settled row published Restarting does not make one restart a loop",
 			observed(instanceRow(5, v1beta1.OMENativeInstanceRestarting, "svc-decoder-new", &ready, 1)),
 			[]*corev1.Pod{readyAgain(crashPod("new", 5, 1, runnerDied(death)))}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := crashedCanaryPod(v1beta1.DecoderComponent, tc.observed, tc.pods, since)
+			if tc.want == "" {
+				if got != nil {
+					t.Fatalf("no crash expected, got %+v", got)
+				}
+				return
+			}
+			if got == nil || got.Detail != tc.want || got.Component != v1beta1.DecoderComponent {
+				t.Fatalf("crash %+v, want detail %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// parkedRow is the row of an Instance whose update or repair the workload
+// stopped at its ready deadline: the row reads Failed and still carries the
+// operation, its Ready entry is the old pod set's, and its last failure is
+// the new pod's readiness, dated when that pod started.
+func parkedRow(index int32, readyAt, startedAt time.Time, incarnation int64, op *v1beta1.InstanceOperation) v1beta1.OMENativeInstanceStatus {
+	row := instanceRow(index, v1beta1.OMENativeInstanceFailed, "svc-decoder-old", &readyAt, incarnation)
+	row.TargetRevision = "svc-decoder-new"
+	row.LastFailure = &v1beta1.InstanceTermination{PodName: "svc-decoder-5-default-0", ContainerName: constants.MainContainerName,
+		Reason: evidence.ReasonContainersNotReady, Time: metav1.NewTime(startedAt)}
+	row.Operation = op
+	return row
+}
+
+// TestCrashedCanaryPod_ParkedReplacementNeverServed: an update replaced an
+// Instance's pod with a version 2 pod, which missed its ready deadline, so
+// the workload stopped the update and keeps the Instance out of service.
+// That pod never served, so its deaths at boot are not a crash after
+// serving, however many there are and however long after the replacement
+// they come.
+func TestCrashedCanaryPod_ParkedReplacementNeverServed(t *testing.T) {
+	ready := time.Unix(100000, 0)
+	since := ready.Add(time.Minute) // the canary's anchor
+	started := since.Add(18 * time.Second)
+	death := started.Add(65 * time.Minute)
+	observed := func(rows ...v1beta1.OMENativeInstanceStatus) observedCanaryRevisions {
+		return observedCanaryRevisions{targetHash: "new", rows: rows, fromIR: true, statusFresh: true}
+	}
+	update := &v1beta1.InstanceOperation{ID: "update-5", Type: v1beta1.InstanceOperationUpdate, Step: workloadtypes.UpdateStepParked,
+		StartedAt: metav1.NewTime(started), TargetRevision: "svc-decoder-new"}
+	for _, tc := range []struct {
+		name     string
+		observed observedCanaryRevisions
+		pods     []*corev1.Pod
+		want     string
+	}{
+		{"a parked replacement that died once at boot and runs again keeps the step",
+			observed(parkedRow(5, ready, started, 2, update)), []*corev1.Pod{notReady(crashPod("new", 5, 2, runnerDied(death)))}, ""},
+		{"a parked replacement that keeps dying at boot keeps the step",
+			observed(parkedRow(5, ready, started, 2, update)), []*corev1.Pod{notReady(crashPod("new", 5, 2, runnerDiedTwice(death, death.Add(40*time.Second))))}, ""},
+		{"a parked repair still reads the old pod set it drains, which served",
+			observed(parkedRow(5, ready, started, 2, repairOperation(5))), []*corev1.Pod{readyAgain(crashPod("new", 5, 1, runnerDiedTwice(death, death.Add(40*time.Second))))}, "container ome-container Error (exit 1)"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := crashedCanaryPod(v1beta1.DecoderComponent, tc.observed, tc.pods, since)

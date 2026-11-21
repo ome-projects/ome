@@ -884,18 +884,19 @@ func repairRatioConfigs(full bool) []scaleConfig {
 	return configs
 }
 
-// The known pictures of this model: reported, not failed, until a fix
-// removes the entry and the lock test that holds it.
+// The classes this model names: the known picture is reported, not
+// failed, until a change of behaviour removes the entry and the lock test that holds it;
+// an attempt waiting on a pod that never started on a lost node is a
+// finding, held closed by TestUpdate_ANewPodThatNeverRanOnANodeThatStoppedReportingIsBuiltAgainElsewhere.
 const (
 	knownRebuildsOutrunTheRatio     = "known-rebuilds-on-the-new-version-outrun-the-ratio"
-	knownNeverStartedPodOfALostNode = "known-attempt-waits-on-a-never-started-pod-of-a-lost-node"
+	knownNeverStartedPodOfALostNode = "attempt-waits-on-a-never-started-pod-of-a-lost-node"
 )
 
-// knownRepairRatioClasses are the finding classes this model shows on main
-// today, each with the picture behind it.
+// knownRepairRatioClasses are the finding classes this model shows on the
+// current engine, each with the picture behind it.
 var knownRepairRatioClasses = map[string]string{
-	knownNeverStartedPodOfALostNode: "a node that stops reporting while it holds an attempt's new pod before that pod ever ran leaves the attempt waiting on it for good: the force-delete policy removes the pods the node had run after its threshold, but a pod that never ran a container is removed only inside a repair (ops/restart.go:freeRebuiltSetNames), not for a surge, a recreate or the Create pass's own build, and the attempt names no hold once the old pod is gone (held by TestRepairsUnderTheRatioGate_ALostNodeUnderTheLastSurgeLeavesItsReplacementWaitingWithNoHold)",
-	knownRebuildsOutrunTheRatio:     "Instances that lose every pod under an open roll are handed to the roll, written Pending and rebuilt by the Create pass on the new version in one pass with no coordination gate and no budget asked, under both strategies; an Instance whose pods are listed but serve nothing is recreated by the update pass exempt from the gate; so a loss of many Instances on one side puts that side's new-version share past the ratio rule's tolerance plus one step at once, where the gates admit one step at a time (held by TestRepairsUnderTheRatioGate_NineLostPrefillInstancesAreRebuiltOnTheNewVersionAtOnce and TestRepairsUnderTheRatioGate_UnderRecreatePodTheLostInstancesAreRebuiltOnTheNewVersionAtOnceToo)",
+	knownRebuildsOutrunTheRatio: "Instances that lose every pod under an open roll are handed to the roll, written Pending and rebuilt by the Create pass on the new version in one pass with no coordination gate and no budget asked, under both strategies; an Instance whose pods are listed but serve nothing is recreated by the update pass exempt from the gate; so a loss of many Instances on one side puts that side's new-version share past the ratio rule's tolerance plus one step at once, where the gates admit one step at a time (held by TestRepairsUnderTheRatioGate_NineLostPrefillInstancesAreRebuiltOnTheNewVersionAtOnce and TestRepairsUnderTheRatioGate_UnderRecreatePodTheLostInstancesAreRebuiltOnTheNewVersionAtOnceToo)",
 }
 
 // repairRatioExpected reports an end the engine owes, counted and not
@@ -1233,39 +1234,36 @@ func repairWorldAtLast(t *testing.T, cfg scaleConfig) (*scaleWorld, *repairRatio
 	return w, m
 }
 
-// TestRepairsUnderTheRatioGate_ALostNodeUnderTheLastSurgeLeavesItsReplacementWaitingWithNoHold
-// holds the picture the model found. 16 prefill and 8 decode under
-// SurgeThenDrain at ten percent with maintainRatio; the roll is at its
-// last two prefill Instances, their replacements just created. The node
-// that holds those two Instances' old pods and replacements, and seven
-// promoted Instances' pods, stops reporting. After the force-delete
-// threshold the engine removes every pod the node had run and rebuilds
-// the seven promoted Instances elsewhere, but the two replacements that
-// never ran a container stay, and the two attempts wait on them with no
-// hold while the decoder finishes. When the engine removes a never-run
-// pod of an update attempt on a node that stopped reporting and builds
-// it again, this test fails and the known class goes with it.
-func TestRepairsUnderTheRatioGate_ALostNodeUnderTheLastSurgeLeavesItsReplacementWaitingWithNoHold(t *testing.T) {
+// TestRepairsUnderTheRatioGate_ANodeThatStopsReportingUnderTheLastSurgeIsRebuiltElsewhere
+// holds the rule. 16 prefill and 8 decode under SurgeThenDrain
+// at ten percent with maintainRatio; the roll is at its last two prefill
+// Instances, their replacements just created. The node that holds those
+// two Instances' old pods and replacements, and seven promoted Instances'
+// pods, stops reporting. After the force-delete threshold the engine
+// removes every pod the node held, the two replacements that never ran a
+// container included, builds them again on live nodes, and the roll
+// finishes with nothing left on the lost node.
+func TestRepairsUnderTheRatioGate_ANodeThatStopsReportingUnderTheLastSurgeIsRebuiltElsewhere(t *testing.T) {
 	surge := workloadtypes.UpdateStrategySurgeThenDrain
 	cfg := scaleConfig{shape: scaleShape{16, 8, 1}, settings: scaleSettings{prefill: surge, decode: surge, maintainRatio: true}}
 	w, m := repairWorldAtLast(t, cfg)
 	m.apply(repairLoss{scope: lossPrefill, count: 9, kind: lossUnreported})
 	settled := m.playOut()
 	prefill := w.prefill()
-	var waiting []string
+	var left []string
 	for _, pod := range w.pods(prefill) {
-		if neverStartedOnALostNode(prefill, pod) {
-			waiting = append(waiting, pod.Name)
+		if prefill.h.deadNodes[pod.Spec.NodeName] {
+			left = append(left, pod.Name)
 		}
 	}
-	t.Logf("settled=%t after the loss: %s; pods that never started on the lost node: %v", settled, w.picture(), waiting)
-	if !settled {
-		t.Fatalf("the world did not settle: %s", w.picture())
+	t.Logf("settled=%t after the loss: %s; pods left on the lost node: %v", settled, w.picture(), left)
+	if !settled || !w.complete() {
+		t.Fatalf("the roll must finish after the node stopped reporting under its last replacements: %s", w.picture())
 	}
-	if w.complete() {
-		t.Fatalf("the picture moved: the roll finished after the loss; remove the known class and this lock: %s", w.picture())
+	if len(left) != 0 {
+		t.Fatalf("pods left on the lost node after the roll finished: %v", left)
 	}
-	if len(waiting) == 0 || prefill.h.hold != nil || !m.attemptWaitsOnANeverStartedPodOfALostNode() {
-		t.Fatalf("the picture moved: the prefill side no longer waits on a never-run pod with no hold (hold %v, pods %v); remove the known class and this lock: %s", prefill.h.hold, waiting, w.picture())
+	if c := w.counts[knownNeverStartedPodOfALostNode]; c != 0 {
+		t.Fatalf("an attempt waited on a never-run pod of the lost node on %d tick(s): %s", c, w.findings[knownNeverStartedPodOfALostNode].message)
 	}
 }

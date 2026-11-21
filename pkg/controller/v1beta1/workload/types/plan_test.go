@@ -281,3 +281,57 @@ func TestComponentPlan_TotalPodsFor_CountsTheLayoutRunnersForBuilds(t *testing.T
 	}
 	t.Logf("%d readings, %d pods counted", draws, counted)
 }
+
+// TestComponentPlan_InstanceAt holds the lookup to the plan: a dense plan,
+// a sparse one (gaps below, above and between its entries, as a plan reads
+// after a scale-down or during a surge), an empty one and an index the plan
+// does not cover.
+func TestComponentPlan_InstanceAt(t *testing.T) {
+	entries := func(indexes ...int32) []InstancePlan {
+		out := make([]InstancePlan, len(indexes))
+		for i, idx := range indexes {
+			out[i] = InstancePlan{Index: idx, Runners: []RunnerPlan{{Name: RunnerDefault, Size: idx + 1}}}
+		}
+		return out
+	}
+	tests := []struct {
+		name    string
+		plan    ComponentPlan
+		covered []int32
+		missing []int32
+	}{
+		{name: "dense", plan: ComponentPlan{Instances: entries(0, 1, 2, 3)}, covered: []int32{0, 1, 2, 3}, missing: []int32{-1, 4, 100}},
+		{name: "sparse", plan: ComponentPlan{Instances: entries(0, 2, 5, 9)}, covered: []int32{0, 2, 5, 9}, missing: []int32{-1, 1, 3, 4, 6, 10}},
+		{name: "sparse from above", plan: ComponentPlan{Instances: entries(3, 4, 5, 7)}, covered: []int32{3, 4, 5, 7}, missing: []int32{0, 1, 2, 6, 8}},
+		{name: "empty", plan: ComponentPlan{}, missing: []int32{0, 1}},
+	}
+	for _, tc := range tests {
+		for _, idx := range tc.covered {
+			inst := tc.plan.InstanceAt(idx)
+			if inst == nil || inst.Index != idx {
+				t.Errorf("%s: InstanceAt(%d) = %v, want the entry with that index", tc.name, idx, inst)
+				continue
+			}
+			if got := tc.plan.DesiredPodsFor(idx, 42); got != idx+1 {
+				t.Errorf("%s: DesiredPodsFor(%d) = %d, want the entry's %d pods", tc.name, idx, got, idx+1)
+			}
+		}
+		for _, idx := range tc.missing {
+			if inst := tc.plan.InstanceAt(idx); inst != nil {
+				t.Errorf("%s: InstanceAt(%d) = entry %d, want nil", tc.name, idx, inst.Index)
+			}
+			if got := tc.plan.DesiredPodsFor(idx, 42); got != 42 {
+				t.Errorf("%s: DesiredPodsFor(%d) = %d, want the observed 42", tc.name, idx, got)
+			}
+		}
+	}
+}
+
+// TestComponentPlan_InstanceAt_AliasesThePlan holds that the entry handed
+// back is the plan's own, not a copy.
+func TestComponentPlan_InstanceAt_AliasesThePlan(t *testing.T) {
+	plan := ComponentPlan{Instances: []InstancePlan{{Index: 0}, {Index: 1}}}
+	if got := plan.InstanceAt(1); got != &plan.Instances[1] {
+		t.Fatalf("InstanceAt(1) = %p, want the plan's entry at %p", got, &plan.Instances[1])
+	}
+}

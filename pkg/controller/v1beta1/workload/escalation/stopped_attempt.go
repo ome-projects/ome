@@ -49,12 +49,11 @@ func FollowStoppedAttempts(ctx context.Context, in PassInput) error {
 	if err != nil {
 		return fmt.Errorf("workload.Reconcile: list pods to follow parked attempts (component=%s): %w", plan.Component, err)
 	}
-	desiredByIdx := status.DesiredPodCountByInstance(plan)
 	wait := stoppedAttemptWait(input, nextAttemptRevision(in))
 	now := input.Now()
 	for _, row := range stopped {
 		own := evidence.AttemptStuckPods(row, byIdx[row.Index], row.Operation.TargetRevision)
-		desired := status.DesiredFor(desiredByIdx, row.Index, row.PodCount)
+		desired := plan.DesiredPodsFor(row.Index, row.PodCount)
 		phase := stoppedAttemptPhase(row.Phase, own, desired, now, input.StuckPodGrace)
 		if row.Phase == phase && (wait == "" || row.Operation.Waiting == wait) {
 			continue

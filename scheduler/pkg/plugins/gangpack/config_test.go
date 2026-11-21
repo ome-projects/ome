@@ -86,3 +86,24 @@ func TestDecodeArgs_ARefusalNamesTheArgumentItRefuses(t *testing.T) {
 		}
 	}
 }
+
+// TestDecodeArgs_PreemptionIsOffUnlessSetAndNeedsACap: without a preemption
+// block the plugin never preempts; a block without a positive cap is refused.
+func TestDecodeArgs_PreemptionIsOffUnlessSetAndNeedsACap(t *testing.T) {
+	off, err := decodeArgs(&runtime.Unknown{Raw: []byte(`{"gcIntervalSeconds":5}`)})
+	if err != nil || off.maxPreemptionsInFlight() != 0 {
+		t.Fatalf("no preemption block: cap = %d, err = %v, want 0 and nil", off.maxPreemptionsInFlight(), err)
+	}
+	on, err := decodeArgs(&runtime.Unknown{Raw: []byte(`{"gcIntervalSeconds":5,"preemption":{"maxInFlight":2}}`)})
+	if err != nil || on.maxPreemptionsInFlight() != 2 {
+		t.Fatalf("maxInFlight 2: cap = %d, err = %v, want 2 and nil", on.maxPreemptionsInFlight(), err)
+	}
+	for raw, want := range map[string]string{
+		`{"gcIntervalSeconds":5,"preemption":{}}`:                "preemption.maxInFlight must be configured when preemption is set",
+		`{"gcIntervalSeconds":5,"preemption":{"maxInFlight":0}}`: "preemption.maxInFlight must be at least 1",
+	} {
+		if _, err := decodeArgs(&runtime.Unknown{Raw: []byte(raw)}); err == nil || err.Error() != want {
+			t.Errorf("decodeArgs(%s) err = %v, want %q", raw, err, want)
+		}
+	}
+}

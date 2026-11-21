@@ -68,6 +68,10 @@ type ComponentInputs struct {
 	// replica created this reconcile is created pointed at it. Empty when
 	// the unit keeps no stable side.
 	RollbackToRevision string
+	// UpdateStrategyOverride replaces the Component's update strategy on its
+	// InferenceReplica while a canary force needs another one. nil leaves the
+	// Component's own strategy.
+	UpdateStrategyOverride *v1beta1.UpdateStrategy
 	// CoordinatorFollower marks a Component whose desired count the scaling
 	// coordinator owns; CoordinatorTarget is the count it resolved for this
 	// reconcile, nil when it resolved none.

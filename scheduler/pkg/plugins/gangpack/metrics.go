@@ -71,6 +71,32 @@ var (
 		},
 	)
 
+	// gangPreemptionTotal counts preemption decisions by result: "evicted"
+	// (lower-priority pods evicted and a domain held), "held" (a domain held while pods
+	// already shutting down there leave), "in_flight_limit" (the configured
+	// number of preemptions was already in flight), "no_domain" (no domain fits
+	// the gang even with every lower-priority unit gone) or "hold_expired" (a
+	// held domain still could not fit its gang when the hold's time was up).
+	gangPreemptionTotal = metrics.NewCounterVec(
+		&metrics.CounterOpts{
+			Subsystem:      metricsSubsystem,
+			Name:           "gang_preemption_total",
+			Help:           "Gang preemption decisions by result (evicted, held, in_flight_limit, no_domain, hold_expired).",
+			StabilityLevel: metrics.ALPHA,
+		},
+		[]string{"result"},
+	)
+
+	// gangPreemptionEvictedPods counts the pods gang preemption evicted.
+	gangPreemptionEvictedPods = metrics.NewCounter(
+		&metrics.CounterOpts{
+			Subsystem:      metricsSubsystem,
+			Name:           "gang_preemption_evicted_pods_total",
+			Help:           "Pods evicted by gang preemption.",
+			StabilityLevel: metrics.ALPHA,
+		},
+	)
+
 	// assignedGroups, exported as pinned_groups, is how many placement groups
 	// currently hold a domain assignment (and its capacity reservation).
 	assignedGroups = metrics.NewGauge(
@@ -89,7 +115,8 @@ var registerMetricsOnce sync.Once
 // registry exactly once.
 func registerMetrics() {
 	registerMetricsOnce.Do(func() {
-		legacyregistry.MustRegister(gangAssignmentTotal, gangGateTotal, gangActivationTotal, gangUnwindTotal, assignedGroups)
+		legacyregistry.MustRegister(gangAssignmentTotal, gangGateTotal, gangActivationTotal, gangUnwindTotal, assignedGroups,
+			gangPreemptionTotal, gangPreemptionEvictedPods)
 	})
 }
 

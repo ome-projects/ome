@@ -63,7 +63,7 @@ func fdSkipGracePolicy() *workload.ForceDeletePolicy {
 // fdClassify classifies pod at fdNow with c as both the cache and the
 // API server, as the escalation reads them once the cache has caught up.
 func fdClassify(c client.Reader, pod *corev1.Pod, policy *workload.ForceDeletePolicy) evidence.TerminatingResult {
-	return evidence.StuckTerminating(context.Background(), workload.NodeReaders{Cache: c, Live: c}, pod, policy, fdNow)
+	return evidence.StuckTerminating(context.Background(), workload.NodeReaders{Cache: c, Live: c}, pod, policy, workload.Lifecycle{}, fdNow)
 }
 
 // fdFakeClient builds a fake client with the schemes the force-delete

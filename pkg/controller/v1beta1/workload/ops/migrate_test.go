@@ -458,6 +458,9 @@ type migFixture struct {
 	// pauseNewSurge holds fresh migration reservations, as the adapter
 	// does while placement execution pauses surge.
 	pauseNewSurge bool
+	// planGate, when set, is the plan gate the pass asks; a held gate
+	// admits no start on the roll target.
+	planGate func() (bool, workload.RolloutHoldGate, string)
 	// conditions captures every Component condition the pass stamps, in
 	// write order, when a test wires the capture.
 	conditions *[]metav1.Condition
@@ -637,6 +640,7 @@ func (f *migFixture) input(t *testing.T) workload.ReconcileInput {
 	in.ObservedState.RetryBlocks = append([]workload.RetryBlock(nil), f.retryBlocks...)
 	in.UpdateRetryPolicy = f.retryPolicy
 	in.PauseNewSurge = f.pauseNewSurge
+	in.PlanGate = f.planGate
 	if f.conditions != nil {
 		in.WriteAggregateCondition = func(_ context.Context, cond metav1.Condition) error {
 			*f.conditions = append(*f.conditions, cond)
@@ -3246,7 +3250,8 @@ func TestMigrate_ReplacementFollowsTheRollTargetWhileItsRetryRecordIsInBackoff(t
 // TestMigrate_ReplacementKeepsTheSourceRevisionWhenTheRollCannotTakeIt: a
 // roll that cannot start on its target, or may not take the source, leaves
 // the move on the revision the source runs: a paused Component, a target
-// whose retry record is Held, and a partition that holds the source. The
+// whose retry record is Held, a plan gate that admits no start on the
+// target, and a partition that holds the source. The
 // operations name no revision, the surge renders the source's stored template
 // under the source's hash, and the promoted surge records the source
 // revision; the roll takes the moved Instance afterwards like any other
@@ -3260,6 +3265,7 @@ func TestMigrate_ReplacementKeepsTheSourceRevisionWhenTheRollCannotTakeIt(t *tes
 		{name: "the target's retry record is Held", arrange: func(f *migFixture) {
 			f.retryBlocks = []workload.RetryBlock{{TargetRevision: f.target.Name, State: workload.RetryBlockHeld}}
 		}},
+		{name: "the plan gate holds", arrange: func(f *migFixture) { f.planGate = planGateHolds }},
 		{name: "the partition holds the source", arrange: func(f *migFixture) {
 			partition := int32(3)
 			f.plan.UpdateStrategy.RollingUpdate = &workload.RollingUpdate{Partition: &partition}

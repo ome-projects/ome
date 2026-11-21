@@ -6396,6 +6396,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -14543,6 +14548,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -22681,6 +22691,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -31219,6 +31234,11 @@ spec:
                       properties:
                         instanceReadyTimeout:
                           type: string
+                        leaderGoneGracePeriod:
+                          type: string
+                          x-kubernetes-validations:
+                            - message: leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has.
+                              rule: duration(self) > duration('0s')
                         migrationPolicy:
                           properties:
                             mode:
@@ -33382,6 +33402,41 @@ spec:
                       required:
                         - reason
                       type: object
+                    forced:
+                      properties:
+                        canaryRevisionHash:
+                          type: string
+                        endReason:
+                          enum:
+                            - Completed
+                            - Crash
+                            - RolledBack
+                            - RunClosed
+                            - Paused
+                            - Removed
+                            - Changed
+                            - Expired
+                          type: string
+                        endedAt:
+                          format: date-time
+                          type: string
+                        mode:
+                          enum:
+                            - Disruptive
+                          type: string
+                        reason:
+                          type: string
+                        runID:
+                          type: string
+                        startedAt:
+                          format: date-time
+                          type: string
+                      required:
+                        - mode
+                        - reason
+                        - runID
+                        - startedAt
+                      type: object
                     lastConclusiveEvaluationTime:
                       format: date-time
                       type: string
@@ -33576,6 +33631,41 @@ spec:
                                 type: string
                             required:
                               - reason
+                            type: object
+                          forced:
+                            properties:
+                              canaryRevisionHash:
+                                type: string
+                              endReason:
+                                enum:
+                                  - Completed
+                                  - Crash
+                                  - RolledBack
+                                  - RunClosed
+                                  - Paused
+                                  - Removed
+                                  - Changed
+                                  - Expired
+                                type: string
+                              endedAt:
+                                format: date-time
+                                type: string
+                              mode:
+                                enum:
+                                  - Disruptive
+                                type: string
+                              reason:
+                                type: string
+                              runID:
+                                type: string
+                              startedAt:
+                                format: date-time
+                                type: string
+                            required:
+                              - mode
+                              - reason
+                              - runID
+                              - startedAt
                             type: object
                           lastConclusiveEvaluationTime:
                             format: date-time

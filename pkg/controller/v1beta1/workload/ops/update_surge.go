@@ -614,7 +614,7 @@ func (s *singlePodSurge) createReplacement(ctx context.Context) (bool, error) {
 	if !found {
 		return true, announceRevisionGone(ctx, s.deps, s.input, s.inst.Index, s.attemptRevision)
 	}
-	if _, err := createMissingPods(ctx, s.deps, s.input, s.plan, s.inst, s.inst.Index, s.replacementTargets, tmpl); err != nil {
+	if _, err := createMissingPods(ctx, s.deps, s.input, s.plan, s.inst, s.inst.Index, s.replacementTargets, s.replacementPods, tmpl); err != nil {
 		if createRejectionHandled(err) {
 			return true, nil
 		}

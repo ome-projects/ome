@@ -1,3 +1,6 @@
+{{- if and .Values.scheduler.plugin.preemption.enabled (not .Values.scheduler.disablePreemption) -}}
+{{- fail "scheduler.plugin.preemption.enabled requires scheduler.disablePreemption: the built-in preemptor runs first and would evict single gang pods across domains" -}}
+{{- end }}
 # The scheduler's KubeSchedulerConfiguration. One profile whose schedulerName is
 # the opt-in name; OMEGangPack is enabled via multiPoint, which wires it into
 # every extension point it implements (PreFilter, Filter, PostFilter, Reserve,
@@ -43,9 +46,10 @@ data:
               # simulation, so it can evict
               # victims scattered across domains that never assemble one whole free
               # domain — churning pods for nothing. Disabling it here means
-              # ome-scheduler simply waits for capacity (the default scheduler still
-              # preempts for everything it schedules). Set disablePreemption: false
-              # to restore the built-in behavior.
+              # ome-scheduler waits for capacity, or frees a whole domain itself
+              # when scheduler.plugin.preemption is enabled (the default scheduler
+              # still preempts for everything it schedules). Set
+              # disablePreemption: false to restore the built-in behavior.
               - name: DefaultPreemption
             {{- end }}
           score:
@@ -76,6 +80,12 @@ data:
               podGroupSyncTimeoutSeconds: {{ .Values.scheduler.plugin.podGroupSyncTimeoutSeconds }}
               gcIntervalSeconds: {{ .Values.scheduler.plugin.gcIntervalSeconds }}
               standaloneDomainPacking: {{ .Values.scheduler.plugin.standaloneDomainPacking }}
+              {{- with .Values.scheduler.plugin.preemption }}
+              {{- if .enabled }}
+              preemption:
+                maxInFlight: {{ .maxInFlight }}
+              {{- end }}
+              {{- end }}
           - name: NodeResourcesFit
             args:
               scoringStrategy:

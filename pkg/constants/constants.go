@@ -465,6 +465,9 @@ var (
 		RolloutPromoteAnnotation,
 		RolloutPromoteForceAnnotation,
 		RolloutRollbackAnnotation,
+		RolloutForceModeAnnotation,
+		RolloutForceRunAnnotation,
+		RolloutForceReasonAnnotation,
 	}
 
 	RevisionTemplateLabelDisallowedList = []string{
@@ -562,6 +565,25 @@ const (
 	KueueQueueLabelKey                 = "kueue.x-k8s.io/queue-name"
 	KueueWorkloadPriorityClassLabelKey = "kueue.x-k8s.io/priority-class"
 	KueueEnabledLabelKey               = "kueue-enabled"
+)
+
+// Kueue pod-group keys. Pods that share a group name and a total count form
+// one Kueue Workload, which Kueue admits whole and evicts whole.
+const (
+	KueuePodGroupNameLabelKey            = "kueue.x-k8s.io/pod-group-name"
+	KueuePodGroupTotalCountAnnotationKey = "kueue.x-k8s.io/pod-group-total-count"
+	// KueuePodGroupServingAnnotationKey marks a group of long-running pods:
+	// Kueue never treats the group as finished, and it admits a pod that
+	// joins the group while the group's Workload is admitted.
+	KueuePodGroupServingAnnotationKey = "kueue.x-k8s.io/pod-group-serving"
+	// KueuePodRoleAnnotationKey names the role a pod plays in its group.
+	// Kueue makes one entry of the group's Workload per role and keeps a role
+	// the pod already carries instead of hashing the pod's spec.
+	KueuePodRoleAnnotationKey = "kueue.x-k8s.io/role-hash"
+	// KueuePodFinalizer is the finalizer Kueue's pod webhook adds to every pod
+	// it manages. In a pod group Kueue keeps it until a replacement pod joins
+	// the group or the group's Workload is deleted.
+	KueuePodFinalizer = "kueue.x-k8s.io/managed"
 )
 
 // Model Agent & Model Controller

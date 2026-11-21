@@ -165,6 +165,10 @@ func (r *Reconciler) buildReconcileInput(ctx context.Context, ir *v1beta1.Infere
 		// Termination grace of a replacement a rollout abandons before it
 		// ever served. Zero (unconfigured) leaves such a pod its own grace.
 		AbandonedReplacementGrace: settings.AbandonedReplacement,
+		// Termination grace of the old pods of a multi-pod Instance a
+		// Restart rebuilds. Zero (unconfigured) leaves each pod its own
+		// grace.
+		GangRestartGrace: settings.GangRestart,
 		// Migration admission caps. Nil (unconfigured) holds requests:
 		// the caps are the only bound on destructive migration churn.
 		MigrationAudit: settings.MigrationAudit,
@@ -257,9 +261,10 @@ func (r *Reconciler) wireCoordinationGates(ctx context.Context, input *workloadt
 		}
 		// The pin alone, for the starts the workload admits without the
 		// capacity consult: an Instance that serves nothing still rolls on
-		// the plan.
+		// the plan. A spec the service has already changed is no plan
+		// either, so the gate also holds until the changed spec arrives.
 		input.PlanGate = func() (bool, workloadtypes.RolloutHoldGate, string) {
-			allowed, gate, reason := coordination.EvaluatePlanGate(parent, ir.Spec.Component)
+			allowed, gate, reason := coordination.EvaluateReplicaPlanGate(parent, ir)
 			return allowed, workloadtypes.RolloutHoldGate(gate), reason
 		}
 		// The drain-time half of the pair floor: a surge update asks it with
@@ -1283,19 +1288,21 @@ func buildPromoteCurrentRevision(writer statusWriter, reads, podReader client.Re
 		if targetName == "" {
 			return nil
 		}
-		pods, err := podRevisionsFor(ctx, podReader, ir)
+		byInstance, err := componentPodsByInstance(ctx, podReader, ir)
 		if err != nil {
 			return err
 		}
-		return promoteCurrentRevisionOverPods(ctx, writer, reads, ir, targetName, pods)
+		return promoteCurrentRevisionOverPods(ctx, writer, reads, ir, targetName, byInstance)
 	}
 }
 
 // promoteCurrentRevisionOverPods is the promotion of buildPromoteCurrentRevision
-// over pods the caller read. The end of a pass lists the Component's pods
-// once and hands them to the promotion and to the publication, so both
-// decide from the same pods. An empty targetName promotes nothing.
-func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, targetName string, pods workloadstatus.PodRevisions) error {
+// over pods the caller read, bucketed by Instance index. The end of a pass
+// lists the Component's pods once and hands them to the promotion and to
+// the publication, so both decide from the same pods; the revision each
+// pod carries is read only when the rows alone do not decide. An empty
+// targetName promotes nothing.
+func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, reads client.Reader, ir *v1beta1.InferenceReplica, targetName string, byInstance map[int32][]*corev1.Pod) error {
 	if targetName == "" {
 		return nil
 	}
@@ -1304,7 +1311,7 @@ func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, re
 	// the pods call for, the live object needs no write, and nothing is
 	// read; a copy behind a write of this controller is read again by the
 	// pass that write's event brings.
-	if currentRevisionWanted(ir, targetName, pods) == ir.Status.CurrentRevision {
+	if currentRevisionWanted(ir, targetName, byInstance) == ir.Status.CurrentRevision {
 		return nil
 	}
 	key := client.ObjectKeyFromObject(ir)
@@ -1331,7 +1338,7 @@ func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, re
 		}
 		withdrawn := withdrawnRevisionFor(&fresh.Status)
 		recorded := fresh.Status.CurrentRevision
-		want := currentRevisionWanted(fresh, targetName, pods)
+		want := currentRevisionWanted(fresh, targetName, byInstance)
 		if want == recorded {
 			return nil
 		}
@@ -1362,10 +1369,11 @@ func promoteCurrentRevisionOverPods(ctx context.Context, writer statusWriter, re
 // currentRevisionWanted is the current revision the rows and the retry
 // records of ir, the revision its status records a rollback from, and the
 // revision each Instance's pods carry say its status should name, with
-// targetName as the roll target.
-func currentRevisionWanted(ir *v1beta1.InferenceReplica, targetName string, pods workloadstatus.PodRevisions) string {
+// targetName as the roll target. byInstance holds the Component's pods by
+// Instance index; their revisions are read only when a rule needs them.
+func currentRevisionWanted(ir *v1beta1.InferenceReplica, targetName string, byInstance map[int32][]*corev1.Pod) string {
 	insts := v1beta1convert.InstanceStatusSliceToWorkload(ir.Status.InstanceStatuses)
-	return workloadstatus.CurrentRevisionFor(insts, ir.Status.CurrentRevision, targetName, retryBlocksFromIR(ir), withdrawnRevisionFor(&ir.Status), pods)
+	return workloadstatus.CurrentRevisionOverPods(insts, ir.Status.CurrentRevision, targetName, retryBlocksFromIR(ir), withdrawnRevisionFor(&ir.Status), byInstance)
 }
 
 // buildRecordUpdateRevision writes status.updateRevision ahead of the pass
@@ -1388,7 +1396,6 @@ func currentRevisionWanted(ir *v1beta1.InferenceReplica, targetName string, pods
 func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Reader, ir *v1beta1.InferenceReplica, plan workloadtypes.ComponentPlan, nodes workloadtypes.NodePresence) func(ctx context.Context, targetName string) error {
 	key := client.ObjectKeyFromObject(ir)
 	templateHash := templateHashOf(ir)
-	desiredByIdx := workloadstatus.DesiredPodCountByInstance(plan)
 	return func(ctx context.Context, targetName string) error {
 		if targetName == "" {
 			return nil
@@ -1401,7 +1408,6 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 			return err
 		}
 		podsByInstance := query.BucketPodsByInstanceIdx(componentPods)
-		pods := workloadstatus.PodRevisionsByInstance(podsByInstance)
 		var committedCurrent string
 		var committedUpdated, committedUpdatedReady int32
 		wrote := false
@@ -1418,8 +1424,8 @@ func buildRecordUpdateRevision(writer statusWriter, reads, podReader client.Read
 			insts := v1beta1convert.InstanceStatusSliceToWorkload(fresh.Status.InstanceStatuses)
 			withdrawn := withdrawnRevisionFor(&fresh.Status)
 			recorded := fresh.Status.CurrentRevision
-			current := workloadstatus.CurrentRevisionFor(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn, pods)
-			updated, updatedReady := instancesOnRevision(insts, targetName, podsByInstance, desiredByIdx)
+			current := workloadstatus.CurrentRevisionOverPods(insts, recorded, targetName, retryBlocksFromIR(fresh), withdrawn, podsByInstance)
+			updated, updatedReady := instancesOnRevision(insts, targetName, podsByInstance, plan)
 			fresh.Status.UpdateRevision = targetName
 			fresh.Status.ObservedTemplateHash = templateHash
 			fresh.Status.CurrentRevision = current
@@ -1481,7 +1487,7 @@ func freshCopyForRecord(ctx context.Context, reads client.Reader, key client.Obj
 // before every write), so readiness is read from the live pods; the desired
 // size is the plan's, as the publication reads it, and the live pod count
 // for an Instance the plan does not name.
-func instancesOnRevision(insts []workloadtypes.InstanceStatus, revisionName string, podsByInstance map[int32][]*corev1.Pod, desiredByIdx map[int32]int32) (int32, int32) {
+func instancesOnRevision(insts []workloadtypes.InstanceStatus, revisionName string, podsByInstance map[int32][]*corev1.Pod, plan workloadtypes.ComponentPlan) (int32, int32) {
 	rev := query.RevisionFromName(revisionName)
 	var on, ready int32
 	for i := range insts {
@@ -1492,7 +1498,7 @@ func instancesOnRevision(insts []workloadtypes.InstanceStatus, revisionName stri
 		on++
 		live := query.ExcludeTerminalPods(podsByInstance[row.Index])
 		total := int32(len(live))
-		if workloadstatus.InstanceMeetsThreshold(total, workloadstatus.CountReadyPods(live), workloadstatus.DesiredFor(desiredByIdx, row.Index, total)) {
+		if workloadstatus.InstanceMeetsThreshold(total, workloadstatus.CountReadyPods(live), plan.DesiredPodsFor(row.Index, total)) {
 			ready++
 		}
 	}
@@ -1505,14 +1511,14 @@ func templateHashOf(ir *v1beta1.InferenceReplica) string {
 	return ir.Annotations[constants.InferenceReplicaTemplateHashAnnotationKey]
 }
 
-// podRevisionsFor lists the Component's pods through the cache, as the
-// publication does, and reads the revision each Instance's pods carry.
-func podRevisionsFor(ctx context.Context, c client.Reader, ir *v1beta1.InferenceReplica) (workloadstatus.PodRevisions, error) {
+// componentPodsByInstance lists the Component's pods through the cache, as
+// the publication does, bucketed by Instance index.
+func componentPodsByInstance(ctx context.Context, c client.Reader, ir *v1beta1.InferenceReplica) (map[int32][]*corev1.Pod, error) {
 	pods, err := listComponentPods(ctx, c, ir)
 	if err != nil {
 		return nil, err
 	}
-	return podRevisionsOf(pods), nil
+	return query.BucketPodsByInstanceIdx(pods), nil
 }
 
 // listComponentPods is the one cached list of the Component's pods a
@@ -1532,11 +1538,6 @@ func componentPodLister(c client.Reader, ir *v1beta1.InferenceReplica) func(cont
 	return func(ctx context.Context) ([]*corev1.Pod, error) {
 		return listComponentPods(ctx, c, ir)
 	}
-}
-
-// podRevisionsOf reads the revision each Instance's pods carry.
-func podRevisionsOf(pods []*corev1.Pod) workloadstatus.PodRevisions {
-	return workloadstatus.PodRevisionsByInstance(query.BucketPodsByInstanceIdx(pods))
 }
 
 // buildMutateRetryBlock wraps the workload-typed RetryBlock mutate

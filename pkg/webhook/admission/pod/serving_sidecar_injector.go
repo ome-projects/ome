@@ -15,15 +15,14 @@ const (
 )
 
 type ServingSidecarInjector struct {
-	Image                string `json:"image" validate:"required"`
-	MemoryRequest        string `json:"memoryRequest"`
-	MemoryLimit          string `json:"memoryLimit"`
-	CpuRequest           string `json:"cpuRequest"`
-	CpuLimit             string `json:"cpuLimit"`
-	CompartmentId        string `json:"compartmentId" validate:"required"`
-	AuthType             string `json:"authType" validate:"required"`
-	Region               string `json:"region"`
-	RealmDomainComponent string `json:"realmDomainComponent"`
+	Image         string `json:"image" validate:"required"`
+	MemoryRequest string `json:"memoryRequest"`
+	MemoryLimit   string `json:"memoryLimit"`
+	CpuRequest    string `json:"cpuRequest"`
+	CpuLimit      string `json:"cpuLimit"`
+	CompartmentId string `json:"compartmentId" validate:"required"`
+	AuthType      string `json:"authType" validate:"required"`
+	Region        string `json:"region"`
 }
 
 func newServingSidecarInjector(configMap *v1.ConfigMap) (*ServingSidecarInjector, error) {

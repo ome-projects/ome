@@ -817,8 +817,8 @@ func (m *heldModel) explore(seed int64) {
 // removes its entry and the lock test that holds it.
 const knownHeldFailedAttemptNamed = "known-held-failed-attempt-named-by-the-hold"
 
-// knownHeldExitClasses are the finding classes this model shows on main
-// today, each with the picture behind it.
+// knownHeldExitClasses are the finding classes this model shows on the
+// current engine, each with the picture behind it.
 var knownHeldExitClasses = map[string]string{
 	knownHeldFailedAttemptNamed: "an Instance whose attempt toward the target failed under the spent schedule is held by a partition after the release (a canary step's partition raised by a scale-up, or the operator's) and the roll never retries it while the partition holds it; the hold names the Instance and the two ways out, lowering the partition (the canary's next step does) or pushing another revision (held by TestHeldExits_ACanaryStepRaisedByAScaleUpHoldsTheFailedInstanceUntilThePromote and TestHeldExits_APartitionSetAtHeldNamesTheFailedInstancesItHoldsAfterTheRelease)",
 }
@@ -826,13 +826,27 @@ var knownHeldExitClasses = map[string]string{
 // heldExitsExpected reports an end the engine owes, counted and not
 // failed: the roll complete, held with no corrective step taken, paused
 // with the pause standing, held again after a release of a revision still
-// broken, waiting on a fault still standing, or an entry's own end.
+// broken, waiting on a fault still standing, or an entry's own end once
+// the world settled. An entry whose world never settles is not owed.
 func heldExitsExpected(class string) bool {
 	switch class {
 	case "complete", "held", "ends-paused", "held-again-after-release", "fault-still-standing":
 		return true
 	}
-	return strings.HasPrefix(class, "entry-")
+	return strings.HasPrefix(class, "entry-") && !strings.HasSuffix(class, "-not-settled")
+}
+
+// TestHeldExitsExpected_AnEntryThatNeverSettlesIsNotOwed holds the
+// reader's own rule: an entry's end is owed only once the world settled.
+func TestHeldExitsExpected_AnEntryThatNeverSettlesIsNotOwed(t *testing.T) {
+	for class, want := range map[string]bool{
+		"entry-paused": true, "entry-no-room": true, "held": true,
+		"entry-paused-not-settled": false, "entry-spent-crash-not-settled": false,
+	} {
+		if got := heldExitsExpected(class); got != want {
+			t.Errorf("heldExitsExpected(%q) = %t, want %t", class, got, want)
+		}
+	}
 }
 
 // heldResult is what one configuration's exploration found.

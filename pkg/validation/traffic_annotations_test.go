@@ -72,6 +72,24 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 			wantOK: true,
 		},
 		{
+			name: "valid force with a reason",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeDisruptive,
+				constants.RolloutForceRunAnnotation:    "svc-a-4f1c2b9e",
+				constants.RolloutForceReasonAnnotation: "version 1 fails every request",
+			},
+			wantOK: true,
+		},
+		{
+			name: "valid blue-green force with a reason",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeBlueGreen,
+				constants.RolloutForceRunAnnotation:    "svc-a-4f1c2b9e",
+				constants.RolloutForceReasonAnnotation: "version 1 fails every request",
+			},
+			wantOK: true,
+		},
+		{
 			name: "valid component-scoped resume target",
 			annotations: map[string]string{
 				constants.RolloutResumeAnnotation: "router=e5d6f79d",
@@ -192,6 +210,69 @@ func TestValidateTrafficAnnotations_TypedValues(t *testing.T) {
 				constants.RolloutResumeAnnotation: "true",
 			},
 			wantContains: "InvalidRolloutResumeTarget",
+		},
+		{
+			// The executor matches the value against the open run's ID.
+			name: "force run is not a run ID",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeDisruptive,
+				constants.RolloutForceRunAnnotation:    "Run_1",
+				constants.RolloutForceReasonAnnotation: "version 1 fails every request",
+			},
+			wantContains: "InvalidRolloutForceRun",
+		},
+		{
+			name: "force mode is not a known mode",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   "disruptive",
+				constants.RolloutForceRunAnnotation:    "svc-a-4f1c2b9e",
+				constants.RolloutForceReasonAnnotation: "version 1 fails every request",
+			},
+			wantContains: "InvalidRolloutForceMode",
+		},
+		{
+			name: "force without a run",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeDisruptive,
+				constants.RolloutForceReasonAnnotation: "version 1 fails every request",
+			},
+			wantContains: "InvalidRolloutForceRun",
+		},
+		{
+			// Removing the mode key alone stops a force; the run key it
+			// leaves is not an error here, and admission refuses a run key
+			// added or changed without a mode.
+			name: "a run left without a force mode",
+			annotations: map[string]string{
+				constants.RolloutForceRunAnnotation: "svc-a-4f1c2b9e",
+			},
+			wantOK: true,
+		},
+		{
+			name: "force without a reason",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation: constants.RolloutForceModeDisruptive,
+				constants.RolloutForceRunAnnotation:  "svc-a-4f1c2b9e",
+			},
+			wantContains: "InvalidRolloutForceReason",
+		},
+		{
+			name: "force with a blank reason",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeDisruptive,
+				constants.RolloutForceRunAnnotation:    "svc-a-4f1c2b9e",
+				constants.RolloutForceReasonAnnotation: "  ",
+			},
+			wantContains: "InvalidRolloutForceReason",
+		},
+		{
+			name: "force reason over the limit",
+			annotations: map[string]string{
+				constants.RolloutForceModeAnnotation:   constants.RolloutForceModeDisruptive,
+				constants.RolloutForceRunAnnotation:    "svc-a-4f1c2b9e",
+				constants.RolloutForceReasonAnnotation: strings.Repeat("x", constants.RolloutForceReasonMaxLength+1),
+			},
+			wantContains: "InvalidRolloutForceReason",
 		},
 		{
 			name: "resume scope is not a rollout Component",

@@ -205,6 +205,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - kueue.x-k8s.io
+  resources:
+  - workloads
+  verbs:
+  - delete
+  - get
+- apiGroups:
   - leaderworkerset.x-k8s.io
   resources:
   - leaderworkersets

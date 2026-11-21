@@ -60,11 +60,11 @@ func TestDecodedComponentIRAgreesAcrossEncodings(t *testing.T) {
 	columnar := fake.NewClientBuilder().WithScheme(decodedTestScheme(t)).WithObjects(columnarIR(t, rows)).Build()
 	decoder := irstatus.NewDecoder(uint64(len(rows)))
 
-	denseIR, denseEncoding, err := DecodedComponentIR(ctx, irstatus.NewReader(dense, decoder), "prod", "svc", v1beta1.EngineComponent)
+	denseIR, denseEncoding, err := DecodedComponentIRFor(ctx, irstatus.NewReader(dense, decoder), projectedService("prod", "svc"), v1beta1.EngineComponent)
 	if err != nil || denseIR == nil || denseEncoding != irstatus.EncodingDenseV1 {
 		t.Fatalf("dense read: ir=%v encoding=%q err=%v", denseIR != nil, denseEncoding, err)
 	}
-	columnarIR, columnarEncoding, err := DecodedComponentIR(ctx, irstatus.NewReader(columnar, decoder), "prod", "svc", v1beta1.EngineComponent)
+	columnarIR, columnarEncoding, err := DecodedComponentIRFor(ctx, irstatus.NewReader(columnar, decoder), projectedService("prod", "svc"), v1beta1.EngineComponent)
 	if err != nil || columnarIR == nil || columnarEncoding != irstatus.EncodingColumnarV2 {
 		t.Fatalf("columnar read: ir=%v encoding=%q err=%v", columnarIR != nil, columnarEncoding, err)
 	}
@@ -83,11 +83,11 @@ func TestDecodedComponentIRAgreesAcrossEncodings(t *testing.T) {
 
 func TestDecodedComponentIRAbsentAndNilReader(t *testing.T) {
 	ctx := context.Background()
-	if ir, encoding, err := DecodedComponentIR(ctx, nil, "prod", "svc", v1beta1.EngineComponent); ir != nil || encoding != "" || err != nil {
+	if ir, encoding, err := DecodedComponentIRFor(ctx, nil, projectedService("prod", "svc"), v1beta1.EngineComponent); ir != nil || encoding != "" || err != nil {
 		t.Fatalf("nil reader must degrade to no observation, got ir=%v encoding=%q err=%v", ir, encoding, err)
 	}
 	empty := fake.NewClientBuilder().WithScheme(decodedTestScheme(t)).Build()
-	if ir, _, err := DecodedComponentIR(ctx, irstatus.NewReader(empty, irstatus.NewDecoder(4)), "prod", "svc", v1beta1.EngineComponent); ir != nil || err != nil {
+	if ir, _, err := DecodedComponentIRFor(ctx, irstatus.NewReader(empty, irstatus.NewDecoder(4)), projectedService("prod", "svc"), v1beta1.EngineComponent); ir != nil || err != nil {
 		t.Fatalf("missing IR must be (nil, nil), got ir=%v err=%v", ir, err)
 	}
 	if ir, _, err := DecodedComponentIRFor(ctx, empty, projectedService("prod", "svc"), v1beta1.EngineComponent); ir != nil || err != nil {
@@ -102,14 +102,14 @@ func TestDecodedComponentIRFailsClosed(t *testing.T) {
 	malformed := columnarIR(t, rows)
 	malformed.Status.InstanceStatusColumns.Phases = nil
 	c := fake.NewClientBuilder().WithScheme(decodedTestScheme(t)).WithObjects(malformed).Build()
-	if ir, _, err := DecodedComponentIR(ctx, irstatus.NewReader(c, irstatus.NewDecoder(4)), "prod", "svc", v1beta1.EngineComponent); err == nil || ir != nil {
+	if ir, _, err := DecodedComponentIRFor(ctx, irstatus.NewReader(c, irstatus.NewDecoder(4)), projectedService("prod", "svc"), v1beta1.EngineComponent); err == nil || ir != nil {
 		t.Fatalf("malformed payload must be an error with no object, got ir=%v err=%v", ir, err)
 	} else if reason, ok := irstatus.ErrorReasonOf(err); !ok || reason != irstatus.ErrorReasonCoverage {
 		t.Fatalf("malformed payload error reason = %q (%v), want %s", reason, err, irstatus.ErrorReasonCoverage)
 	}
 
 	c = fake.NewClientBuilder().WithScheme(decodedTestScheme(t)).WithObjects(columnarIR(t, rows)).Build()
-	if _, _, err := DecodedComponentIR(ctx, c, "prod", "svc", v1beta1.EngineComponent); err == nil {
+	if _, _, err := DecodedComponentIRFor(ctx, c, projectedService("prod", "svc"), v1beta1.EngineComponent); err == nil {
 		t.Fatal("a reader without a configured bound must fail closed on ColumnarV2")
 	} else if reason, _ := irstatus.ErrorReasonOf(err); reason != irstatus.ErrorReasonCardinalityLimit {
 		t.Fatalf("unbounded read error reason = %q, want %s", reason, irstatus.ErrorReasonCardinalityLimit)
@@ -117,7 +117,7 @@ func TestDecodedComponentIRFailsClosed(t *testing.T) {
 
 	// The raw accessor never decodes: it returns the stored representation
 	// for callers that inspect no rows.
-	raw, err := ComponentIR(ctx, c, "prod", "svc", v1beta1.EngineComponent)
+	raw, err := ComponentIRFor(ctx, c, projectedService("prod", "svc"), v1beta1.EngineComponent)
 	if err != nil || raw == nil || raw.Status.InstanceStatusColumns == nil || len(raw.Status.InstanceStatuses) != 0 {
 		t.Fatalf("raw accessor must leave the ColumnarV2 representation untouched: %+v err=%v", raw, err)
 	}

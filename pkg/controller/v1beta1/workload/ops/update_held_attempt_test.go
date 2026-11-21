@@ -18,7 +18,9 @@ import (
 // (SurgeThenDrain) or is gone and only the recreated pod that never served
 // stands (RecreatePod). An Instance with no pod left is the create pass's
 // to rebuild and is not named; a row whose attempt still claims the
-// update, or whose target is another revision, is not either.
+// update, whose target is another revision, or that already runs the
+// target is not either, and a pod of a revision the roll has left is not
+// the attempt's.
 func TestHeldInstanceKeepsAFailedAttempt_ReadsTheAttemptsOwnPodWhenTheSourceIsGone(t *testing.T) {
 	const oldHash, targetHash, otherHash = "aaaa1111", "bbbb2222", "cccc3333"
 	oldRevision, targetRevision := "owner-engine-"+oldHash, "owner-engine-"+targetHash
@@ -37,13 +39,15 @@ func TestHeldInstanceKeepsAFailedAttempt_ReadsTheAttemptsOwnPodWhenTheSourceIsGo
 	}{
 		{"the source serves beside the failed replacement", failed(targetRevision, nil), []*corev1.Pod{podOf(0, oldHash), podOf(0, targetHash)}, true},
 		{"the source stands and the failed replacement is on its way out", failed(targetRevision, nil), []*corev1.Pod{podOf(0, oldHash), podOf(0, targetHash, leaving)}, true},
-		{"the source is gone and the recreated pod stands", failed(targetRevision, stopped), []*corev1.Pod{podOf(0, targetHash)}, true},
-		{"the source is gone and the recreated pod stands with no operation", failed(targetRevision, nil), []*corev1.Pod{podOf(0, targetHash)}, true},
+		{"the source is gone and the recreated pod stands", failed(targetRevision, stopped), []*corev1.Pod{podOf(0, targetHash, gateLost)}, true},
+		{"the source is gone and the recreated pod stands with no operation", failed(targetRevision, nil), []*corev1.Pod{podOf(0, targetHash, gateLost)}, true},
 		{"no pod is left", failed(targetRevision, stopped), nil, false},
 		{"the only pod left is on its way out", failed(targetRevision, stopped), []*corev1.Pod{podOf(0, targetHash, leaving)}, false},
 		{"the attempt still claims the update", failed(targetRevision, claimed), []*corev1.Pod{podOf(0, targetHash)}, false},
 		{"the attempt was toward a revision the roll has left", failed("owner-engine-"+otherHash, nil), []*corev1.Pod{podOf(0, oldHash), podOf(0, otherHash)}, false},
 		{"the row is Ready", &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseReady, RunningRevision: oldRevision, TargetRevision: targetRevision}, []*corev1.Pod{podOf(0, oldHash)}, false},
+		{"only a pod of a revision the roll has left stands", failed(targetRevision, nil), []*corev1.Pod{podOf(0, otherHash)}, false},
+		{"the row already runs the target", &workload.InstanceStatus{Index: 0, Phase: workload.InstancePhaseFailed, RunningRevision: targetRevision, TargetRevision: targetRevision}, []*corev1.Pod{podOf(0, targetHash)}, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

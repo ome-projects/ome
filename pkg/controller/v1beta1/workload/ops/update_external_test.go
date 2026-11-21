@@ -84,6 +84,116 @@ func TestCleanupWreckage_ServingAlienLeavesRotationBeforeItIsDeleted(t *testing.
 	}
 }
 
+// A pod the pass's list shows on a revision the Instance neither runs nor
+// rolls to, and that the apiserver holds on the running revision, is no
+// leftover: an
+// in-place roll moved it there under the same name after the list was
+// taken. The cleanup reads the pod live, leaves it in rotation and deletes
+// nothing, whether the list shows the pod serving or out of rotation.
+func TestCleanupOfLeftoverPods_APodListedBehindItsInPlacePatchIsLeftAlone(t *testing.T) {
+	for _, listedServing := range []bool{true, false} {
+		isvc, c, pod, target, events := alienFixture(t, true /* serving */)
+		listed := pod.DeepCopy()
+		if !listedServing {
+			listed.Status.Conditions = podForInstance(isvc, 0, true /* ready */, false /* serving */).Status.Conditions
+		}
+		live := &corev1.Pod{}
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), live); err != nil {
+			t.Fatalf("read the pod: %v", err)
+		}
+		live.Labels[query.LabelRevisionHash] = query.RevisionHashFromControllerRevisionName(alienRunningRevision)
+		if err := c.Update(context.Background(), live); err != nil {
+			t.Fatalf("move the pod onto the running revision: %v", err)
+		}
+		plan := buildPlanSinglePodEngine(1)
+		input := buildTestInput(isvc, c, workload.ComponentEngine)
+		done, err := ops.CleanupWreckage(context.Background(), workload.Deps{Client: c, Recorder: events},
+			input, plan, plan.Instances[0], target, []*corev1.Pod{listed})
+		if err != nil || !done {
+			t.Fatalf("listed serving=%v: done=%v err=%v, want nothing left to clean", listedServing, done, err)
+		}
+		after := &corev1.Pod{}
+		if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), after); err != nil {
+			t.Fatalf("listed serving=%v: the pod was deleted: %v", listedServing, err)
+		}
+		if !podreadiness.IsServing(after) {
+			t.Fatalf("listed serving=%v: the pod was taken out of rotation", listedServing)
+		}
+		if len(events.Events) != 0 {
+			t.Fatalf("listed serving=%v: the cleanup recorded %q", listedServing, <-events.Events)
+		}
+	}
+}
+
+// A pod deleted and made again under its own name since the pass listed it
+// is another pod, one the pass has not read. The cleanup leaves it in
+// rotation and deletes nothing, even while the new pod carries a revision
+// the Instance neither runs nor rolls to: the next pass decides on the pod
+// it lists.
+func TestCleanupOfLeftoverPods_APodMadeAgainUnderItsNameIsLeftToTheNextPass(t *testing.T) {
+	isvc, c, pod, target, events := alienFixture(t, true /* serving */)
+	listed := pod.DeepCopy()
+	listed.UID = "the-pod-the-pass-listed"
+	plan := buildPlanSinglePodEngine(1)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	done, err := ops.CleanupWreckage(context.Background(), workload.Deps{Client: c, Recorder: events},
+		input, plan, plan.Instances[0], target, []*corev1.Pod{listed})
+	if err != nil || !done {
+		t.Fatalf("done=%v err=%v, want nothing left to clean in this pass", done, err)
+	}
+	after := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), after); err != nil {
+		t.Fatalf("the pod made again under the name was deleted: %v", err)
+	}
+	if !podreadiness.IsServing(after) {
+		t.Fatalf("the pod made again under the name was taken out of rotation")
+	}
+	if len(events.Events) != 0 {
+		t.Fatalf("the cleanup recorded %q", <-events.Events)
+	}
+}
+
+// A leftover pod the pass's list shows terminating is on its way out, and
+// the cleanup only waits for it. It reads no pod from the apiserver for it,
+// writes nothing, and reports the Instance not clean yet.
+func TestCleanupOfLeftoverPods_APodListedTerminatingIsNotReadAgain(t *testing.T) {
+	isvc, c, pod, target, events := alienFixture(t, true /* serving */)
+	listed := pod.DeepCopy()
+	deleted := metav1.Now()
+	listed.DeletionTimestamp = &deleted
+	reads := &podReadCounter{Reader: c}
+	plan := buildPlanSinglePodEngine(1)
+	input := buildTestInput(isvc, c, workload.ComponentEngine)
+	done, err := ops.CleanupWreckage(context.Background(), workload.Deps{Client: c, APIReader: reads, Recorder: events},
+		input, plan, plan.Instances[0], target, []*corev1.Pod{listed})
+	if err != nil || done {
+		t.Fatalf("done=%v err=%v, want the cleanup to wait for the terminating pod", done, err)
+	}
+	if reads.pods != 0 {
+		t.Fatalf("the cleanup read %d pod(s) from the apiserver for a pod its list shows terminating; want none", reads.pods)
+	}
+	after := &corev1.Pod{}
+	if err := c.Get(context.Background(), client.ObjectKeyFromObject(pod), after); err != nil || !podreadiness.IsServing(after) {
+		t.Fatalf("the cleanup wrote to the pod it only waits for: err=%v", err)
+	}
+	if len(events.Events) != 0 {
+		t.Fatalf("the cleanup recorded %q", <-events.Events)
+	}
+}
+
+// podReadCounter counts the pods read through it.
+type podReadCounter struct {
+	client.Reader
+	pods int
+}
+
+func (r *podReadCounter) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := obj.(*corev1.Pod); ok {
+		r.pods++
+	}
+	return r.Reader.Get(ctx, key, obj, opts...)
+}
+
 func TestCleanupWreckage_VanishedAlienIsNotAnError(t *testing.T) {
 	isvc, c, pod, target, events := alienFixture(t, true /* serving */)
 	if err := c.Delete(context.Background(), pod); err != nil {

@@ -27,9 +27,6 @@ import (
 // Env vars are read-once at pod startup which matches the LLM-runtime
 // pattern.
 type PeerEndpointEnv struct {
-	// Peer is the peer Component these vars target.
-	Peer v1beta1.ComponentType
-
 	// GenericName is the OME_<PEER>_ENDPOINT env var name.
 	GenericName string
 
@@ -78,7 +75,6 @@ func PeerEnvDeclared(isvc *v1beta1.InferenceService) bool {
 func BuildPeerEndpointEnv(isvcName, peerPrefix, namespace, clusterDomain string, peer v1beta1.ComponentType, peerRevisionHash string) PeerEndpointEnv {
 	upper := strings.ToUpper(string(peer))
 	return PeerEndpointEnv{
-		Peer:          peer,
 		GenericName:   fmt.Sprintf("OME_%s_ENDPOINT", upper),
 		GenericValue:  genericPeerDNS(isvcName, peer, namespace, clusterDomain),
 		RevisionName:  fmt.Sprintf("OME_%s_REVISION_ENDPOINT", upper),

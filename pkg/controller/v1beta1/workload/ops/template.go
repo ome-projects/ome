@@ -79,8 +79,8 @@ func revisionNamed(input workload.ReconcileInput, component workload.ComponentTy
 // storedTemplate is the template the named ControllerRevision records,
 // stamped with that revision. target is the roll target: it tells the
 // renderer which keys of the current template's metadata belong to a
-// revision (see revisionMeta). found is false when the revision is gone;
-// the caller decides what a rebuild with nothing to render from does.
+// revision (see revision.ComposeMeta). found is false when the revision is
+// gone; the caller decides what a rebuild with nothing to render from does.
 // The roll target is never read through here: the Component's current
 // template IS that revision's, and callers with the target in hand go
 // through desiredTemplate.
@@ -115,7 +115,7 @@ func templateFromPayload(input workload.ReconcileInput, target *appsv1.Controlle
 		revision:      query.RevisionFromName(name),
 		podSpec:       payload.PodSpec,
 		workerPodSpec: payload.WorkerPodSpec,
-		meta:          revisionMeta(input.DesiredSpec.PodTemplateObjectMeta, owned, payload.PodMeta),
+		meta:          revision.ComposeMeta(input.DesiredSpec.PodTemplateObjectMeta, owned, payload.PodMeta),
 	}
 	if payload.PairingProtocol != nil {
 		tmpl.pairingProtocol = *payload.PairingProtocol
@@ -136,64 +136,6 @@ func revisionOwnedMeta(target *appsv1.ControllerRevision) (*metav1.ObjectMeta, e
 		return nil, nil
 	}
 	return payload.PodMeta, nil
-}
-
-// revisionMeta composes the labels and annotations a pod of a stored
-// revision carries. A key a revision hashes belongs to the revision: it
-// takes the stored revision's value and is absent when the stored
-// revision does not record it, even if the current template does — that
-// is a key a newer revision added. A key no revision hashes — the
-// admission plane's queue labels, the annotations inherited from the
-// owner — keeps following the current template. The renderer tells the
-// two apart by owned, the metadata the roll target recorded: a current
-// key the target hashed is a revision's; every other current key is not.
-func revisionMeta(current, owned, stored *metav1.ObjectMeta) *metav1.ObjectMeta {
-	if current == nil && stored == nil {
-		return nil
-	}
-	var ownedLabels, ownedAnnotations map[string]string
-	if owned != nil {
-		ownedLabels, ownedAnnotations = owned.Labels, owned.Annotations
-	}
-	out := &metav1.ObjectMeta{}
-	if current != nil {
-		out.Labels = cloneWithout(current.Labels, ownedLabels)
-		out.Annotations = cloneWithout(current.Annotations, ownedAnnotations)
-	}
-	if stored != nil {
-		out.Labels = overlay(out.Labels, stored.Labels)
-		out.Annotations = overlay(out.Annotations, stored.Annotations)
-	}
-	return out
-}
-
-// cloneWithout copies in, leaving out every key drop names.
-func cloneWithout(in, drop map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for k, v := range in {
-		if _, dropped := drop[k]; dropped {
-			continue
-		}
-		out[k] = v
-	}
-	return out
-}
-
-// overlay writes every entry of over into base and returns the result.
-func overlay(base, over map[string]string) map[string]string {
-	if len(over) == 0 {
-		return base
-	}
-	if base == nil {
-		base = make(map[string]string, len(over))
-	}
-	for k, v := range over {
-		base[k] = v
-	}
-	return base
 }
 
 // announceRevisionGone reports, once per attempt on the row, that a

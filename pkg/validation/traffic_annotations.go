@@ -13,6 +13,8 @@ import (
 	"strings"
 	"time"
 
+	k8svalidation "k8s.io/apimachinery/pkg/util/validation"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/trafficdrain"
@@ -32,6 +34,9 @@ const (
 	kindPromoteTarget // canary revision hash
 	kindResumeTarget  // canary revision hash, optionally "<component>=<hash>"
 	kindTrafficDrain  // versioned JSON map of manual per-cluster traffic holds
+	kindForceMode     // a force mode: Disruptive or BlueGreen
+	kindForceRun      // an open rollout run's ID
+	kindForceReason   // non-empty free text, bounded in length
 )
 
 // trafficAnnotationKinds is the authoritative classifier for every
@@ -67,6 +72,9 @@ var trafficAnnotationKinds = map[string]trafficAnnotationKind{
 	constants.RolloutPromoteForceAnnotation:    kindPromoteTarget,
 	constants.RolloutRollbackAnnotation:        kindBool,
 	constants.RolloutResumeAnnotation:          kindResumeTarget,
+	constants.RolloutForceModeAnnotation:       kindForceMode,
+	constants.RolloutForceRunAnnotation:        kindForceRun,
+	constants.RolloutForceReasonAnnotation:     kindForceReason,
 }
 
 // resumableRoles names the Components a "<component>=<hash>"
@@ -146,6 +154,9 @@ func ValidateTrafficAnnotations(annotations map[string]string, traffic *v1beta1.
 	if err := crossRuleRetry(annotations); err != nil {
 		return warnings, err
 	}
+	if err := crossRuleForceReason(annotations); err != nil {
+		return warnings, err
+	}
 	if w := crossRuleStickyEndpointCap(annotations, traffic); w != "" {
 		warnings = append(warnings, w)
 	}
@@ -213,6 +224,23 @@ func validateAnnotationValue(key, value string, kind trafficAnnotationKind) erro
 		if !isRevisionHashToken(hash) {
 			return fmt.Errorf("annotation %q value %q must be the parked canary revision hash, copied from status.components.<component>.canary.canaryRevisionHash, optionally scoped as \"<component>=<hash>\" (lowercase alphanumeric, at least 6 chars) (InvalidRolloutResumeTarget)", key, value)
 		}
+	case kindForceMode:
+		if value != constants.RolloutForceModeDisruptive && value != constants.RolloutForceModeBlueGreen {
+			return fmt.Errorf("annotation %q value %q must be %q or %q (InvalidRolloutForceMode)", key, value, constants.RolloutForceModeDisruptive, constants.RolloutForceModeBlueGreen)
+		}
+	case kindForceRun:
+		// The executor matches the value against the open run's ID, so
+		// anything else would sit on the object doing nothing.
+		if !isRunIDToken(value) {
+			return fmt.Errorf("annotation %q value %q must be the open rollout run's ID, copied from status.rollout.activeRun.runID (InvalidRolloutForceRun)", key, value)
+		}
+	case kindForceReason:
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("annotation %q must say why the rollout is forced (InvalidRolloutForceReason)", key)
+		}
+		if n := len([]rune(value)); n > constants.RolloutForceReasonMaxLength {
+			return fmt.Errorf("annotation %q is %d characters; the limit is %d (InvalidRolloutForceReason)", key, n, constants.RolloutForceReasonMaxLength)
+		}
 	case kindTrafficDrain:
 		if _, err := trafficdrain.Parse(value); err != nil {
 			return fmt.Errorf("annotation %q is not a valid traffic-drain value (InvalidTrafficDrain): %w", key, err)
@@ -234,6 +262,39 @@ func isRevisionHashToken(s string) bool {
 		}
 	}
 	return true
+}
+
+// isRunIDToken reports whether s looks like a rollout run ID: lowercase
+// alphanumerics, '-' and '.', as an InferenceService name followed by a hash,
+// and no longer than a Kubernetes object name.
+func isRunIDToken(s string) bool {
+	if s == "" || len(s) > k8svalidation.DNS1123SubdomainMaxLength {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+// crossRuleForceReason requires every force to name its run and give a
+// reason: the run binds the request to one rollout, and the reason is the
+// record of why the outage was accepted. A run key left after the mode key
+// is removed is allowed, since removing the mode alone must stop a force;
+// admission refuses a run key added or changed without a mode.
+func crossRuleForceReason(annotations map[string]string) error {
+	if _, forced := annotations[constants.RolloutForceModeAnnotation]; !forced {
+		return nil
+	}
+	if _, bound := annotations[constants.RolloutForceRunAnnotation]; !bound {
+		return fmt.Errorf("annotation %q needs %q: name the open rollout run, from status.rollout.activeRun.runID (InvalidRolloutForceRun)", constants.RolloutForceModeAnnotation, constants.RolloutForceRunAnnotation)
+	}
+	if _, ok := annotations[constants.RolloutForceReasonAnnotation]; !ok {
+		return fmt.Errorf("annotation %q needs %q: say why the rollout is forced (InvalidRolloutForceReason)", constants.RolloutForceModeAnnotation, constants.RolloutForceReasonAnnotation)
+	}
+	return nil
 }
 
 // crossRuleRetry enforces "retry-attempts > 0 requires retry-on".

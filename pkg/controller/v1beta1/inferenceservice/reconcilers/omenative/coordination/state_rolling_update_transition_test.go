@@ -178,6 +178,11 @@ var rollingUpdateRows = []rollingUpdateRow{
 		want: rollingSurging,
 	},
 	{
+		name: "the engine the ratio gate holds is named while the router surges",
+		pair: skewPair(4, 0, 0),
+		want: withEngineHeld(rollingSurging),
+	},
+	{
 		name: "the held start is named while a router's new pod is not Ready",
 		pair: skewPair(4, 1, 0),
 		edit: func(m map[v1beta1.ComponentType]*ComponentObservation) {

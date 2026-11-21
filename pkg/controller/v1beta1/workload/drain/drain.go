@@ -107,7 +107,7 @@ func (b *Batcher) IsPodDrained(ctx context.Context, serviceName string, pod *cor
 		}
 		return absence.drained, nil
 	}
-	return !endpoints.index.ready.contains(pod), nil
+	return !endpoints.index.routed(pod), nil
 }
 
 // IsPodRouted reports whether pod is still published through
@@ -130,7 +130,7 @@ func (b *Batcher) IsPodRouted(ctx context.Context, serviceName string, pod *core
 	if endpoints.empty {
 		return true, nil
 	}
-	return endpoints.index.ready.contains(pod), nil
+	return endpoints.index.routed(pod), nil
 }
 
 // IsPodInRotation reports whether serviceName publishes pod as an
@@ -146,7 +146,7 @@ func (b *Batcher) IsPodInRotation(ctx context.Context, serviceName string, pod *
 	if endpoints.err != nil {
 		return false, endpoints.err
 	}
-	return endpoints.index.available.contains(pod), nil
+	return endpoints.index.inRotation(pod), nil
 }
 
 // RoutesNothing reports whether serviceName carries no traffic path at
@@ -218,68 +218,76 @@ func (b *Batcher) readAbsence(ctx context.Context, serviceName string) serviceAb
 	return absence
 }
 
-// endpointIndex is the pods a Service's endpoints name, in the two
-// senses the readings ask: ready is every pod kube-proxy still routes
-// to, a terminating one included; available is every pod eligible for
-// new traffic, Ready and not Terminating. available is a subset of ready.
+// endpointIndex is the pods a Service's endpoints name, each with the
+// strongest reading any endpoint naming it carries. A pod is routed when
+// some endpoint naming it is Ready, a terminating one included: kube-proxy
+// still sends it traffic. A pod is in rotation when some endpoint naming it
+// is Ready and not Terminating: eligible for new traffic. In rotation
+// implies routed. The TargetRef is the pod's identity, where an address can
+// be reused by a later pod: a ref with a namespace names exactly that pod,
+// one with no namespace names a pod of that name in any namespace.
 type endpointIndex struct {
-	ready     podTargets
-	available podTargets
+	// exact and anyNamespace hold true for a pod in rotation and false for
+	// a pod routed only.
+	exact        map[client.ObjectKey]bool
+	anyNamespace map[string]bool
 }
 
-// indexEndpoints reads every endpoint of slices once into the index.
+// indexEndpoints reads every endpoint of slices once into the index. The
+// map is sized for the Ready endpoints before the first is added, so it
+// never grows while it fills: growing a map of thousands of entries costs
+// more than the entries themselves.
 func indexEndpoints(slices []discoveryv1.EndpointSlice) endpointIndex {
-	index := endpointIndex{ready: newPodTargets(), available: newPodTargets()}
+	ready := 0
+	for i := range slices {
+		for j := range slices[i].Endpoints {
+			if endpointIsReady(slices[i].Endpoints[j]) {
+				ready++
+			}
+		}
+	}
+	index := endpointIndex{exact: make(map[client.ObjectKey]bool, ready)}
 	for i := range slices {
 		for j := range slices[i].Endpoints {
 			ep := &slices[i].Endpoints[j]
-			if !endpointIsReady(*ep) {
-				continue
-			}
-			index.ready.add(ep.TargetRef)
-			if EndpointAvailable(*ep) {
-				index.available.add(ep.TargetRef)
+			if endpointIsReady(*ep) {
+				index.add(ep.TargetRef, EndpointAvailable(*ep))
 			}
 		}
 	}
 	return index
 }
 
-// podTargets is a set of pods named by endpoint TargetRefs. A TargetRef
-// with no namespace names a pod of that name in any namespace; one with
-// a namespace names exactly that pod. The TargetRef is the pod's stable
-// identity, where an address can be reused by a later pod.
-type podTargets struct {
-	exact        map[client.ObjectKey]struct{}
-	anyNamespace map[string]struct{}
-}
-
-func newPodTargets() podTargets {
-	return podTargets{
-		exact:        map[client.ObjectKey]struct{}{},
-		anyNamespace: map[string]struct{}{},
-	}
-}
-
-// add records the pod ref names; a ref of another kind names none.
-func (t podTargets) add(ref *corev1.ObjectReference) {
+// add records that a Ready endpoint names the pod ref points at, in
+// rotation or routed only; a pod already in rotation stays so. A ref of
+// another kind names no pod.
+func (x *endpointIndex) add(ref *corev1.ObjectReference, inRotation bool) {
 	if ref == nil || (ref.Kind != "" && ref.Kind != "Pod") {
 		return
 	}
 	if ref.Namespace == "" {
-		t.anyNamespace[ref.Name] = struct{}{}
+		if x.anyNamespace == nil {
+			x.anyNamespace = map[string]bool{}
+		}
+		x.anyNamespace[ref.Name] = x.anyNamespace[ref.Name] || inRotation
 		return
 	}
-	t.exact[client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}] = struct{}{}
+	key := client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}
+	x.exact[key] = x.exact[key] || inRotation
 }
 
-// contains reports whether some endpoint named pod.
-func (t podTargets) contains(pod *corev1.Pod) bool {
-	if _, ok := t.anyNamespace[pod.Name]; ok {
+// routed reports whether some Ready endpoint named pod.
+func (x endpointIndex) routed(pod *corev1.Pod) bool {
+	if _, ok := x.anyNamespace[pod.Name]; ok {
 		return true
 	}
-	_, ok := t.exact[client.ObjectKeyFromObject(pod)]
+	_, ok := x.exact[client.ObjectKeyFromObject(pod)]
 	return ok
+}
+
+// inRotation reports whether some Ready, not Terminating endpoint named pod.
+func (x endpointIndex) inRotation(pod *corev1.Pod) bool {
+	return x.anyNamespace[pod.Name] || x.exact[client.ObjectKeyFromObject(pod)]
 }
 
 // drainedWhenSliceListEmpty is the drain gate's answer for a Service

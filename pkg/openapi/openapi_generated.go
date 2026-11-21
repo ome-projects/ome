@@ -63,6 +63,7 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobSpec":                   schema_pkg_apis_ome_v1beta1_BenchmarkJobSpec(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.BenchmarkJobStatus":                 schema_pkg_apis_ome_v1beta1_BenchmarkJobStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure":                      schema_pkg_apis_ome_v1beta1_CanaryFailure(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryForce":                        schema_pkg_apis_ome_v1beta1_CanaryForce(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryStatus":                       schema_pkg_apis_ome_v1beta1_CanaryStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAllocationStatus":          schema_pkg_apis_ome_v1beta1_CandidateAllocationStatus(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CandidateAutoscalingStatus":         schema_pkg_apis_ome_v1beta1_CandidateAutoscalingStatus(ref),
@@ -3227,6 +3228,72 @@ func schema_pkg_apis_ome_v1beta1_CanaryFailure(ref common.ReferenceCallback) com
 	}
 }
 
+func schema_pkg_apis_ome_v1beta1_CanaryForce(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "CanaryForce is one force on a canary run: the request and how it ended.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"mode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Mode is how the force replaces the old Instances.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"reason": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Reason is the operator's reason, as given in ome.io/rollout-force-reason.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"runID": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RunID is the rollout run the force applies to. A new run never inherits it.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"canaryRevisionHash": {
+						SchemaProps: spec.SchemaProps{
+							Description: "CanaryRevisionHash is the canary revision the force drove. A crash on that canary may find no old Instance left; a later canary toward another revision is not affected by this force. It is cleared when the canary rolls back, since the rollback brings the old Instances back.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"startedAt": {
+						SchemaProps: spec.SchemaProps{
+							Description: "StartedAt is when the force first applied.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"endedAt": {
+						SchemaProps: spec.SchemaProps{
+							Description: "EndedAt is when the force ended; absent while it runs.",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Time"),
+						},
+					},
+					"endReason": {
+						SchemaProps: spec.SchemaProps{
+							Description: "EndReason is how the force ended; empty while it runs.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"mode", "reason", "runID", "startedAt"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
 func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
 	return common.OpenAPIDefinition{
 		Schema: spec.Schema{
@@ -3364,12 +3431,18 @@ func schema_pkg_apis_ome_v1beta1_CanaryStatus(ref common.ReferenceCallback) comm
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure"),
 						},
 					},
+					"forced": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Forced records a force that drives the unit's open run to 100% (ome.io/rollout-force-mode): the mode, the reason, the run, and how it ended. Absent until a force applies to the unit. While it runs (no EndedAt) the unit has no timers or gates. An ended force keeps the record of what happened until the next force or a new run replaces it.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryForce"),
+						},
+					},
 				},
 				Required: []string{"currentStep", "observedTrafficWeight"},
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AnalysisMetricResult", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure"},
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Time", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AnalysisMetricResult", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryFailure", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.CanaryForce"},
 	}
 }
 
@@ -7721,7 +7794,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceReplicaSpec(ref common.ReferenceCallba
 					},
 					"lifecycle": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Lifecycle holds the OMENative lifecycle policies (RestartPolicy, UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, MigrationPolicy). An unset policy takes the fixed fallback its LifecycleSpec field names; an unset or zero instanceReadyTimeout falls back to the operator's lifecycle.instanceReadyTimeout on every replica, and with neither set operations open with no deadline. The operator's deploy defaults are applied only to a projected replica, before the copy. lifecycle.minReadySeconds is not read on a replica and is rejected on a standalone one; set spec.minReadySeconds. On a projected replica this is the component's effective lifecycle: the InferenceService's value, else the runtime's, with unset fields filled from the operator's deploy defaults.",
+							Description: "Lifecycle holds the OMENative lifecycle policies (RestartPolicy, UpdateStrategy, ReadyPolicy, InstanceReadyTimeout, LeaderGoneGracePeriod, MigrationPolicy). An unset policy takes the fixed fallback its LifecycleSpec field names; an unset or zero instanceReadyTimeout falls back to the operator's lifecycle.instanceReadyTimeout on every replica, and with neither set operations open with no deadline. An unset leaderGoneGracePeriod has no fallback on any replica: every pod keeps its own termination grace. The operator's deploy defaults are applied only to a projected replica, before the copy. lifecycle.minReadySeconds is not read on a replica and is rejected on a standalone one; set spec.minReadySeconds. On a projected replica this is the component's effective lifecycle: the InferenceService's value, else the runtime's, with unset fields filled from the operator's deploy defaults.",
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.LifecycleSpec"),
 						},
 					},
@@ -9900,6 +9973,12 @@ func schema_pkg_apis_ome_v1beta1_LifecycleSpec(ref common.ReferenceCallback) com
 					"instanceReadyTimeout": {
 						SchemaProps: spec.SchemaProps{
 							Description: "InstanceReadyTimeout is OMENative's upper bound for waiting on a newly-created Instance to become Ready (during migration, rollout, or initial creation).",
+							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
+						},
+					},
+					"leaderGoneGracePeriod": {
+						SchemaProps: spec.SchemaProps{
+							Description: "LeaderGoneGracePeriod is the most time the worker pods of a multi-pod Instance that are still terminating get once the Instance's leader pod is gone. The workers of such an Instance work through their leader: a worker that outlives it cannot finish the requests it holds, and one that does not stop by itself keeps its node until its own terminationGracePeriodSeconds is over. With this field set, OMENative deletes each such worker once more with this grace. OMENative starts no deletion for it: a pod that is not terminating is never touched.\n\nHow long a worker then has depends on when its leader went. The API server counts the new grace from the first delete of the pod. When the leader is gone within this long of that delete, the worker's kubelet stops its containers this long after it learns of the new grace. When the leader itself took longer than this, the API server leaves the worker a grace of 1s, and its kubelet stops it about 2s later.\n\nExample: an Instance of 1 leader and 3 workers whose pods have a termination grace of 480s is rolled. Unset, the workers are gone after 480s. With 30s and a leader whose pod is gone after 5s, the workers are gone after about 36s. With 30s and a leader that takes 60s, the workers are gone about 2s after it, 62s after their delete.\n\nWhile this field is set, OMENative waits longer before it treats a worker pod's kubelet as failed: up to the larger of this value and the grace the pod shows, past the pod's deletion time. That holds for every worker pod that shows a grace at or under this value, or under its own terminationGracePeriodSeconds.\n\nThe field acts in every way a multi-pod Instance is taken down: a rollout, a scale-down, a restart of the Instance, a move to another node and the deletion of the service. The leader counts as gone when its pod object is gone or the pod has ended (phase Succeeded or Failed). The leader pod keeps its own grace, and so does a worker whose leader still runs or whose own grace ends sooner. A single-pod Instance has no leader, so the field does nothing there. The value must be above 0, and a fraction of a second counts as a whole second. Unset inherits the ServingRuntime's value. When neither sets it, every pod keeps its own grace, and nothing supplies a default.",
 							Ref:         ref("k8s.io/apimachinery/pkg/apis/meta/v1.Duration"),
 						},
 					},
@@ -14996,7 +15075,7 @@ func schema_pkg_apis_ome_v1beta1_Runner(ref common.ReferenceCallback) common.Ope
 					},
 					"template": {
 						SchemaProps: spec.SchemaProps{
-							Description: "Template is the fully-rendered pod template for this Runner. Labels include ome.io/runner=<name>. The InferenceReplica controller stamps OME_RUNNER (leader|worker|default) and, for pods of a multi-pod Instance, OME_LEADER_ADDRESS (short-form DNS of the leader pod's per-incarnation hostname, matching LWS conventions) onto the rendered pod at create.",
+							Description: "Template is the fully-rendered pod template for this Runner. Labels include ome.io/runner=<name>. The InferenceReplica controller stamps OME_RUNNER (leader|worker|default) and, for pods of a multi-pod Instance, OME_LEADER_ADDRESS (short-form DNS of the leader pod's hostname, matching LWS conventions) onto the rendered pod at create. The leader's hostname is its pod name followed by the recreation count its pod set was built at, or the pod name alone in a pod set whose pods already have that form.",
 							Default:     map[string]interface{}{},
 							Ref:         ref("k8s.io/api/core/v1.PodTemplateSpec"),
 						},

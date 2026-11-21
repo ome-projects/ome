@@ -16,9 +16,10 @@ import (
 // subset, observed routing selector capabilities, and the Pods behind those
 // aggregates. Capacity gates use the ready map; Service producers use routing.
 //
-// useIndex MUST match the reader (see observePerRevisionPods): the canary capacity
-// gate passes the LIVE API reader, which has no Pod field index, so it MUST pass
-// useIndex=false.
+// useIndex MUST match the reader (see observePerRevisionPods): true for the
+// manager's cached client, which carries the Pod field index and which the
+// canary dispatch reads its pods through as well; false for a reader without
+// the index, the live API reader or an index-less fake.
 //
 // With the cached client and useIndex=true the pods handed back are the
 // informer cache's own objects: read them during the pass, write nothing

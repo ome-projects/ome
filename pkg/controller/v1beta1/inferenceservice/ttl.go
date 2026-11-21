@@ -2,6 +2,7 @@ package inferenceservice
 
 import (
 	"context"
+	"math"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,14 +18,25 @@ import (
 // deleted because spec.ttlSecondsAfterCreation has passed.
 const ttlExpiredReason = "TTLExpired"
 
+// maxTTLSeconds is the longest TTL, in whole seconds, that a time.Duration
+// can hold: a Duration counts nanoseconds in an int64.
+const maxTTLSeconds = math.MaxInt64 / int64(time.Second)
+
 // ttlRemaining reports how long until the InferenceService's
 // spec.ttlSecondsAfterCreation passes; a value <= 0 means it already has.
-// ok is false when no TTL applies.
+// ok is false when no TTL applies: none is set, or it is longer than
+// maxTTLSeconds, a time no Duration can count, so it never passes.
 func ttlRemaining(isvc *v1beta1.InferenceService, now time.Time) (remaining time.Duration, ok bool) {
 	ttl := isvc.Spec.TTLSecondsAfterCreation
 	if ttl == nil || isvc.CreationTimestamp.IsZero() {
 		return 0, false
 	}
+	if *ttl > maxTTLSeconds {
+		return 0, false
+	}
+	// A TTL from 1, the least the schema admits, to maxTTLSeconds fits a
+	// Duration. Time.Add and Time.Sub hold at the ends of their ranges, so no
+	// step of this sum wraps.
 	expiry := isvc.CreationTimestamp.Add(time.Duration(*ttl) * time.Second)
 	return expiry.Sub(now), true
 }

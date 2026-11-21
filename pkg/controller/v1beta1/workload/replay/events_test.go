@@ -1239,3 +1239,47 @@ timeline:
 		t.Fatalf("a counted outage ends after its count: %v", err)
 	}
 }
+
+// TestApplySpecRevisionRewritesTheRequests states what a spec.revision
+// with requests writes: the template's resource requests, which the next
+// rendered container carries and the trace names in key order. The event
+// refuses an amount that is no quantity and changes nothing, and a
+// scenario that starts with such an amount does not load.
+func TestApplySpecRevisionRewritesTheRequests(t *testing.T) {
+	ctx := context.Background()
+	d := mustDriver(t, minimalScenario)
+	if requests := d.podTemplate("").Containers[0].Resources.Requests; requests != nil {
+		t.Fatalf("a scenario that sets no request renders a container that asks for nothing, got %v", requests)
+	}
+	edit := func(requests map[string]string) (string, error) {
+		return applySpecRevision(ctx, d, TimelineEvent{ID: "spec.revision", Args: EventArgs{Requests: requests}})
+	}
+	detail, err := edit(map[string]string{"memory": "16Gi", "cpu": "4"})
+	if err != nil || detail != "requests=[cpu:4 memory:16Gi] generation=1" {
+		t.Fatalf("the trace names the edited requests in key order: %q, %v", detail, err)
+	}
+	requests := d.podTemplate("").Containers[0].Resources.Requests
+	if memory := requests[corev1.ResourceMemory]; len(requests) != 2 || memory.String() != "16Gi" {
+		t.Fatalf("the next rendered container carries the edited requests, got %v", requests)
+	}
+	if _, err := edit(map[string]string{"memory": "plenty"}); err == nil || !strings.Contains(err.Error(), "no quantity") {
+		t.Fatalf("an amount that is no quantity must be refused: %v", err)
+	}
+	if d.spec.Requests["memory"] != "16Gi" || d.owner.Generation != 1 {
+		t.Fatalf("a refused edit changes nothing: requests %v, generation %d", d.spec.Requests, d.owner.Generation)
+	}
+	const startsWrong = `
+scenario: starts-with-a-request-that-is-no-quantity
+arrows: [T-empty-create]
+initial:
+  spec:
+    replicas: 1
+    image: registry.example.com/runtime:v1
+    requests: {memory: plenty}
+timeline:
+  - tick: 1
+`
+	if _, err := Parse([]byte(startsWrong), Vocabulary{}); err == nil || !strings.Contains(err.Error(), "initial.spec.requests") {
+		t.Fatalf("a scenario that starts with such an amount must not load: %v", err)
+	}
+}

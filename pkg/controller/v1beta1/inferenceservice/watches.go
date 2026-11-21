@@ -24,28 +24,31 @@ import (
 // not count.
 var isvcGroupKind = v1beta1.SchemeGroupVersion.WithKind("InferenceService").GroupKind()
 
-// endpointSliceToISVC maps an EndpointSlice of an OMENative headless Service
-// to the InferenceService the Service belongs to. The name parse selects the
-// Services (`<prefix>-<component>-headless`, prefix being a replica's name
-// prefix); the Service's controller owner, when it is an InferenceService,
-// names the service, since the prefix is the service name only for a
-// projected replica. A Service that cannot be read, or that another kind
-// controls, keeps the parsed name. Slices of any other Service map to
-// nothing.
+// endpointSliceToISVC maps an EndpointSlice to the InferenceService whose
+// Service it belongs to: the per-Component headless Service, the routed
+// per-revision Services and their headless twins alike. A Service the
+// InferenceService controls names it through the owner reference, whatever
+// the Service is called; a Service that cannot be read, or that another
+// kind controls, is parsed by name. The coordination pass counts a pod for
+// the traffic split only once its routed Service lists it, so the slice
+// that lists the pod must start the pass that reads it.
 func (r *InferenceServiceReconciler) endpointSliceToISVC(ctx context.Context, obj client.Object) []reconcile.Request {
-	reqs := EndpointSliceToISVC(ctx, obj)
 	slice, ok := obj.(*discoveryv1.EndpointSlice)
-	if len(reqs) == 0 || !ok {
+	if !ok {
+		return nil
+	}
+	serviceName := slice.Labels[discoveryv1.LabelServiceName]
+	if serviceName == "" {
 		return nil
 	}
 	svc := &v1.Service{}
-	if err := r.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: slice.Labels[discoveryv1.LabelServiceName]}, svc); err == nil {
+	if err := r.Get(ctx, types.NamespacedName{Namespace: slice.Namespace, Name: serviceName}, svc); err == nil {
 		if ref := metav1.GetControllerOf(svc); ref != nil &&
 			schema.FromAPIVersionAndKind(ref.APIVersion, ref.Kind).GroupKind() == isvcGroupKind {
 			return []reconcile.Request{{NamespacedName: types.NamespacedName{Namespace: slice.Namespace, Name: ref.Name}}}
 		}
 	}
-	return reqs
+	return EndpointSliceToISVC(ctx, obj)
 }
 
 // headlessServiceSuffix is the trailing component of the per-Component
@@ -54,25 +57,31 @@ func (r *InferenceServiceReconciler) endpointSliceToISVC(ctx context.Context, ob
 // and reverse-lookup the name prefix.
 const headlessServiceSuffix = "-headless"
 
-// EndpointSliceToISVC maps an EndpointSlice for an OMENative headless
-// Service to the InferenceService reconcile key its name prefix spells.
-// Returns an empty slice for any event that doesn't target an
-// OMENative-managed Service — the EndpointSlice watch is unfiltered, so
-// the mapper does all the filtering.
+// perRevisionServiceInfix is the segment between the `<prefix>-<component>`
+// prefix and the revision hash in a per-revision Service name
+// (`<prefix>-<component>-rev-<hash>`, with the headless suffix on its twin).
+const perRevisionServiceInfix = "-rev-"
+
+// EndpointSliceToISVC maps an EndpointSlice of an OMENative Service to the
+// InferenceService reconcile key its name prefix spells. Returns an empty
+// slice for any event that doesn't target an OMENative-managed Service —
+// the EndpointSlice watch is unfiltered, so the mapper does all the
+// filtering.
 //
 // EndpointSlice carries the `kubernetes.io/service-name` label pointing
-// at its parent Service. OMENative headless Services are named
-// `<prefix>-<component>-headless`, prefix being the replica's name
-// prefix: the InferenceService name for a projected replica, which is
-// what the parse recovers. The controller's mapper refines the result
-// through the Service's owner when an InferenceService controls it.
+// at its parent Service. OMENative names its Services
+// `<prefix>-<component>-headless`, `<prefix>-<component>-rev-<hash>` and
+// `<prefix>-<component>-rev-<hash>-headless`, prefix being the replica's
+// name prefix: the InferenceService name for a projected replica, which is
+// what the parse recovers. The controller's mapper asks the Service's owner
+// first and parses only a Service it cannot read.
 func EndpointSliceToISVC(ctx context.Context, obj client.Object) []reconcile.Request {
 	slice, ok := obj.(*discoveryv1.EndpointSlice)
 	if !ok {
 		return nil
 	}
 	serviceName := slice.Labels[discoveryv1.LabelServiceName]
-	isvcName, _, ok := isvcFromHeadlessServiceName(serviceName)
+	isvcName, _, ok := isvcFromOMENativeServiceName(serviceName)
 	if !ok {
 		return nil
 	}
@@ -82,6 +91,24 @@ func EndpointSliceToISVC(ctx context.Context, obj client.Object) []reconcile.Req
 			Name:      isvcName,
 		},
 	}}
+}
+
+// isvcFromOMENativeServiceName parses the three names OMENative gives a
+// Service after an InferenceService, `<isvc>-<component>-headless`,
+// `<isvc>-<component>-rev-<hash>` and `<isvc>-<component>-rev-<hash>-headless`,
+// into (isvc, component, ok). A per-revision name is read from its last
+// revision infix, so an InferenceService whose own name carries one still
+// parses.
+func isvcFromOMENativeServiceName(name string) (string, v1beta1.ComponentType, bool) {
+	if isvc, component, ok := isvcFromHeadlessServiceName(name); ok {
+		return isvc, component, true
+	}
+	trimmed := strings.TrimSuffix(name, headlessServiceSuffix)
+	i := strings.LastIndex(trimmed, perRevisionServiceInfix)
+	if i <= 0 {
+		return "", "", false
+	}
+	return isvcFromHeadlessServiceName(trimmed[:i] + headlessServiceSuffix)
 }
 
 // isvcFromHeadlessServiceName parses `<isvc>-<component>-headless`

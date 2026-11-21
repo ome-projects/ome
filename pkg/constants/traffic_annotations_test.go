@@ -35,6 +35,9 @@ func TestTrafficAnnotations_Prefix(t *testing.T) {
 		{"RolloutPromoteAnnotation", RolloutPromoteAnnotation},
 		{"RolloutPromoteForceAnnotation", RolloutPromoteForceAnnotation},
 		{"RolloutRollbackAnnotation", RolloutRollbackAnnotation},
+		{"RolloutForceModeAnnotation", RolloutForceModeAnnotation},
+		{"RolloutForceRunAnnotation", RolloutForceRunAnnotation},
+		{"RolloutForceReasonAnnotation", RolloutForceReasonAnnotation},
 	}
 	wantPrefix := OMEAPIGroupName + "/"
 	for _, k := range keys {
@@ -73,6 +76,9 @@ func TestTrafficAnnotations_Unique(t *testing.T) {
 		RolloutPromoteAnnotation,
 		RolloutPromoteForceAnnotation,
 		RolloutRollbackAnnotation,
+		RolloutForceModeAnnotation,
+		RolloutForceRunAnnotation,
+		RolloutForceReasonAnnotation,
 	}
 	seen := make(map[string]string, len(all))
 	for _, k := range all {

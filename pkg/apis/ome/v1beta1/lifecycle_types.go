@@ -570,6 +570,48 @@ type LifecycleSpec struct {
 	// +optional
 	InstanceReadyTimeout *metav1.Duration `json:"instanceReadyTimeout,omitempty"`
 
+	// LeaderGoneGracePeriod is the most time the worker pods of a multi-pod
+	// Instance that are still terminating get once the Instance's leader pod
+	// is gone. The workers of such an Instance work through their leader: a
+	// worker that outlives it cannot finish the requests it holds, and one
+	// that does not stop by itself keeps its node until its own
+	// terminationGracePeriodSeconds is over. With this field set, OMENative
+	// deletes each such worker once more with this grace. OMENative starts no
+	// deletion for it: a pod that is not terminating is never touched.
+	//
+	// How long a worker then has depends on when its leader went. The API
+	// server counts the new grace from the first delete of the pod. When the
+	// leader is gone within this long of that delete, the worker's kubelet
+	// stops its containers this long after it learns of the new grace. When
+	// the leader itself took longer than this, the API server leaves the
+	// worker a grace of 1s, and its kubelet stops it about 2s later.
+	//
+	// Example: an Instance of 1 leader and 3 workers whose pods have a
+	// termination grace of 480s is rolled. Unset, the workers are gone after
+	// 480s. With 30s and a leader whose pod is gone after 5s, the workers are
+	// gone after about 36s. With 30s and a leader that takes 60s, the workers
+	// are gone about 2s after it, 62s after their delete.
+	//
+	// While this field is set, OMENative waits longer before it treats a
+	// worker pod's kubelet as failed: up to the larger of this value and the
+	// grace the pod shows, past the pod's deletion time. That holds for every
+	// worker pod that shows a grace at or under this value, or under its own
+	// terminationGracePeriodSeconds.
+	//
+	// The field acts in every way a multi-pod Instance is taken down: a
+	// rollout, a scale-down, a restart of the Instance, a move to another
+	// node and the deletion of the service. The leader counts as gone when
+	// its pod object is gone or the pod has ended (phase Succeeded or
+	// Failed). The leader pod keeps its own grace, and so does a worker whose
+	// leader still runs or whose own grace ends sooner. A single-pod Instance
+	// has no leader, so the field does nothing there. The value must be above
+	// 0, and a fraction of a second counts as a whole second. Unset inherits
+	// the ServingRuntime's value. When neither sets it, every pod keeps its
+	// own grace, and nothing supplies a default.
+	// +optional
+	// +kubebuilder:validation:XValidation:rule="duration(self) > duration('0s')",message="leaderGoneGracePeriod must be above 0s, for example 30s. Leave it unset to keep the termination grace each pod has."
+	LeaderGoneGracePeriod *metav1.Duration `json:"leaderGoneGracePeriod,omitempty"`
+
 	// MinReadySeconds is the minimum time a newly Ready pod must stay Ready
 	// before OMENative treats it as Available. A pod is Available when its
 	// PodReady condition is True and that condition's lastTransitionTime

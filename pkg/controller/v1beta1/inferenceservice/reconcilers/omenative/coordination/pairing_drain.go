@@ -12,7 +12,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
-	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/podreadiness"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
@@ -47,10 +46,14 @@ import (
 //
 // It reads pods, not InferenceReplica status: a single-pod surge keeps its
 // replacement inside the source's Instance until the promote, so only the
-// pods' cohort labels tell the two cohorts apart. A serving pod is PodReady
-// (the serving gate is folded into it) and routable; workers never carry
-// traffic. targetRevision is the ControllerRevision the Component's Instances
-// move to in this pass, the same one the start-time gate orients by. Fails
+// pods' cohort labels tell the two cohorts apart. A serving pod is PodReady,
+// routable, and not taken out of rotation through its serving gate; workers
+// never carry traffic. The serving gate is read beside PodReady because
+// every drain writes the gate False first and the kubelet turns PodReady
+// False only on its next report: a pod already taken out must not count as
+// the partner that stays when the next drain is asked about.
+// targetRevision is the ControllerRevision the Component's Instances move
+// to in this pass, the same one the start-time gate orients by. Fails
 // closed on a list error, like the start-time gate.
 //
 // The cohort the leaving pods are traded for is the one of the revision
@@ -100,22 +103,14 @@ func EvaluatePairingDrain(ctx context.Context, reads client.Reader, isvc *v1beta
 	protoByPod := map[string]string{}
 	instanceByPod := map[string]string{}
 	for _, comp := range pairingComponents {
-		prefix := prefixFor(isvc, comp)
-		pods := &corev1.PodList{}
-		if err := reads.List(ctx, pods, client.InNamespace(isvc.Namespace), client.MatchingLabels{
-			constants.InferenceServicePodLabelKey: prefix,
-			constants.OMEComponentLabel:           string(comp),
-			query.LabelManagedBy:                  query.ManagedByOMENative,
-		}); err != nil {
+		pods, err := pairingSidePods(ctx, reads, isvc, comp)
+		if err != nil {
 			return false, v1beta1.RolloutHoldGatePairing, fmt.Sprintf("pairing drain gate: cannot list %s pods, failing closed: %v", comp, err)
 		}
-		for i := range pods.Items {
-			pod := &pods.Items[i]
-			if pod.DeletionTimestamp != nil || !query.RoutedRunner(pod) {
-				continue
-			}
-			proto := pod.Labels[query.LabelPairingProtocol]
-			if !podreadiness.IsPodReady(pod) || query.RoutedServiceForPod(prefix, workloadtypes.ComponentType(comp), pod) == "" {
+		prefix := prefixFor(isvc, comp)
+		for _, pod := range pods {
+			proto, inRotation := servedProtocol(prefix, comp, pod)
+			if !inRotation {
 				continue
 			}
 			serving[comp][proto]++
@@ -197,8 +192,8 @@ func EvaluatePairingDrain(ctx context.Context, reads client.Reader, isvc *v1beta
 // with the cohorts of their serving pods, the cohorts leaving, the cohort
 // the leaving pods are traded for, and both sides' pairable floors. The
 // drain gate builds it from pods; the start-time gate builds it from the
-// rows to read a hand-over it keeps (pairingPicture.handOverHeld), so both
-// read one rule.
+// rows to read which pods of a surge that gate keeps
+// (pairingPicture.drainHeld), so both read one rule.
 type pairingDrainPicture struct {
 	component      v1beta1.ComponentType
 	cohort         string
@@ -285,6 +280,25 @@ func pinnedCohort(ctx context.Context, reads client.Reader, namespace string, co
 		return "", fmt.Sprintf("pairing drain gate: revision %s the leaving %s pods are pinned to not found, failing closed", pin, component)
 	}
 	return proto, ""
+}
+
+// pairingSidePods lists the pods of one pairing side under its replica's
+// prefix. Both pairing gates read a side's pods through it.
+func pairingSidePods(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, comp v1beta1.ComponentType) ([]*corev1.Pod, error) {
+	return query.ListOMENativePodsByName(ctx, reads, isvc.Namespace, prefixFor(isvc, comp), workloadtypes.ComponentType(comp), false)
+}
+
+// servedProtocol reports the pairing protocol of a pod that takes requests.
+// It reports false for a pod being deleted, a worker, a pod that is not
+// Ready, one taken out of rotation, and one behind no Service.
+func servedProtocol(prefix string, comp v1beta1.ComponentType, pod *corev1.Pod) (string, bool) {
+	if pod.DeletionTimestamp != nil || !query.RoutedRunner(pod) {
+		return "", false
+	}
+	if !podreadiness.IsPodReady(pod) || podreadiness.HeldNotServing(pod) || query.RoutedServiceForPod(prefix, workloadtypes.ComponentType(comp), pod) == "" {
+		return "", false
+	}
+	return pod.Labels[query.LabelPairingProtocol], true
 }
 
 // instanceKeyForPod names the Instance a pod belongs to, by its index label;

@@ -57,7 +57,8 @@ scheduler:
   # Disable the built-in DefaultPreemption plugin for this scheduler. Default
   # preemption is domain-blind for gangs and can evict victims that never form
   # a whole domain.
-  # Leave true so ome-scheduler waits for capacity instead; the default scheduler
+  # Leave true so ome-scheduler waits for capacity instead, or frees a whole
+  # domain itself when plugin.preemption is enabled; the default scheduler
   # still preempts for its own workloads. Set false to restore built-in behavior.
   disablePreemption: true
 
@@ -87,6 +88,16 @@ scheduler:
     # counts are only as complete as the node sample Score receives — see
     # percentageOfNodesToScore below.
     standaloneDomainPacking: true
+    # Gang preemption. When on, a gang that fits no domain may free one by
+    # evicting lower-priority work there: every pod of a lower-priority gang,
+    # never part of one, and lower-priority pods in no gang. The domain stays
+    # reserved for the waiting gang while the evicted pods shut down. Off by
+    # default. Turning it on requires disablePreemption: true, because the
+    # built-in preemptor runs first and evicts single pods across domains.
+    preemption:
+      enabled: false
+      # How many gangs may wait at once for a domain preemption is freeing.
+      maxInFlight: 1
 
   # Domain-level packing score for standalone pods (OMEGangPack.Score). Weight it
   # at/above nodeResourcesFit so the partition-level signal wins the tie that

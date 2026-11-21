@@ -171,6 +171,7 @@ func (r *Router) reconcileDeployment(ctx context.Context, isvc *v1beta1.Inferenc
 			MultiPod:                  false,
 			PacingPartition:           r.PacingPartition,
 			RollbackToRevision:        r.RollbackToRevision,
+			UpdateStrategyOverride:    r.UpdateStrategyOverride,
 			CoordinatorFollower:       r.CoordinatorFollower,
 			CoordinatorTarget:         r.CoordinatorTarget,
 			FollowerReleased:          r.FollowerReleased,

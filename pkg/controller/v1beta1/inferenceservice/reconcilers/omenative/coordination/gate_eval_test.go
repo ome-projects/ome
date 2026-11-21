@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	"sigs.k8s.io/ome/pkg/constants"
 	workloadtypes "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -89,5 +90,54 @@ func TestEvaluateUpdateGate_DarkRowConsultIsHeldWithoutAndWithARun(t *testing.T)
 		if !strings.Contains(reason, counted) {
 			t.Errorf("the denial must show the dark Instance counted as open unavailability and again as the start; got %q", reason)
 		}
+	}
+}
+
+// TestEvaluateReplicaPlanGate_HoldsWhileTheSpecTrailsTheService checks the
+// plan gate as a replica's own pass asks it. A grouped Component starts no
+// update while the service's generation is ahead of the one the replica's
+// spec was written for: the roll target in hand may be one the operator
+// has already replaced. The hold ends once the two agree.
+func TestEvaluateReplicaPlanGate_HoldsWhileTheSpecTrailsTheService(t *testing.T) {
+	isvc := mkUnavailFixture(iosInt(1))
+	isvc.Generation = 5
+	replica := func(component v1beta1.ComponentType, stamp string) *v1beta1.InferenceReplica {
+		ir := &v1beta1.InferenceReplica{}
+		ir.Spec.Component = component
+		if stamp != "" {
+			ir.Annotations = map[string]string{constants.InferenceReplicaParentGenerationAnnotationKey: stamp}
+		}
+		return ir
+	}
+
+	allowed, gate, reason := EvaluateReplicaPlanGate(isvc, replica(v1beta1.EngineComponent, "4"))
+	if allowed || gate != v1beta1.RolloutHoldGatePlan || !strings.Contains(reason, "generation 5") || !strings.Contains(reason, "generation 4") ||
+		!strings.Contains(reason, "look at the service's conditions and events") {
+		t.Fatalf("a spec written for generation 4 under a service at generation 5 = (%v, %q, %q), want the plan hold naming both generations and the service to look at", allowed, gate, reason)
+	}
+
+	admitted := map[string]*v1beta1.InferenceReplica{
+		"a spec written for the service's generation":  replica(v1beta1.EngineComponent, "5"),
+		"a spec newer than the service this pass read": replica(v1beta1.EngineComponent, "6"),
+		"a replica with no written generation":         replica(v1beta1.EngineComponent, ""),
+		"a written generation that does not parse":     replica(v1beta1.EngineComponent, "five"),
+		"a Component outside every group":              replica(v1beta1.DecoderComponent, "4"),
+	}
+	for name, ir := range admitted {
+		if allowed, gate, reason := EvaluateReplicaPlanGate(isvc, ir); !allowed {
+			t.Errorf("%s = (%v, %q, %q), want the start admitted", name, allowed, gate, reason)
+		}
+	}
+	if allowed, _, _ := EvaluateReplicaPlanGate(isvc, nil); !allowed {
+		t.Error("a nil replica holds nothing")
+	}
+	if allowed, _, _ := EvaluateReplicaPlanGate(nil, replica(v1beta1.EngineComponent, "4")); !allowed {
+		t.Error("a nil service holds nothing, as the plan gate holds nothing on one")
+	}
+
+	isvc.Status.Rollout = nil
+	allowed, gate, reason = EvaluateReplicaPlanGate(isvc, replica(v1beta1.EngineComponent, "5"))
+	if allowed || gate != v1beta1.RolloutHoldGatePlan || !strings.Contains(reason, "no active run") {
+		t.Fatalf("with no active run = (%v, %q, %q), want the hold that names the missing run", allowed, gate, reason)
 	}
 }

@@ -38,7 +38,7 @@ func intOrStringInt(v int) *intstr.IntOrString {
 }
 
 // singleInstancePlan returns a ComponentPlan whose desired pod count for
-// instance idx is pods — the DesiredPodCountByInstance input the pass
+// instance idx is pods — the count (ComponentPlan.DesiredPodsFor) the pass
 // derives disposable-vs-gang routing from.
 func singleInstancePlan(idx, pods int32) workloadtypes.ComponentPlan {
 	return workloadtypes.ComponentPlan{

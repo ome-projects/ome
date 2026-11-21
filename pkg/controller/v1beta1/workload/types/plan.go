@@ -1,6 +1,8 @@
 package types
 
 import (
+	"cmp"
+	"slices"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,10 +36,12 @@ type ComponentPlan struct {
 	// (= MinReplicas, or 1 when MinReplicas is unset).
 	Replicas int32
 
-	// Instances enumerates the desired Instances. Normally one entry
-	// per index 0..Replicas-1; indices may be sparse while a surge
-	// migration is in flight (the surge Instance carries an
-	// out-of-band index until promotion settles the plan).
+	// Instances enumerates the desired Instances in ascending index
+	// order, each index once, as BuildPlan lists them; every lookup by
+	// index (InstanceAt) relies on that order. Normally one entry per
+	// index 0..Replicas-1; indices may be sparse while a surge migration
+	// is in flight (the surge Instance carries an out-of-band index until
+	// promotion settles the plan).
 	Instances []InstancePlan
 
 	// RestartPolicy is the effective Instance-group restart policy.
@@ -62,6 +66,12 @@ type ComponentPlan struct {
 	// (lifecycle.gangScheduleTimeout); nil means unconfigured and the
 	// grace reaches the scheduler as it is.
 	GangScheduleTimeout *GangScheduleTimeoutClamp
+
+	// KueuePodGroups puts the pods of a multi-pod Instance that carry a
+	// Kueue queue label into one Kueue pod group, so Kueue admits and evicts
+	// the Instance whole. Operator config (lifecycle.kueuePodGroups); false
+	// leaves each pod its own Kueue Workload.
+	KueuePodGroups bool
 
 	// MinReadySeconds is how long a newly Ready pod must stay Ready before
 	// it is Available. Rollout drains and promotions wait on Available
@@ -208,6 +218,32 @@ func (p ComponentPlan) TopologyKeyForInstance(index int32) string {
 		return key
 	}
 	return p.TopologyKey
+}
+
+// InstanceAt returns the planned Instance with Index idx, or nil when the
+// plan does not cover it. The Instances ascend by index: a plan with no
+// index missing below idx holds it at position idx, read in one probe, and
+// a sparse one is searched by halving.
+func (p ComponentPlan) InstanceAt(idx int32) *InstancePlan {
+	if i := int(idx); i >= 0 && i < len(p.Instances) && p.Instances[i].Index == idx {
+		return &p.Instances[i]
+	}
+	if i, found := slices.BinarySearchFunc(p.Instances, idx, func(inst InstancePlan, want int32) int {
+		return cmp.Compare(inst.Index, want)
+	}); found {
+		return &p.Instances[i]
+	}
+	return nil
+}
+
+// DesiredPodsFor returns the pod count the plan asks of Instance idx, or
+// observedPodCount when the plan does not cover it: a row the plan has let
+// go is read by the pods it has.
+func (p ComponentPlan) DesiredPodsFor(idx, observedPodCount int32) int32 {
+	if inst := p.InstanceAt(idx); inst != nil {
+		return inst.TotalPods()
+	}
+	return observedPodCount
 }
 
 // DemotionSelection is one Instance the truth pass corrects, with the

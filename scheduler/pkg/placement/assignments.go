@@ -6,6 +6,7 @@ package placement
 
 import (
 	"sync"
+	"time"
 
 	"sigs.k8s.io/ome/scheduler/pkg/topology"
 )
@@ -79,6 +80,10 @@ type commitment struct {
 	// was made: no other domain free of reservations had room for the gang, or
 	// bound members imposed it. A member vetoed there has nowhere else to go.
 	soleFit bool
+	// heldUntil is set on a commitment made by preemption: the domain stays
+	// reserved for the gang while the evicted pods shut down, until this time.
+	// It is zero on a commitment made by Choose or Set.
+	heldUntil time.Time
 }
 
 // New returns an empty assignment store.
@@ -167,14 +172,7 @@ func (p *DomainAssignments) Choose(gang Gang, free topology.FreeByDomain, nodesB
 	// the reservation drains into real snapshot occupancy.
 	eff := make(topology.FreeByDomain, len(free))
 	for d, f := range free {
-		blocked := p.reserved[Domain{TopologyKey: gang.TopologyKey, Name: d}] > 0
-		for _, node := range nodesByDomain[d] {
-			if p.reservedNodes[node] > 0 {
-				blocked = true
-				break
-			}
-		}
-		if blocked {
+		if p.blocked(Domain{TopologyKey: gang.TopologyKey, Name: d}, nodesByDomain[d]) {
 			eff[d] = 0
 		} else {
 			eff[d] = f
@@ -191,6 +189,88 @@ func (p *DomainAssignments) Choose(gang Gang, free topology.FreeByDomain, nodesB
 	p.byGroup[gang.Group] = c
 	p.setRemaining(c, size)
 	return d, c.id, true
+}
+
+// blocked reports whether an outstanding reservation covers the domain, by
+// reservation metadata or by any of its physical nodes. Caller holds p.mu.
+func (p *DomainAssignments) blocked(domain Domain, nodes []string) bool {
+	if p.reserved[domain] > 0 {
+		return true
+	}
+	for _, node := range nodes {
+		if p.reservedNodes[node] > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// Blocked reports whether another gang's outstanding reservation covers the
+// domain, by reservation metadata or by any of the nodes listed for it.
+func (p *DomainAssignments) Blocked(topologyKey, domain string, nodes []string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.blocked(Domain{TopologyKey: topologyKey, Name: domain}, nodes)
+}
+
+// Hold commits a gang that holds no commitment to a domain preemption is
+// freeing, and returns the id that owns the commitment. size whole nodes are
+// reserved there, as Choose reserves them, so neither another gang nor a
+// standalone pod can take the room while the evicted pods shut down. The room
+// is not checked: the domain fills until those pods are gone. The commitment
+// reports no alternative domain. ok is false when the gang already holds a
+// commitment or another reservation covers the domain or its nodes.
+func (p *DomainAssignments) Hold(gang Gang, domain string, size int, nodes []string, until time.Time) (id uint64, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, assigned := p.byGroup[gang.Group]; assigned || size <= 0 {
+		return 0, false
+	}
+	dom := Domain{TopologyKey: gang.TopologyKey, Name: domain}
+	if p.blocked(dom, nodes) {
+		return 0, false
+	}
+	c := &commitment{domain: dom, owner: gang.Owner, id: p.nextCommitmentID(), nodes: nodeSet(nodes), soleFit: true, heldUntil: until}
+	p.byGroup[gang.Group] = c
+	p.setRemaining(c, size)
+	return c.id, true
+}
+
+// HeldUntil returns the time the group's commitment made by preemption holds
+// its domain until, and the id that owns it. ok is false when the group holds
+// no commitment or one made by Choose or Set.
+func (p *DomainAssignments) HeldUntil(group string) (until time.Time, id uint64, ok bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, found := p.byGroup[group]
+	if !found || c.heldUntil.IsZero() {
+		return time.Time{}, 0, false
+	}
+	return c.heldUntil, c.id, true
+}
+
+// Holding counts the commitments made by preemption whose gangs have not yet
+// placed every member: the preemptions still in flight.
+func (p *DomainAssignments) Holding() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := 0
+	for _, c := range p.byGroup {
+		if !c.heldUntil.IsZero() && c.remaining > 0 {
+			n++
+		}
+	}
+	return n
+}
+
+// Reserving reports whether the group holds a commitment with room still
+// reserved: a gang forming in its domain, or one waiting for a domain
+// preemption is freeing.
+func (p *DomainAssignments) Reserving(group string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	c, ok := p.byGroup[group]
+	return ok && c.remaining > 0
 }
 
 // fittingDomains counts the domains with room for the whole gang.

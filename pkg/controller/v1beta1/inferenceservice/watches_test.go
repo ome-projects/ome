@@ -27,10 +27,10 @@ import (
 	v1beta1 "sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 )
 
-// endpointSliceToISVC admits exactly the OMENative headless Services the
-// name parse recognizes and, among those, enqueues the InferenceService
-// that controls the Service over the parsed prefix; a Service it cannot
-// read, or that another kind controls, keeps the parsed name.
+// endpointSliceToISVC enqueues the InferenceService that controls the
+// slice's Service, whatever the Service is named; a Service it cannot
+// read, or that another kind controls, is parsed by name, and a name that
+// is not an OMENative Service's enqueues nothing.
 func TestEndpointSliceToISVC(t *testing.T) {
 	scheme := runtime.NewScheme()
 	for _, add := range []func(*runtime.Scheme) error{corev1.AddToScheme, discoveryv1.AddToScheme, v1beta1.AddToScheme} {
@@ -72,7 +72,9 @@ func TestEndpointSliceToISVC(t *testing.T) {
 		{"headless Service controlled by a replica, by name", "pool-d-decoder-headless", want("pool-d")},
 		{"headless Service controlled by a same-kind owner of another group, by name", "other-engine-headless", want("other")},
 		{"headless Service that cannot be read, by name", "svc-engine-headless", want("svc")},
-		{"per-revision Service", "pool-a-engine-rev-abc", nil},
+		{"routed per-revision Service controlled by an InferenceService, by owner", "pool-a-engine-rev-abc", want("svc")},
+		{"routed per-revision Service that cannot be read, by name", "svc-engine-rev-abc12345", want("svc")},
+		{"per-revision headless Service that cannot be read, by name", "svc-engine-rev-abc12345-headless", want("svc")},
 		{"foreign Service", "kube-dns", nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -515,7 +517,8 @@ func TestISVCOwnsWatch_ChildEventsEnqueueDeletingParent(t *testing.T) {
 }
 
 // EndpointSliceToISVC, the name parse under endpointSliceToISVC, admits
-// exactly `<isvc>-<component>-headless` and spells the InferenceService
+// `<isvc>-<component>-headless`, `<isvc>-<component>-rev-<hash>` and
+// `<isvc>-<component>-rev-<hash>-headless`, and spells the InferenceService
 // key from the prefix.
 func TestEndpointSliceToISVC_ParsesHeadlessServiceNames(t *testing.T) {
 	cases := []struct {
@@ -533,6 +536,11 @@ func TestEndpointSliceToISVC_ParsesHeadlessServiceNames(t *testing.T) {
 		{"router headless", "llama-70b-router-headless", "prod", "llama-70b", true},
 		{"missing isvc name", "engine-headless", "prod", "", false},
 		{"isvc name with dashes", "my-fancy-llama-engine-headless", "prod", "my-fancy-llama", true},
+		{"routed per-revision", "llama-70b-engine-rev-abc12345", "prod", "llama-70b", true},
+		{"per-revision headless", "llama-70b-decoder-rev-abc12345-headless", "prod", "llama-70b", true},
+		{"isvc name with a revision infix of its own", "my-rev-llama-engine-rev-abc12345", "prod", "my-rev-llama", true},
+		{"revision infix with no component", "llama-rev-abc12345", "prod", "", false},
+		{"revision infix with no isvc name", "engine-rev-abc12345", "prod", "", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

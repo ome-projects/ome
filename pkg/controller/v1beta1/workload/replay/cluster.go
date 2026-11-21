@@ -218,30 +218,58 @@ func (d *driver) staging(write func() error) error {
 	return write()
 }
 
-// deleteObject performs one delete against the fake apiserver. A grace-zero
-// delete — the escalation's own — removes a pod at once, as the apiserver
-// removes an object it does not wait for a kubelet to release; the
-// driver's finalizer stands in for that kubelet and does not survive it. A
-// pod held Terminating by a dead kubelet is held by the driver rather than
-// by a finalizer, so a graceful delete on it changes nothing, exactly as it
-// changes nothing on a real cluster where the object is already on its way
-// out. Every other delete goes to the client untouched, and a pod that
-// survives it has the instant it began terminating recorded.
-func (d *driver) deleteObject(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) error {
+// deleteObject performs one delete against the fake apiserver and returns
+// what the trace adds to the delete's line. A grace-zero delete, the
+// escalation's own, removes a pod at once, as the apiserver removes an
+// object it does not wait for a kubelet to release; the driver's finalizer
+// stands in for that kubelet and does not survive it. A pod that is already
+// terminating keeps its object on every other delete, and a delete that
+// names a shorter grace than the pod shows moves its deletion time, as the
+// apiserver moves it. That holds for a pod whose kubelet is gone too, which
+// the driver holds rather than a finalizer. Every other delete goes to the
+// client untouched, and a pod that survives it has the instant it began
+// terminating recorded.
+func (d *driver) deleteObject(ctx context.Context, c client.WithWatch, obj client.Object, opts ...client.DeleteOption) (string, error) {
 	pod, isPod := obj.(*corev1.Pod)
 	if !isPod {
-		return c.Delete(ctx, obj, opts...)
+		return "", c.Delete(ctx, obj, opts...)
 	}
 	if zeroGrace(opts) {
-		return d.reapStuckPod(ctx, pod.Name)
+		return "", d.reapStuckPod(ctx, pod.Name)
 	}
-	if hold := d.terminating[pod.Name]; hold != nil && hold.kubeletStuck {
-		return nil
+	hold := d.terminating[pod.Name]
+	if hold != nil && hold.kubeletStuck {
+		return d.shortenTeardown(hold, opts), nil
 	}
 	if err := c.Delete(ctx, obj, opts...); err != nil {
-		return err
+		return "", err
 	}
-	return d.recordTeardown(ctx, c, pod.Name, opts)
+	if hold != nil {
+		return d.shortenTeardown(hold, opts), nil
+	}
+	return "", d.recordTeardown(ctx, c, pod.Name, opts)
+}
+
+// shortenTeardown applies one more delete to a pod that is already
+// terminating, the way the apiserver does. A delete that names a shorter
+// grace than the pod shows moves the deletion time to the first request's
+// instant plus the new grace, and the pod shows the new grace. When that
+// instant is already behind the clock, the deletion time is the clock and
+// the pod shows a grace of 1 s. A delete that names no grace, or one no
+// shorter, changes nothing. It returns what the trace says of the move,
+// empty when there is none.
+func (d *driver) shortenTeardown(hold *podTeardown, opts []client.DeleteOption) string {
+	grace := requestedGrace(opts)
+	if grace == nil || *grace >= hold.grace {
+		return ""
+	}
+	before := hold.at
+	at, shown := before.Add(time.Duration(*grace-hold.grace)*time.Second), *grace
+	if now := d.clock.Now(); at.Before(now) {
+		at, shown = now, 1
+	}
+	hold.at, hold.grace = at, shown
+	return " deletionTime=" + d.norm.at(before) + "→" + d.norm.at(at)
 }
 
 // recordTeardown notes what a pod that outlived its delete is terminating
@@ -459,14 +487,15 @@ func (d *driver) interceptors() interceptor.Funcs {
 				}
 				return d.rejectionEffect(ctx, obj, err)
 			}
-			if err := d.deleteObject(ctx, c, obj, opts...); err != nil {
+			moved, err := d.deleteObject(ctx, c, obj, opts...)
+			if err != nil {
 				if d.traced(obj) {
 					d.trace.object(kindOf(obj), "delete-failed", obj.GetName(), "err="+err.Error())
 				}
 				return err
 			}
 			if d.traced(obj) {
-				d.trace.object(kindOf(obj), "delete", obj.GetName(), deleteDetail(opts))
+				d.trace.object(kindOf(obj), "delete", obj.GetName(), deleteDetail(opts)+moved)
 			}
 			return nil
 		},

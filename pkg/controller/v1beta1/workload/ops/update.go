@@ -1714,6 +1714,39 @@ func alienRevisionPods(s *workload.InstanceStatus, targetName string, pods []*co
 	return out
 }
 
+// alienRevisionPodsReadLive is alienRevisionPods confirmed against the
+// apiserver: every pod the pass's list shows on a revision the Instance
+// neither runs nor rolls to is read live, and kept only while it still
+// carries such a revision. An in-place roll moves a pod onto the target
+// under the same name, so a list from before the patch shows a pod that
+// serves the target as a leftover of the revision it left. The cleanup
+// takes such pods out of rotation and deletes them, so it decides on the
+// pod as the apiserver holds it. A pod gone since the list, or replaced
+// under its name, is left to the next pass. A pod the list shows
+// terminating is kept as listed, with no read: a terminating pod stays
+// terminating until it is gone, and the cleanup only waits for it.
+func alienRevisionPodsReadLive(ctx context.Context, deps workload.Deps, s *workload.InstanceStatus, targetName string, pods []*corev1.Pod) ([]*corev1.Pod, error) {
+	listed := alienRevisionPods(s, targetName, pods)
+	live := make([]*corev1.Pod, 0, len(listed))
+	for _, pod := range listed {
+		if pod.DeletionTimestamp != nil {
+			live = append(live, pod)
+			continue
+		}
+		fresh := &corev1.Pod{}
+		if err := deps.Reader().Get(ctx, client.ObjectKeyFromObject(pod), fresh); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		if fresh.UID == pod.UID {
+			live = append(live, fresh)
+		}
+	}
+	return alienRevisionPods(s, targetName, live), nil
+}
+
 // CleanupWreckage abandons one instance's superseded-revision wreckage
 // toward the CURRENT desired state — legal when target equals the
 // instance's RunningRevision (the corrective roll-back), where the
@@ -1755,7 +1788,10 @@ func CleanupWreckage(ctx context.Context, deps workload.Deps, input workload.Rec
 			instanceFailureReason(s, "gang surge abandoned after a corrective edit"), instanceFailureCause(s), gangSurgeEnd{})
 	}
 
-	aliens := alienRevisionPods(s, target.Name, instancePods)
+	aliens, err := alienRevisionPodsReadLive(ctx, deps, s, target.Name, instancePods)
+	if err != nil {
+		return false, fmt.Errorf("re-read the pods listed on another revision (instance=%d): %w", inst.Index, err)
+	}
 	if len(aliens) > 0 {
 		return deleteSupersededRevisionPods(ctx, deps, input, inst.Index, aliens, target.Name)
 	}

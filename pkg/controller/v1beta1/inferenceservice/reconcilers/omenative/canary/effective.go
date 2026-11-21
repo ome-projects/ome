@@ -1,6 +1,8 @@
 package canary
 
 import (
+	"k8s.io/apimachinery/pkg/util/intstr"
+
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/irprojector"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/inferenceservice/reconcilers/omenative/coordination"
@@ -56,6 +58,12 @@ func EffectivePartition(isvc *v1beta1.InferenceService, policies rollout.Policie
 	// other unit must read the same state to stay in step with it.
 	cs := rollout.GroupCanaryStatusFor(isvc, policies, component)
 	phase := isvc.Status.Components[rollout.PrimaryOf(g)].RolloutPhase
+	// A running disruptive force holds NOTHING (0): every Instance of every
+	// member rolls to the new revision at once.
+	if disruptiveForceRunning(cs) {
+		zero := int32(0)
+		return &zero, true
+	}
 	// Stopped Failed: hold EVERY Instance where it stands. A stop promises
 	// that nothing moves, so no further Instance of any member rolls onto
 	// the stopped revision until a rollback, a resume or a new revision;
@@ -119,6 +127,27 @@ func StepPartition(isvc *v1beta1.InferenceService, policies rollout.Policies, co
 		return nil
 	}
 	return p
+}
+
+// UpdateStrategyOverride is the update strategy a Component's replica rolls
+// under while its canary unit runs a disruptive force: RecreatePod with every
+// Instance allowed down at once, so the Component's own surge or
+// unavailability budget cannot pace the replacement. nil leaves the
+// Component's own strategy. The 100% budget is the definition of the
+// disruptive mode, not a tunable value.
+func UpdateStrategyOverride(isvc *v1beta1.InferenceService, policies rollout.Policies, component v1beta1.ComponentType) *v1beta1.UpdateStrategy {
+	g := rollout.CanaryGroupFor(isvc, policies, component)
+	if g == nil || g.Canary == nil || !groupHasComponent(g, component) {
+		return nil
+	}
+	if !disruptiveForceRunning(rollout.GroupCanaryStatusFor(isvc, policies, component)) {
+		return nil
+	}
+	all := intstr.FromString("100%")
+	return &v1beta1.UpdateStrategy{
+		Type:          v1beta1.UpdateStrategyRecreatePod,
+		RollingUpdate: &v1beta1.RollingUpdate{MaxUnavailable: &all},
+	}
 }
 
 // PartitionResolver is the rollout-control partition a canary projects for

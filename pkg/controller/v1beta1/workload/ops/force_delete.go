@@ -113,7 +113,7 @@ func escalateStuckTerminatingWithDeadline(ctx context.Context, deps workload.Dep
 	if input.ForceDelete == nil || input.Swept.Swept(pod.UID) {
 		return time.Time{}, nil
 	}
-	res := evidence.StuckTerminating(ctx, deps.NodeReaders(), pod, input.ForceDelete, input.Now())
+	res := evidence.StuckTerminating(ctx, deps.NodeReaders(), pod, input.ForceDelete, input.DesiredSpec.Lifecycle, input.Now())
 	if res.Kind == evidence.NodeReadError {
 		return time.Time{}, fmt.Errorf("force-delete node reading for pod %s: node %s read: %w", pod.Name, res.NodeName, res.NodeReadErr)
 	}
@@ -222,13 +222,13 @@ func forceDeleteOnNodeDeath(ctx context.Context, deps workload.Deps, input workl
 // and holds no state, so removing it costs only the create that puts the
 // name on a live node, which the caller issues on its next pass; a pod
 // that ran keeps its name, since its container may still run on the
-// node. The set is visited on every pass of the open repair, so the node
-// is read through the informer cache and live only once the cache shows
-// the threshold passed (NodeDeathScreened); with no policy no Node is
-// read. The rule measures an age, so a pod whose Node object is missing
-// is not read here. Reports whether a pod was removed and the earliest
-// moment a node still short of the threshold comes of age; one pod's
-// error does not stop the others.
+// node. The set is visited on every pass of the open repair and, for each
+// planned Instance, on every Create pass, so the node is read through the
+// informer cache and live only once the cache shows the threshold passed
+// (NodeDeathScreened); with no policy no Node is read. The rule measures
+// an age, so a pod whose Node object is missing is not read here. Reports
+// whether a pod was removed and the earliest moment a node still short of
+// the threshold comes of age; one pod's error does not stop the others.
 func forceDeleteNeverRanPodsOnNodeDeath(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, idx int32, pods []*corev1.Pod) (bool, time.Time, error) {
 	if input.ForceDelete == nil {
 		return false, time.Time{}, nil

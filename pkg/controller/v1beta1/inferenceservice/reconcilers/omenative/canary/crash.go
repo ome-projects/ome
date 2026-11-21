@@ -186,8 +186,10 @@ func laterOf(a, b time.Time) time.Time {
 
 // servingAnchor is the moment after which a death of pod's runner is a death
 // of a serving Instance: the later of the row's entry into Ready and since.
-// It is absent for a row that never served, and for a pod of a repair's
-// rebuilt set, whose boot restarts are the ordinary start of a fresh pod. A
+// It is absent for a row that never served, and for a pod that the
+// operation still on its row created: a repair's rebuilt set, or the new
+// pods of an update or repair stopped at its ready deadline. Such a pod has
+// not served, and its boot restarts are the ordinary start of a fresh pod. A
 // row the workload escalated to Failed for its pod's crash loop still
 // speaks for that pod: the escalation is the workload's reading of the same
 // deaths, and the pod it left in place carries them. A Restarting row with
@@ -199,8 +201,8 @@ func servingAnchor(row *v1beta1.OMENativeInstanceStatus, pod *corev1.Pod, since 
 		return time.Time{}, false
 	}
 	switch row.Phase {
-	case v1beta1.OMENativeInstanceReady, v1beta1.OMENativeInstanceFailed:
-	case v1beta1.OMENativeInstanceRestarting:
+	case v1beta1.OMENativeInstanceReady:
+	case v1beta1.OMENativeInstanceFailed, v1beta1.OMENativeInstanceRestarting:
 		if row.Operation == nil {
 			break
 		}

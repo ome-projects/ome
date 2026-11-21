@@ -59,6 +59,7 @@ import (
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/query"
 	workload "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
+	"sigs.k8s.io/ome/pkg/utils/fieldequal"
 )
 
 var (
@@ -672,54 +673,11 @@ func ownedFieldsOf(pg *schedulingv1alpha1.PodGroup) ownedFields {
 // than through a reflection walk that copies every leaf on the way.
 func (f ownedFields) equal(other ownedFields) bool {
 	return maps.Equal(f.Labels, other.Labels) &&
-		ownerReferencesEqual(f.OwnerReferences, other.OwnerReferences) &&
+		fieldequal.OwnerReferences(f.OwnerReferences, other.OwnerReferences) &&
 		f.TopologyKey == other.TopologyKey &&
 		f.TopologyKeySet == other.TopologyKeySet &&
 		f.MinMember == other.MinMember &&
-		int32PointersEqual(f.ScheduleTimeoutSeconds, other.ScheduleTimeoutSeconds)
-}
-
-// ownerReferencesEqual reads two owner reference lists in order; a nil
-// list and an empty one are the same.
-func ownerReferencesEqual(a, b []metav1.OwnerReference) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if !ownerReferenceEqual(&a[i], &b[i]) {
-			return false
-		}
-	}
-	return true
-}
-
-// ownerReferenceEqual reads every field of an owner reference. A field
-// added to the reference type is read here too: the compare's contract
-// test changes every leaf of the owned fields one at a time and fails on a
-// field this function does not read.
-func ownerReferenceEqual(a, b *metav1.OwnerReference) bool {
-	return a.APIVersion == b.APIVersion &&
-		a.Kind == b.Kind &&
-		a.Name == b.Name &&
-		a.UID == b.UID &&
-		boolPointersEqual(a.Controller, b.Controller) &&
-		boolPointersEqual(a.BlockOwnerDeletion, b.BlockOwnerDeletion)
-}
-
-// boolPointersEqual reads two optional flags; both absent is equal.
-func boolPointersEqual(a, b *bool) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
-}
-
-// int32PointersEqual reads two optional counts; both absent is equal.
-func int32PointersEqual(a, b *int32) bool {
-	if a == nil || b == nil {
-		return a == nil && b == nil
-	}
-	return *a == *b
+		fieldequal.Pointers(f.ScheduleTimeoutSeconds, other.ScheduleTimeoutSeconds)
 }
 
 // applyTo writes the owned fields onto pg and leaves the rest of the object

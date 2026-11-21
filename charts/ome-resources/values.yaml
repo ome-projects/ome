@@ -735,6 +735,14 @@ ome:
       # Heartbeat of a parked (Failed) canary, which only an operator or a new
       # target moves. Empty means the same rate-limited fallback.
       canaryParkedRequeue: "5m"
+      # forceComplete limits the force that drives one open canary run to
+      # 100% (ome.io/rollout-force-mode). Removing the block, or leaving
+      # maxDuration empty or invalid, refuses every force. Admission reads the
+      # block at manager start, so a change reaches it on the next restart.
+      forceComplete:
+        # Longest a force may run; then the run continues as a normal canary
+        # from where it stands.
+        maxDuration: "6h"
     # coordination tunes the OMENative cross-Component coordination layer.
     coordination:
       # Per-revision hysteresis band (percent) for the pod-proportional traffic
@@ -982,6 +990,15 @@ ome:
       # that has served keeps its own grace. Removing this field leaves every
       # abandoned replacement its own grace.
       abandonedReplacementGracePeriod: 30s
+      # gangRestartGracePeriod is the termination grace given to the old pods
+      # of a multi-pod instance when the instance is rebuilt after it lost a
+      # member. The rebuild has already taken those pods out of traffic, and
+      # without the lost member they cannot finish the requests they hold. The
+      # new pods reuse their names, so the pods' own
+      # terminationGracePeriodSeconds (the pod grace default above) would keep
+      # the instance down for that long. A pod whose own grace is shorter keeps
+      # it. Removing this field leaves every old pod its own grace.
+      gangRestartGracePeriod: 30s
       # gangScheduleTimeout is the range of PodGroup scheduleTimeoutSeconds the
       # gang scheduler accepts. A gang's PodGroup carries unschedulableGracePeriod
       # as its timeout, so the scheduler stops waiting for the gang in the same
@@ -995,6 +1012,15 @@ ome:
       gangScheduleTimeout:
         min: 1s
         max: 15m
+      # kueuePodGroups puts the pods of a multi-pod instance (a leader and its
+      # workers) that carry a Kueue queue label into one Kueue pod group, so
+      # Kueue admits the whole instance or none of it, and evicts it whole when
+      # it preempts. Without it each pod is its own Kueue Workload: Kueue can
+      # start the leader while a worker waits for quota, and a preemption can
+      # take one worker of a running instance. Applies to pods created after it
+      # is set. The OME binary has NO built-in default: leaving it out, or
+      # false, keeps one Workload per pod.
+      # kueuePodGroups: true
       # audit bounds migration EXECUTION on one InferenceService: how many
       # migrations may be executing at once, how many may be started inside
       # the trailing window, and the window itself. The window also bounds
@@ -1070,17 +1096,18 @@ ome:
       # group naming 20 moves 2:1, 4:2, 6:3, 8:4, 9:5, 11:6, 12:7, 12:8, up
       # to 1.33 decode Instances off 3:2. A batch that cannot fit shrinks,
       # and at least one Instance moves per batch, so a tight tolerance
-      # slows the roll and never stops it. firstSide names the side that
-      # moves first inside every batch,
-      # engine or decoder: the other side's moves of the batch are admitted
-      # once the named side's new Instances serve. Name the side that takes
-      # longer to come back, so one side is down at a time and both return
-      # close together; any other value is rejected. The OME binary has NO
-      # built-in rules: removing a field, or the block, turns that rule off
-      # and each side rolls on its own budget.
+      # slows the roll and never stops it. firstSide, when set to engine or
+      # decoder, names the side that moves first inside every batch: the
+      # other side's moves of the batch wait until the named side's new
+      # Instances serve. It is unset here, so both sides start each batch
+      # together and a batch takes as long as its slower side. Setting it
+      # roughly doubles each batch, and the side that waits still sits
+      # without a partner of its version while the other side starts. Any
+      # other value is rejected. The OME binary has NO built-in rules:
+      # removing a field, or the block, turns that rule off and each side
+      # rolls on its own budget.
       prefillDecodeRoll:
         keepRatio: true
-        firstSide: decoder
     ingressGateway:
       disableIstioVirtualHost: false
       # The cluster's DNS domain: the suffix of every in-cluster Service

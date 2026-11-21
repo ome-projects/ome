@@ -67,6 +67,9 @@ type DispatchDeps struct {
 	// requeue instead.
 	Requeue       time.Duration
 	ParkedRequeue time.Duration
+	// ForceMaxDuration is the longest a canary force may run
+	// (rollout.forceComplete.maxDuration); zero means the block is absent.
+	ForceMaxDuration time.Duration
 	// MetricProviders are this cluster's logical provider bindings; a canary
 	// source naming a providerRef resolves through them. Run open already
 	// parks an unbound name, so an unbound name HERE is a mid-run config
@@ -135,13 +138,16 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 	}
 	// Observe per-revision pods for EVERY configured component (not just the
 	// primary): the canary stages capacity on all of them. perRev supplies
-	// revision presence and routing Service inputs; readyRev is the rollback,
-	// re-arm and cutover view of live pods. Capacity itself is each replica's
-	// own account of its Instances (observeCanaryRevisions), where a multi-pod
-	// gang is one Instance and rotation is recorded.
-	// d.Reader is the live API reader (no Pod field index) — useIndex=false skips
-	// the doomed MatchingFields probe and goes straight to the label-selector List.
-	perRev, readyRev, routingRev, observedPods, err := coordination.ObservePerRevisionPods(ctx, d.Reader, d.ISVC, configuredComponents(d.Group), false)
+	// revision presence and routing Service inputs; readyRev is the view of
+	// the pods the rollback, a start toward a new target and the cutover read.
+	// Capacity itself is each replica's own account of its Instances
+	// (observeCanaryRevisions), where a multi-pod gang is one Instance and
+	// rotation is recorded.
+	// The pods come from the manager's cache through its pod index, as every
+	// other reader of a Component's pods takes them. The cache holds every pod
+	// and every field read here and can only trail the apiserver: a decision
+	// read off the pods is the one a live list taken a moment earlier gives.
+	perRev, readyRev, routingRev, observedPods, err := coordination.ObservePerRevisionPods(ctx, d.Client, d.ISVC, configuredComponents(d.Group), true)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -176,8 +182,8 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		// Ensure runs EVERY reconcile — it is the self-heal path. A
 		// per-revision Service deleted out-of-band must be recreated even
 		// when the live revision-hash set is unchanged; EnsurePerRevisionServices
-		// uses CreateOrUpdate, whose Gets are cache-served and cheap, and
-		// recreates a missing Service. Gating ensure on revision-set
+		// reads each Service from the cache, writes only when a field it owns
+		// differs, and recreates a missing Service. Gating ensure on revision-set
 		// convergence would strand the weighted-route consumer on a
 		// dead backend. The revisions are walked in sorted order so a pass
 		// is repeatable.
@@ -291,6 +297,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		StablePairingProtocol:     stableProtocol,
 		ReadyCanaryInstances:      revisions.servingTargetInstances(),
 		ReadyStableInstances:      revisions.servingInstances(stableHash),
+		StableInstancesKept:       revisions.instancesHeadedFor(stableHash),
 		CapacityWindowWait:        soonestWait(revisions.windowWait(observedPods[primary], now), secondaryWait),
 		DesiredReplicas:           DesiredReplicas(revisions.replicas, componentExtension(d.ISVC, primary)),
 		PerRevisionPods:           readyRev[primary],
@@ -312,6 +319,7 @@ func Dispatch(ctx context.Context, d DispatchDeps) (Outcome, error) {
 		DefaultReadyTimeout:       d.DefaultReadyTimeout,
 		Requeue:                   d.Requeue,
 		ParkedRequeue:             d.ParkedRequeue,
+		ForceMaxDuration:          d.ForceMaxDuration,
 	}
 	res, err := Reconcile(ctx, in)
 	if err != nil {
@@ -704,6 +712,7 @@ func secondaryRevisions(ctx context.Context, reads client.Reader, isvc *v1beta1.
 			ReadyCanaryCapacity:  canaryCapacity(observed[comp].servingTargetInstances(), readyPerRev[comp][target]),
 			DesiredReplicas:      DesiredReplicas(observed[comp].replicas, componentExtension(isvc, comp)),
 			ReadyStableInstances: observed[comp].servingInstances(stable[comp]),
+			StableInstancesKept:  observed[comp].instancesHeadedFor(stable[comp]),
 		}
 		prefix := irprojector.RoleReplicaPrefix(isvc, comp)
 		var err error
@@ -944,6 +953,28 @@ func (r observedCanaryRevisions) servingInstances(hash string) *int32 {
 		}
 	}
 	return &serving
+}
+
+// instancesHeadedFor counts the Instances whose pods run, or are converging
+// toward, revision hash: the stable Instances a canary step keeps, serving or
+// being rebuilt. An Instance a roll is moving off the revision does not
+// count. A non-IR observation or no revision returns nil.
+func (r observedCanaryRevisions) instancesHeadedFor(hash string) *int32 {
+	if !r.fromIR || hash == "" {
+		return nil
+	}
+	headed := int32(0)
+	revision := query.RevisionFromHash(hash)
+	for i := range r.rows {
+		toward := r.rows[i].TargetRevision
+		if toward == "" {
+			toward = r.rows[i].RunningRevision
+		}
+		if query.RevisionFromName(toward).Same(revision) {
+			headed++
+		}
+	}
+	return &headed
 }
 
 // rowServesTarget reports whether one Instance row counts as capacity on

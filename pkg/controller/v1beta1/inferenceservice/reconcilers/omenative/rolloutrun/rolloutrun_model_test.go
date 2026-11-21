@@ -394,15 +394,21 @@ func (h *runHold) String() string {
 	return fmt.Sprintf("%s: %s", h.gate, h.reason)
 }
 
-// runMove is one thing the world does between two admissions.
+// runMove is one thing the world does between two admissions. words, when
+// set, is the move's own description, for a model of this package whose
+// moves this type does not spell.
 type runMove struct {
 	kind   string
 	member int
 	idx    int
 	value  int32
+	words  string
 }
 
 func (m runMove) String() string {
+	if m.words != "" {
+		return m.words
+	}
 	switch m.kind {
 	case "push", "rollback", "pause", "resume", "project", "project-between",
 		"policy-on", "policy-off", "rule-on", "rule-off", "group-off", "group-on", "scale-both":
@@ -634,6 +640,37 @@ type runWorld struct {
 	// passing is the member whose own pass is running, whose replica then
 	// carries the rows that pass has written so far; -1 between passes.
 	passing int
+	// readerFor, targetObject, beforePass, projectedTarget and
+	// projectedPartition let another model of this package run the same
+	// passes over its own objects: the reader the gates read through, the
+	// target revision handed to the gate stack, a step before a member's
+	// pass, and the revision and partition the projector writes. nil keeps
+	// this model's own.
+	readerFor          func(st *runState) client.Reader
+	targetObject       func(comp v1beta1.ComponentType, rev int8) *appsv1.ControllerRevision
+	beforePass         func(st *runState, i int)
+	projectedTarget    func(st *runState) int8
+	projectedPartition func(st *runState, i int) int32
+	// planGateForExemptStarts asks the plan gate for a start that skips the
+	// capacity gates, as the real admission asks it for every start.
+	planGateForExemptStarts bool
+}
+
+// gateReader is the reader the gate stack reads a state through.
+func (w *runWorld) gateReader(st *runState) client.Reader {
+	if w.readerFor != nil {
+		return w.readerFor(st)
+	}
+	return w.reader(st)
+}
+
+// target is the ControllerRevision of a member's target handed to the gate
+// stack.
+func (w *runWorld) target(comp v1beta1.ComponentType, rev int8) *appsv1.ControllerRevision {
+	if w.targetObject != nil {
+		return w.targetObject(comp, rev)
+	}
+	return runRevisionObject(comp, rev)
 }
 
 func newRunWorld(t *testing.T, cfg runConfig) *runWorld {
@@ -990,8 +1027,16 @@ func (w *runWorld) servicePass(st *runState) (boundary bool) {
 				message: fmt.Sprintf("a run opened again over the picture the last run closed %s on%s: %s", st.closedOutcome, why, w.publishedPicture(st))})
 		}
 	}
+	w.writeGroupEntries(st, svc, time.Now())
+	return boundary
+}
+
+// writeGroupEntries runs the group machine over every member as published
+// and keeps the entries on the service's status: the merge keeps a group's
+// transition time while its phase stands and drops the entries of groups
+// the plan does not declare.
+func (w *runWorld) writeGroupEntries(st *runState, svc *v1beta1.InferenceService, now time.Time) {
 	groups := coordination.ResolveGroups(rollout.Effective(svc, rollout.Policies{}), w.cfg.setting.defaults())
-	now := time.Now()
 	var fresh []v1beta1.RolloutCoordinationGroupStatus
 	for _, g := range groups {
 		obs := coordination.GroupObservation{Group: g, Components: map[v1beta1.ComponentType]coordination.ComponentObservation{}, PausedGlobal: st.paused, Now: now}
@@ -1004,8 +1049,6 @@ func (w *runWorld) servicePass(st *runState) (boundary bool) {
 		}
 		fresh = append(fresh, coordination.BuildGroupStatus(g, coordination.ComputeTransition(obs), nil, now))
 	}
-	// The merge keeps a group's transition time while its phase stands and
-	// drops the entries of groups the plan does not declare.
 	merged := svc.Status.RolloutCoordination
 	declared := map[string]bool{}
 	for _, g := range fresh {
@@ -1022,7 +1065,6 @@ func (w *runWorld) servicePass(st *runState) (boundary bool) {
 		merged.Groups = kept
 	}
 	svc.Status.RolloutCoordination = merged
-	return boundary
 }
 
 // stagedGroupExcusesAnotherMember reports the picture in which only the
@@ -1319,6 +1361,9 @@ func (w *runWorld) pass(st *runState, i int) (admitted int, hold *runHold) {
 	defer func() { w.passing = -1 }()
 	defer w.writeStatus(i, m)
 	defer w.rebuildLost(m)
+	if w.beforePass != nil {
+		w.beforePass(st, i)
+	}
 	// A retry record of a revision the spec does not ask for is removed.
 	if m.retry != runRetryNone && m.retryRev != m.target {
 		m.retry, m.attempts = runRetryNone, 0
@@ -1386,9 +1431,9 @@ func (w *runWorld) pass(st *runState, i int) (admitted int, hold *runHold) {
 	}
 	denied := map[answer]bool{}
 	var inFlightSurge, inFlightUnavail, gateUnavail int32
-	reads := w.reader(st)
+	reads := w.gateReader(st)
 	own := utils.ScaledCountFromIntOrString(ptr.To(intstr.Parse(mc.budget)), int32(len(m.rows)), true)
-	target := runRevisionObject(mc.comp, m.target)
+	target := w.target(mc.comp, m.target)
 	for _, idx := range order {
 		r := m.rows[idx]
 		if denied[answer{r.kind, r.rev}] {
@@ -1414,6 +1459,11 @@ func (w *runWorld) pass(st *runState, i int) (admitted int, hold *runHold) {
 			}
 		} else if prior := m.count(runDrain); prior+inFlightUnavail+1 > own {
 			h = &runHold{gate: v1beta1.RolloutHoldGateBudget, reason: fmt.Sprintf("per-Component unavailability budget %d exhausted (would become %d)", own, prior+inFlightUnavail+1)}
+		}
+		if h == nil && exempt && w.planGateForExemptStarts {
+			if allowed, gate, reason := coordination.EvaluatePlanGate(st.service, mc.comp); !allowed {
+				h = &runHold{gate: gate, reason: reason}
+			}
 		}
 		if h == nil && !exempt {
 			w.gateCalls++
@@ -1524,14 +1574,21 @@ func (w *runWorld) projectorOrder() []int {
 func (w *runWorld) project(st *runState, i int) {
 	m := &st.members[i]
 	m.annotation = st.gen
-	changed := m.target != st.rev || m.replicas != st.desired[i] || m.userPartition != st.partitions[i]
-	if m.target != st.rev {
+	target, partition := st.rev, st.partitions[i]
+	if w.projectedTarget != nil {
+		target = w.projectedTarget(st)
+	}
+	if w.projectedPartition != nil {
+		partition = w.projectedPartition(st, i)
+	}
+	changed := m.target != target || m.replicas != st.desired[i] || m.userPartition != partition
+	if m.target != target {
 		// Rows that run the new target but recorded a failed attempt toward
 		// another revision settle on it: a failed replacement beside a
 		// serving source is removed, a Failed Instance with no pods is
 		// rebuilt on the revision it ran.
 		for idx, r := range m.rows {
-			if r.rev != st.rev {
+			if r.rev != target {
 				continue
 			}
 			switch r.kind {
@@ -1542,7 +1599,7 @@ func (w *runWorld) project(st *runState, i int) {
 			}
 		}
 	}
-	m.target, m.replicas, m.userPartition = st.rev, st.desired[i], st.partitions[i]
+	m.target, m.replicas, m.userPartition = target, st.desired[i], partition
 	if changed {
 		m.irGen++
 	}
@@ -1844,11 +1901,20 @@ func (w *runWorld) apply(st *runState, mv runMove) *runState {
 }
 
 // runFinding is one invariant broken, or one known reading met, at one
-// state.
+// state. picture, when set, is the state in the words of the model that
+// found it; else the state speaks for itself.
 type runFinding struct {
 	class   string
 	message string
 	state   *runState
+	picture string
+}
+
+func (f runFinding) words() string {
+	if f.picture != "" {
+		return f.picture
+	}
+	return f.state.String()
 }
 
 // runKnownClasses are the readings the explorer reports without failing,
@@ -1876,44 +1942,7 @@ func (w *runWorld) check(st *runState) []runFinding {
 	for _, e := range st.events {
 		add(e.class, "%s", e.message)
 	}
-	var pacing *v1beta1.CoordinationPacing
-	if st.grouped {
-		if groups := coordination.ResolveGroups(w.spec(st).Rollout, w.cfg.setting.defaults()); len(groups) > 0 {
-			pacing = &groups[0].Pacing
-		}
-	}
-	for i, mc := range w.cfg.members {
-		m := st.members[i]
-		n := int32(len(m.rows))
-		own := utils.ScaledCountFromIntOrString(ptr.To(intstr.Parse(mc.budget)), n, true)
-		// An attempt that started before a scale-down counts against the
-		// smaller budget until it ends; that excess is reported on its own.
-		budgetClass := "budget"
-		if m.scales < w.cfg.budgets.scales || st.members[w.cfg.anchor()].scales < w.cfg.budgets.scales || st.policyEdits < w.cfg.budgets.policyEdits {
-			budgetClass = "known-budget-after-a-scale"
-		}
-		if mc.surges() {
-			open := m.count(runSurge)
-			if open+m.count(runFailedSurge) > own {
-				add(budgetClass, "%s has %d surges in flight beside %d failed surge pods against its own budget of %d", mc.comp, open, m.count(runFailedSurge), own)
-			}
-			if pacing != nil {
-				if group := coordination.MaxSurgeBudget(*pacing, n); open > group {
-					add(budgetClass, "%s has %d surges in flight against the group budget of %d", mc.comp, open, group)
-				}
-			}
-		} else {
-			open := m.count(runDrain)
-			if open > own {
-				add(budgetClass, "%s has %d Instances out of rotation against its own budget of %d", mc.comp, open, own)
-			}
-			if pacing != nil {
-				if group := coordination.MaxUnavailableBudget(*pacing, n); open+m.count(runFailedUnserving) > group {
-					add(budgetClass, "%s has %d Instances out of rotation beside %d failed against the group unavailability budget of %d", mc.comp, open, m.count(runFailedUnserving), group)
-				}
-			}
-		}
-	}
+	out = append(out, w.budgetFindings(st)...)
 	if !w.complete(st) && len(w.progressMoves(st)) == 0 {
 		class, message := w.classifyStopped(st)
 		add(class, "%s", message)
@@ -1935,6 +1964,67 @@ func (w *runWorld) check(st *runState) []runFinding {
 		}
 	}
 	return out
+}
+
+// budgetFindings reads every member's attempts in flight against its own
+// budget and the group's. An attempt that started before a scale-down
+// counts against the smaller budget until it ends; that excess is reported
+// on its own.
+func (w *runWorld) budgetFindings(st *runState) []runFinding {
+	var out []runFinding
+	var pacing *v1beta1.CoordinationPacing
+	if st.grouped {
+		if groups := coordination.ResolveGroups(w.spec(st).Rollout, w.cfg.setting.defaults()); len(groups) > 0 {
+			pacing = &groups[0].Pacing
+		}
+	}
+	for i := range w.cfg.members {
+		m := st.members[i]
+		class := "budget"
+		if m.scales < w.cfg.budgets.scales || st.members[w.cfg.anchor()].scales < w.cfg.budgets.scales || st.policyEdits < w.cfg.budgets.policyEdits {
+			class = "known-budget-after-a-scale"
+		}
+		for _, message := range w.memberBudgetExcess(i, m, pacing) {
+			out = append(out, runFinding{class: class, message: message, state: st})
+		}
+	}
+	return out
+}
+
+// memberBudgetExcess is every way one member's attempts in flight exceed
+// its own budget or the group's, in words; empty when they fit.
+func (w *runWorld) memberBudgetExcess(i int, m runMember, pacing *v1beta1.CoordinationPacing) []string {
+	mc := w.cfg.members[i]
+	n := int32(len(m.rows))
+	own := utils.ScaledCountFromIntOrString(ptr.To(intstr.Parse(mc.budget)), n, true)
+	var out []string
+	if mc.surges() {
+		open := m.count(runSurge)
+		if open+m.count(runFailedSurge) > own {
+			out = append(out, fmt.Sprintf("%s has %d surges in flight beside %d failed surge pods against its own budget of %d", mc.comp, open, m.count(runFailedSurge), own))
+		}
+		if group := coordination.MaxSurgeBudget(pacingOrZero(pacing), n); pacing != nil && open > group {
+			out = append(out, fmt.Sprintf("%s has %d surges in flight against the group budget of %d", mc.comp, open, group))
+		}
+		return out
+	}
+	open := m.count(runDrain)
+	if open > own {
+		out = append(out, fmt.Sprintf("%s has %d Instances out of rotation against its own budget of %d", mc.comp, open, own))
+	}
+	if group := coordination.MaxUnavailableBudget(pacingOrZero(pacing), n); pacing != nil && open+m.count(runFailedUnserving) > group {
+		out = append(out, fmt.Sprintf("%s has %d Instances out of rotation beside %d failed against the group unavailability budget of %d", mc.comp, open, m.count(runFailedUnserving), group))
+	}
+	return out
+}
+
+// pacingOrZero is the group's pacing, or the zero pacing when the spec
+// declares no group.
+func pacingOrZero(pacing *v1beta1.CoordinationPacing) v1beta1.CoordinationPacing {
+	if pacing == nil {
+		return v1beta1.CoordinationPacing{}
+	}
+	return *pacing
 }
 
 // finishedFor reports whether a member has nothing left to roll toward rev:
@@ -2458,7 +2548,7 @@ func runWorkers() int {
 // before the roll ended, a run opened again over the picture it closed
 // on, a budget exceeded, the depth bound. The known classes are reported
 // with their reading, and a known class no configuration reached is named
-// so a fix that removed it also removes its line.
+// so a change that removed it also removes its line.
 func runExplore(t *testing.T, keep func(runConfig) bool) {
 	t.Helper()
 	full := os.Getenv("OME_RUN_LAYER_HUNT") == "full"
@@ -2503,26 +2593,34 @@ func runExplore(t *testing.T, keep func(runConfig) bool) {
 	}
 	close(jobs)
 	wg.Wait()
+	t.Logf("%d configurations, %d states, %d random runs, %d gate questions, %d run passes, %s", len(configs), summary.states, summary.plays, summary.gateCalls, summary.runPasses, time.Since(started).Round(time.Second))
+	runReportClasses(t, summary, runKnownClasses)
+}
+
+// runReportClasses logs every class a summary gathered with its first
+// pictures, fails the test on a class the known list does not hold, and
+// names the known classes no configuration reached.
+func runReportClasses(t *testing.T, summary *runSummary, known map[string]string) {
+	t.Helper()
 	classes := make([]string, 0, len(summary.totals))
 	for class := range summary.totals {
 		classes = append(classes, class)
 	}
 	sort.Strings(classes)
-	t.Logf("%d configurations, %d states, %d random runs, %d gate questions, %d run passes, %s", len(configs), summary.states, summary.plays, summary.gateCalls, summary.runPasses, time.Since(started).Round(time.Second))
 	for _, class := range classes {
-		if known, ok := runKnownClasses[class]; ok {
-			t.Logf("%s: %d states across %d configurations: %s", class, summary.totals[class], summary.configsWith[class], known)
+		if reading, ok := known[class]; ok {
+			t.Logf("%s: %d states across %d configurations: %s", class, summary.totals[class], summary.configsWith[class], reading)
 		} else {
 			t.Logf("%s: %d states across %d configurations", class, summary.totals[class], summary.configsWith[class])
 		}
 		for _, ex := range summary.examples[class] {
-			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg.name, ex.finding.message, runPath(ex.finding.state), ex.finding.state)
+			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg.name, ex.finding.message, runPath(ex.finding.state), ex.finding.words())
 		}
-		if _, ok := runKnownClasses[class]; !ok {
+		if _, ok := known[class]; !ok {
 			t.Errorf("%s: %d states (first: %s: %s)", class, summary.totals[class], summary.examples[class][0].cfg.name, summary.examples[class][0].finding.message)
 		}
 	}
-	for class := range runKnownClasses {
+	for class := range known {
 		if summary.totals[class] == 0 {
 			t.Logf("known class %s: no configuration reached it in this mode", class)
 		}

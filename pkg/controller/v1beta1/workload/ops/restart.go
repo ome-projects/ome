@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"time"
 
@@ -694,14 +695,15 @@ func (r *instanceRepair) replaceRebuiltSetOffTheTarget(ctx context.Context) (boo
 // the repair replaces at the roll target now, and names the revision it
 // carries: live pods of it exist and agree on a revision other than a
 // target the roll takes a rebuild toward (rollTakesTheRebuild: the roll
-// could start on it, is not held on it by its retry schedule, and its
-// partition does not hold the Instance), and the set is short of
+// could start on it, the plan gate admits a start on it, the roll is not
+// held on it by its retry schedule, and its partition does not hold the
+// Instance), and the set is short of
 // serving, a member missing or a pod not yet runtime-ready. A set one
 // promote from serving is kept: it promotes on the revision it carries and
 // the roll replaces it from Ready under its budget. A paused Component, a
-// Held target, a roll held on its target by its retry schedule or a held
-// Instance keeps the set as well, as it keeps a rebuild that has created
-// no pod on the revision the row records.
+// Held target, a plan gate that admits no start, a roll held on its target
+// by its retry schedule or a held Instance keeps the set as well, as it
+// keeps a rebuild that has created no pod on the revision the row records.
 func (r *instanceRepair) rebuiltSetOffTheTarget() (string, bool) {
 	live := query.ExcludeTerminalPods(r.rebuiltSet)
 	if len(live) == 0 || r.target == nil || !rollTakesTheRebuild(r.input, r.plan, r.inst.Index, r.target) {
@@ -810,7 +812,8 @@ func (r *instanceRepair) oldSetDrained(ctx context.Context) (bool, error) {
 // expectation first and gives it back when the call fails, since a failed
 // call fires no event to count it down. The delete carries the pod's
 // observed UID, so a same-name pod created since is left alone; a pod
-// already gone or changed ends the pass for a fresh read.
+// already gone or changed ends the pass for a fresh read. The old pods of
+// a gang get the bounded grace of gangRestartDeleteOptions.
 func (r *instanceRepair) deleteOldSet(ctx context.Context) (bool, error) {
 	if len(r.oldSet) == 0 {
 		return false, nil
@@ -828,8 +831,9 @@ func (r *instanceRepair) deleteOldSet(ctx context.Context) (bool, error) {
 			return false, fmt.Errorf("delete pod %s/%s without an observed UID", pod.Namespace, pod.Name)
 		}
 		uid := pod.UID
+		opts := append([]client.DeleteOption{client.Preconditions{UID: &uid}}, gangRestartDeleteOptions(r.input, r.inst, pod)...)
 		cache.ExpectDeletes(key.Namespace, key.OwnerName, key.Component, r.inst.Index, 1)
-		if err := r.deps.Client.Delete(ctx, pod, client.Preconditions{UID: &uid}); err != nil {
+		if err := r.deps.Client.Delete(ctx, pod, opts...); err != nil {
 			cache.ObservedDelete(key.Namespace, key.OwnerName, key.Component, r.inst.Index)
 			if apierrors.IsNotFound(err) || apierrors.IsConflict(err) {
 				return true, nil
@@ -838,6 +842,23 @@ func (r *instanceRepair) deleteOldSet(ctx context.Context) (bool, error) {
 		}
 	}
 	return true, nil
+}
+
+// gangRestartDeleteOptions bounds the termination grace of an old pod of a
+// multi-pod Instance under repair. The drain has already taken the pod out
+// of traffic, and without the member the gang lost it cannot finish the
+// requests it holds; its own grace would only hold the name the rebuilt pod
+// needs. A single-pod Instance, an unconfigured bound, and a pod whose own
+// grace is no longer than the bound keep the pod's own grace.
+func gangRestartDeleteOptions(input workload.ReconcileInput, inst workload.InstancePlan, pod *corev1.Pod) []client.DeleteOption {
+	if input.GangRestartGrace <= 0 || inst.TotalPods() <= 1 || pod == nil {
+		return nil
+	}
+	seconds := int64(math.Ceil(input.GangRestartGrace.Seconds()))
+	if own := pod.Spec.TerminationGracePeriodSeconds; own != nil && *own <= seconds {
+		return nil
+	}
+	return []client.DeleteOption{client.GracePeriodSeconds(seconds)}
 }
 
 // planRebuiltSet decides the pod set the attempt builds: the Instance plan
@@ -970,7 +991,7 @@ func (r *instanceRepair) createMissingMembers(ctx context.Context) (bool, error)
 	if !found {
 		return true, announceRevisionGone(ctx, r.deps, r.input, r.inst.Index, rebuildRevision(r.input.ObservedState.Instance(r.inst.Index)))
 	}
-	if _, err := createMissingPods(ctx, r.deps, r.input, r.plan, r.rebuilt, r.inst.Index, missing, tmpl); err != nil {
+	if _, err := createMissingPods(ctx, r.deps, r.input, r.plan, r.rebuilt, r.inst.Index, missing, r.rebuiltSet, tmpl); err != nil {
 		if createRejectionHandled(err) {
 			return true, nil
 		}
@@ -1306,13 +1327,35 @@ func RepairYieldsToTarget(input workload.ReconcileInput, plan workload.Component
 // start on: the Component has one, is not paused, and the RetryBlock does
 // not hold it. A pause withholds the roll, and a Held target admits no
 // fresh attempt until an operator releases it; a Backoff block merely
-// paces the start.
+// paces the start. Whether the plan gate admits a start on the target is
+// a separate question (planGateAdmits), asked by the rules that pick the
+// revision a rebuild, a refill or a move renders, not by the rule that
+// leaves a row to the roll (RepairYieldsToTarget).
 func rollTargetOpen(input workload.ReconcileInput, plan workload.ComponentPlan, target *appsv1.ControllerRevision) bool {
 	if target == nil || plan.Paused {
 		return false
 	}
 	block := workload.FindRetryBlock(input.ObservedState.RetryBlocks, target.Name)
 	return block == nil || block.State != workload.RetryBlockHeld
+}
+
+// planGateAdmits reports whether the plan gate admits a start on the roll
+// target: a run records the plan the roll executes, the precondition every
+// fresh start meets (ReconcileInput.PlanGate). A nil gate admits, as the
+// update admission reads it. While the gate holds, no run records the plan
+// yet or the plan does not resolve, and a pod built at the target would
+// serve a revision no start may open; so a rebuild (rollTakesTheRebuild),
+// a refill (createRevision, refillTakesTheTarget) and a move
+// (rollTakesSource) render the revision the Instance ran instead, and the
+// roll takes the Instance once a start is admitted. RepairYieldsToTarget
+// does not ask it: a row off the target is left to the roll whatever the
+// gate says, and the roll's own admission reports the plan's hold.
+func planGateAdmits(input workload.ReconcileInput) bool {
+	if input.PlanGate == nil {
+		return true
+	}
+	allowed, _, _ := input.PlanGate()
+	return allowed
 }
 
 // rollHeldOnItsTarget reports whether the roll is held on target by its
@@ -1329,11 +1372,12 @@ func rollHeldOnItsTarget(input workload.ReconcileInput, target *appsv1.Controlle
 }
 
 // rollTakesTheRebuild reports whether a rebuild that serves nothing yet
-// renders the roll target: the roll could start on it (rollTargetOpen) and
-// is not held on it by its retry schedule (rollHeldOnItsTarget), and the
-// roll's partition does not hold the Instance (RollHeldIndices).
+// renders the roll target: the roll could start on it (rollTargetOpen),
+// the plan gate admits a start on it (planGateAdmits), the roll is not
+// held on it by its retry schedule (rollHeldOnItsTarget), and the roll's
+// partition does not hold the Instance (RollHeldIndices).
 func rollTakesTheRebuild(input workload.ReconcileInput, plan workload.ComponentPlan, idx int32, target *appsv1.ControllerRevision) bool {
-	return rollTargetOpen(input, plan, target) && !rollHeldOnItsTarget(input, target) && !RollHeldIndices(input, plan, target)[idx]
+	return rollTargetOpen(input, plan, target) && planGateAdmits(input) && !rollHeldOnItsTarget(input, target) && !RollHeldIndices(input, plan, target)[idx]
 }
 
 // RollHeldIndices is the set of Instances the roll holds on the revision
@@ -1361,8 +1405,9 @@ func RollHeldIndices(input workload.ReconcileInput, plan workload.ComponentPlan,
 // rebuildFollowsTarget reports whether the rebuild of an open repair
 // renders the roll target instead of the revision its row records: no pod
 // of the rebuild exists yet, the row is off a target the roll could start
-// on and is not held on by its retry schedule, and the roll's partition
-// does not hold the Instance (rollTakesTheRebuild). The Instance
+// on, the plan gate admits a start on it, the roll is not held on it by
+// its retry schedule, and the roll's partition does not hold the Instance
+// (rollTakesTheRebuild). The Instance
 // serves nothing, so the rebuild is the pass that puts it on the target and
 // no pod set is torn down for it; a held Instance is the step's stable
 // side, which the step machine alone promotes. A rebuild whose pods exist

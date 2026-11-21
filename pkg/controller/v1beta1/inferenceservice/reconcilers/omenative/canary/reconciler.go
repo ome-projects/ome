@@ -62,6 +62,12 @@ type ReconcileInputs struct {
 	// count below it is the stable side short. nil (no replica observed)
 	// falls back to PerRevisionPods.
 	ReadyStableInstances *int32
+	// StableInstancesKept is the replica's count of Instances whose pods run,
+	// or are converging toward, the stable revision, serving or being
+	// rebuilt. Zero means no stable pod will come back on its own, as after
+	// a disruptive force moved every Instance. nil (no replica observed)
+	// reads as unknown.
+	StableInstancesKept *int32
 	// CapacityWindowWait is how long until the soonest canary pod still
 	// inside the Component's minReadySeconds window has held Ready for it,
 	// zero when none is waiting. The crossing raises no watch event, so a
@@ -154,6 +160,10 @@ type ReconcileInputs struct {
 	// requeue instead of a fixed cadence.
 	Requeue       time.Duration
 	ParkedRequeue time.Duration
+	// ForceMaxDuration is the longest a force may run
+	// (controllerconfig rollout.forceComplete.maxDuration). Zero means the
+	// block is absent: a force request is refused and a running force ends.
+	ForceMaxDuration time.Duration
 }
 
 // MemberRevisions is one secondary's revision pair: the target its capacity
@@ -178,6 +188,9 @@ type MemberRevisions struct {
 	// revision, counted as ReadyCanaryCapacity counts the target's; nil (no
 	// replica observed) falls back to the member's ready pods.
 	ReadyStableInstances *int32
+	// StableInstancesKept is the member's Instances headed for its stable
+	// revision, counted as the primary's are; nil reads as unknown.
+	StableInstancesKept *int32
 }
 
 // retargeted reports whether the member rolls toward a revision other than
@@ -214,36 +227,14 @@ func unitRetargeted(in ReconcileInputs) bool {
 // groupRetargeted is unitRetargeted over an explicit group; fallback stands in
 // for the group's members when the group is unknown.
 func groupRetargeted(isvc *v1beta1.InferenceService, group *v1beta1.RolloutGroup, fallback v1beta1.ComponentType) bool {
-	if isvc == nil || isvc.Status.Rollout == nil || isvc.Status.Rollout.ActiveRun == nil {
-		return true
-	}
-	targets := isvc.Status.Rollout.ActiveRun.TargetRevisions
-	if len(targets) == 0 {
-		return true
-	}
-	members := map[v1beta1.ComponentType]bool{}
+	var members []v1beta1.ComponentType
 	if group != nil {
-		for _, c := range group.Components {
-			members[c] = true
-		}
+		members = group.Components
 	}
 	if len(members) == 0 {
-		members[fallback] = true
+		members = []v1beta1.ComponentType{fallback}
 	}
-	seen := false
-	for i := range targets {
-		t := &targets[i]
-		if !members[t.Component] {
-			continue
-		}
-		seen = true
-		if t.Revision != t.StableRevision {
-			return true
-		}
-	}
-	// Every member recorded revision == stableRevision: this unit is idle.
-	// If the run recorded none of them, fall back to arming.
-	return !seen
+	return v1beta1.RolloutRunRetargets(isvc, members)
 }
 
 // readyCanaryCapacity is the primary's canary capacity.
@@ -369,17 +360,20 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 	// ready timeout's, because time the operator holds the rollout is not
 	// time the pods were given to come up. Both pause depths hold the canary
 	// equally; the depth only changes whether Instance repair keeps running
-	// underneath. The one verb the pause consumes is a forced promote: it
-	// never overrides the pause, and left in place it would open the first
-	// gate the resumed ladder meets.
+	// underneath. The verbs the pause consumes are a forced promote and a
+	// canary force: neither overrides the pause, and left in place the
+	// promote would open the first gate the resumed canary meets and the
+	// force would delete every old Instance the moment the pause clears. A
+	// running force ends.
 	if paused, freeze := constants.RolloutPauseState(in.ISVC.Annotations); paused {
+		why := "the rollout is paused"
+		if freeze {
+			why = "the rollout is frozen"
+		}
 		if cs != nil && int(cs.CurrentStep) < len(plan.Steps) {
-			why := "the rollout is paused"
-			if freeze {
-				why = "the rollout is frozen"
-			}
 			ignoreForce(in, cs, take, why)
 		}
+		pausedForce(in, cs, plan, take, why)
 		if cs != nil {
 			stopCapacityWait(cs, rollout.StateOf(cs, in.ISVC.Status.Components[in.Component].RolloutPhase, len(plan.Steps)))
 		}
@@ -408,6 +402,13 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 		return nil, err
 	} else if resumed {
 		return (&Result{Active: true}).wake(in.Requeue), nil
+	}
+
+	// A force runs ahead of the holds: it clears the stop it finds, and a
+	// running one owns the pass. It ends first when its run, its request or
+	// its time limit is gone, and the canary then continues from here.
+	if res, handled := handleForce(in, cs, plan, take); handled {
+		return res, nil
 	}
 
 	// The stable side is read against the split the pass leaves, on every
@@ -674,20 +675,48 @@ func reconcile(ctx context.Context, in ReconcileInputs, take func(string)) (*Res
 }
 
 // parkOnCrash parks a live ladder at its current step because a canary pod
-// keeps dying after it was serving. A capacity dip, a single restart among
-// them, keeps the step's split while the workload repairs it; a crash loop
-// returns the split to the stable revision, because the capacity is there
-// and cannot be trusted with traffic. The park
-// is the capacity gate's: the step's canary capacity did not hold, and the
-// pod that broke it is named in the event. Stable keeps serving until the
-// operator rolls back, resumes or pushes a new revision.
+// keeps dying after it was serving, and every Instance holds where it
+// stands. The step's traffic goes back to the stable revision, as on any
+// crash. The one exception is a canary a disruptive force drove, where some
+// member keeps no Instance on its stable revision: the force moved every
+// Instance, so no stable pod will come back on its own, and every member
+// stays on the canary revision, keeping prefill and decode paired. A canary
+// no force drove always takes the stable path. The pod that broke the step
+// is named in the event, with where the traffic went.
 func parkOnCrash(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result {
-	returnTrafficToStable(in)
+	where := "the step's traffic is back on the stable revision"
+	if forcedThisCanary(cs) && !stableSideServes(in) && stableSideKeepsNoInstance(in) {
+		// The step's weight stays recorded, so the stopped canary's hold
+		// returns the traffic to stable pods if any serve again.
+		weight := cs.ObservedTrafficWeight
+		applyCutoverTraffic(in)
+		cs.ObservedTrafficWeight = weight
+		where = "the traffic stays on revision " + cs.CanaryRevisionHash + ", because no Instance of some member is left on the stable revision " + cs.StableRevisionHash + " to serve the requests"
+	} else {
+		returnTrafficToStable(in)
+	}
 	emit(in.Recorder, in.ISVC, corev1.EventTypeWarning, EventReasonCanaryPodCrashed,
-		"%s canary pod %s keeps dying after it was serving (%s); the ladder is parked at step %d and the step's traffic is back on the stable revision",
-		in.Crash.Component, in.Crash.PodName, in.Crash.Detail, cs.CurrentStep)
+		"%s canary pod %s keeps dying after it was serving (%s); the ladder is parked at step %d and %s",
+		in.Crash.Component, in.Crash.PodName, in.Crash.Detail, cs.CurrentStep, where)
 	parkFailed(in, cs, v1beta1.CanaryFailureCapacityTimeout)
 	return (&Result{Active: true, Partition: in.DesiredReplicas}).wake(in.ParkedRequeue)
+}
+
+// stableSideKeepsNoInstance reports whether some retargeted member of the
+// unit keeps no Instance on its stable revision, by its replica's own count.
+// A member whose count is unknown reads as keeping its Instances, so a unit
+// the replicas do not describe crashes as any canary does.
+func stableSideKeepsNoInstance(in ReconcileInputs) bool {
+	if in.StableRevisionHash != "" && in.StableRevisionHash != in.CanaryRevisionHash &&
+		in.StableInstancesKept != nil && *in.StableInstancesKept == 0 {
+		return true
+	}
+	for _, m := range in.Secondaries {
+		if m.retargeted() && m.StableRevisionHash != "" && m.StableInstancesKept != nil && *m.StableInstancesKept == 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // gateRollsBackWhileShort reads the metric gate of a serving step whose
@@ -890,6 +919,11 @@ func resetCanaryStatus(isvc *v1beta1.InferenceService, c v1beta1.ComponentType, 
 		CanaryRevisionHash: hash,
 		StableRevisionHash: cs.StableRevisionHash,
 		StepEnteredTime:    &metav1.Time{Time: now},
+		// The force record outlives a reset: it is what refuses a second
+		// force on the same run after a resume, what ends a running force
+		// as RunClosed with its event when a new run retargets the unit,
+		// and what tells a later crash the old Instances may be gone.
+		Forced: cs.Forced,
 	}
 	setPhase(isvc, c, v1beta1.RolloutPhasePending)
 }

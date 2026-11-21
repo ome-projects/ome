@@ -12,16 +12,11 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 )
 
-// ComponentIR returns the InferenceReplica an ISVC projects for one
-// Component, by its projected name. Returns (nil, nil) when the IR does not
-// exist yet. Any other read failure is returned as a wrapped error so safety
-// gates can distinguish a missing observation from an unreliable read.
-func ComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
-	return componentIRAt(ctx, reads, types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)})
-}
-
-// ComponentIRFor is ComponentIR for whichever replica serves role c on the
-// service, projected or referenced. Returns (nil, nil) for a nil service.
+// ComponentIRFor returns the InferenceReplica serving role c on the service,
+// projected or referenced. Returns (nil, nil) for a nil service and when the
+// IR does not exist yet. Any other read failure is returned as a wrapped
+// error so safety gates can distinguish a missing observation from an
+// unreliable read.
 func ComponentIRFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, error) {
 	if isvc == nil {
 		return nil, nil
@@ -98,19 +93,13 @@ func statusOf(ir *v1beta1.InferenceReplica, err error) (*v1beta1.InferenceReplic
 	return &ir.Status, nil
 }
 
-// DecodedComponentIR is the decoded-accessor form of ComponentIR for callers
-// that inspect per-Instance rows: the object is returned in the dense
-// logical shape, decoded with the Decoder carried by reads, together with
-// the encoding it was stored in. A malformed or unbounded ColumnarV2 payload
-// is an error, never an empty row set. ComponentIR and ComponentIRStatusFor
-// stay raw for callers that read only spec, metadata, or top-level status.
-func DecodedComponentIR(ctx context.Context, reads client.Reader, namespace, isvcName string, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
-	return decodedComponentIRAt(ctx, reads, types.NamespacedName{Namespace: namespace, Name: InferenceReplicaName(isvcName, c)})
-}
-
-// DecodedComponentIRFor is DecodedComponentIR for whichever replica serves
-// role c on the service, projected or referenced. Returns (nil, "", nil)
-// for a nil service.
+// DecodedComponentIRFor is the decoded-accessor form of ComponentIRFor for
+// callers that inspect per-Instance rows: the object is returned in the
+// dense logical shape, decoded with the Decoder carried by reads, together
+// with the encoding it was stored in. A malformed or unbounded ColumnarV2
+// payload is an error, never an empty row set. ComponentIRFor and
+// ComponentIRStatusFor stay raw for callers that read only spec, metadata,
+// or top-level status. Returns (nil, "", nil) for a nil service.
 func DecodedComponentIRFor(ctx context.Context, reads client.Reader, isvc *v1beta1.InferenceService, c v1beta1.ComponentType) (*v1beta1.InferenceReplica, irstatus.Encoding, error) {
 	if isvc == nil {
 		return nil, "", nil

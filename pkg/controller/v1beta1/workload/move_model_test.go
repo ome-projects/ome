@@ -33,7 +33,7 @@ import (
 // under a partition that holds part of the fleet, beside a scale-up
 // still coming up and beside a scale-down still leaving; under rolling
 // groups at 10 and 25 percent and under a blueGreen group; on the
-// production engine-only and prefill/decode shapes, single pods and
+// reference engine-only and prefill/decode shapes, single pods and
 // gangs. A fourth move loses the node under a move's source once its
 // replacement serves, so the move waits on a kubelet that is gone.
 //
@@ -78,6 +78,9 @@ const (
 	// moveWorkers is the most configurations explored at once in full
 	// mode, to keep the suite's CPU use bounded.
 	moveWorkers = 16
+	// probeBoundedWorkers is the most configurations any probing model on
+	// this world explores at once in bounded mode.
+	probeBoundedWorkers = 8
 	// moveDrainingTicks is how long the fourth move waits for the
 	// request's record to reach its source drain before it loses the
 	// node under the source.
@@ -362,7 +365,7 @@ func newMoveWorld(t *testing.T, cfg moveConfig) *moveWorld {
 		h.migrationAudit = settings.audit
 		h.unschedulableGrace = settings.unschedulableGrace
 		if w.podsPerInstance(s) > 1 {
-			// Gangs run the policy production sets on them: a member
+			// Gangs run the reference restart policy: a member
 			// lost rebuilds the gang.
 			policy := workloadtypes.RestartPolicyRecreateInstance
 			h.lifecycle.RestartPolicy = &policy
@@ -1970,6 +1973,79 @@ func (w *moveWorld) randomRuns(idle *scaleSnapshot, seed int64, runs, budget int
 	}
 }
 
+// momentProbes is a model on the move world that lands probes of its own
+// kind at the roll's moments: it puts itself at a moment's snapshot with
+// its readings cleared, lands a probe's verb, plays the world to a
+// settled end and reads that end.
+type momentProbes[P any] interface {
+	startProbe(snap *scaleSnapshot)
+	land(p P) bool
+	play(p P) bool
+	finishProbe(settled bool)
+}
+
+// playProbesFromTheMoments plays, on model, every probe probesAt names
+// for each moment kept in snaps, from the moment's snapshot to its
+// settled end. The probes left when the tick budget is spent are counted
+// as skipped, so a run on a slower machine reads the same first probes.
+func playProbesFromTheMoments[P any](w *moveWorld, model momentProbes[P], snaps map[moveMoment]*scaleSnapshot, moments []moveMoment, probesAt func(moveMoment) []P, budget int) {
+	for _, m := range moments {
+		snap := snaps[m]
+		if snap == nil {
+			continue
+		}
+		for _, p := range probesAt(m) {
+			if w.mticks >= budget {
+				w.skipped++
+				continue
+			}
+			playProbeFromTheMoment(w, model, snap, m, p)
+		}
+	}
+}
+
+// playProbeFromTheMoment puts model at the moment's snapshot, lands p and
+// plays the world to its settled end. A world paused at the moment is
+// resumed once it settles and played out again. The model then reads the
+// end. It reports whether p landed and whether the world settled.
+func playProbeFromTheMoment[P any](w *moveWorld, model momentProbes[P], snap *scaleSnapshot, m moveMoment, p P) (landed, settled bool) {
+	model.startProbe(snap)
+	w.path = append(w.path, "at "+m.String())
+	if !model.land(p) {
+		return false, false
+	}
+	w.probes++
+	settled = model.play(p)
+	if m == whenPaused && settled {
+		w.setPaused(false)
+		w.path = append(w.path, "resume")
+		settled = w.playOut()
+	}
+	model.finishProbe(settled)
+	return true, settled
+}
+
+// playOneProbeFromTheMoment plays p on model, a fresh world, from the
+// moment to its settled end for a test's own reading. The test fails when
+// the roll never reaches the moment, when nothing fits the probe (fits
+// names what should have, an Instance or a gang), or when the world never
+// settles.
+func playOneProbeFromTheMoment[P fmt.Stringer](t *testing.T, w *moveWorld, model momentProbes[P], m moveMoment, p P, fits string) {
+	t.Helper()
+	w.reachIdle()
+	snap := w.momentSnapshots(m == whenHeld)[m]
+	if snap == nil {
+		t.Fatalf("the roll never reached its %s moment", m)
+	}
+	landed, settled := playProbeFromTheMoment(w, model, snap, m, p)
+	if !landed {
+		t.Fatalf("no %s fits the probe %s; picture: %s", fits, p, w.picture())
+	}
+	if !settled {
+		t.Fatalf("the world never settled; picture: %s", w.picture())
+	}
+}
+
 // moveReferenceConfigs are the configurations every run explores: the
 // reference shapes under their reference settings, the budgets the
 // task names, one blueGreen group, one partition, one gang shape.
@@ -2101,39 +2177,133 @@ func scaleKnownClasses() map[string]string {
 	return out
 }
 
-type moveExample struct {
-	cfg     moveConfig
-	finding scaleFinding
-}
-
-// moveResult is what one configuration's exploration found.
-type moveResult struct {
-	cfg                                               moveConfig
+// probeResult is what one configuration's exploration found. C is the
+// configuration explored.
+type probeResult[C fmt.Stringer] struct {
+	cfg                                               C
 	states, ticks, passes, gateCalls, probes, skipped int
 	counts                                            map[string]int
 	findings                                          map[string]scaleFinding
 	took                                              time.Duration
 }
 
-// moveExplore runs the model over the configurations keep admits, a
-// bounded number at a time in parallel, and reports every class, failing
-// on the classes that are neither expected nor known.
-func moveExplore(t *testing.T, keep func(moveConfig) bool) {
+// probeExample is one configuration's first picture of a class.
+type probeExample[C fmt.Stringer] struct {
+	cfg     C
+	finding scaleFinding
+}
+
+// probeTotals sums the results of a run and keeps the first pictures of
+// every class.
+type probeTotals[C fmt.Stringer] struct {
+	states, ticks, passes, gateCalls, probes, skipped int
+	classes                                           map[string]int
+	configurations                                    map[string]int
+	examples                                          map[string][]probeExample[C]
+}
+
+// newProbeTotals is the empty sum of a run.
+func newProbeTotals[C fmt.Stringer]() *probeTotals[C] {
+	return &probeTotals[C]{classes: map[string]int{}, configurations: map[string]int{}, examples: map[string][]probeExample[C]{}}
+}
+
+func (tot *probeTotals[C]) add(res probeResult[C]) {
+	tot.states += res.states
+	tot.ticks += res.ticks
+	tot.passes += res.passes
+	tot.gateCalls += res.gateCalls
+	tot.probes += res.probes
+	tot.skipped += res.skipped
+	for class, c := range res.counts {
+		tot.classes[class] += c
+	}
+	for class, f := range res.findings {
+		tot.configurations[class]++
+		if len(tot.examples[class]) < 6 {
+			tot.examples[class] = append(tot.examples[class], probeExample[C]{cfg: res.cfg, finding: f})
+		}
+	}
+}
+
+// report logs every class with its first pictures and fails on a class
+// that is neither expected (by any of the expected sets) nor known.
+func (tot *probeTotals[C]) report(t *testing.T, configs int, took time.Duration, known map[string]string, expected ...map[string]bool) {
 	t.Helper()
-	full := os.Getenv(moveHuntFullEnv) == "full"
-	only := os.Getenv(moveHuntOnlyEnv)
-	runs, workers := 1, 8
+	classes := make([]string, 0, len(tot.classes))
+	for class := range tot.classes {
+		classes = append(classes, class)
+	}
+	sort.Strings(classes)
+	t.Logf("%d configurations, %d states, %d ticks, %d passes, %d gate questions, %d probes (%d skipped past the tick budget), %s", configs, tot.states, tot.ticks, tot.passes, tot.gateCalls, tot.probes, tot.skipped, took.Round(time.Second))
+	for _, class := range classes {
+		t.Logf("%s: %d states in %d configurations", class, tot.classes[class], tot.configurations[class])
+		if classExpected(class, expected) {
+			continue
+		}
+		for _, ex := range tot.examples[class] {
+			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg, ex.finding.message, ex.finding.path, ex.finding.state)
+		}
+		if text := known[class]; text != "" {
+			t.Logf("  known: %s", text)
+			continue
+		}
+		t.Errorf("%s: %d states (first: %s: %s)", class, tot.classes[class], tot.examples[class][0].cfg, tot.examples[class][0].finding.message)
+	}
+}
+
+// classExpected says one of the expected sets holds the class.
+func classExpected(class string, expected []map[string]bool) bool {
+	for _, set := range expected {
+		if set[class] {
+			return true
+		}
+	}
+	return false
+}
+
+// probeResultOf is what a world's exploration of cfg found, with the
+// time spent since began.
+func probeResultOf[C fmt.Stringer](w *moveWorld, cfg C, began time.Time) probeResult[C] {
+	return probeResult[C]{cfg: cfg, states: len(w.seen), ticks: w.ticks, passes: w.passes, gateCalls: w.gateCalls, probes: w.probes, skipped: w.skipped,
+		counts: w.counts, findings: w.findings, took: time.Since(began)}
+}
+
+// modelRun describes a probing model's run over its configurations.
+// fullEnv set to "full" widens the run to full mode, and onlyEnv keeps
+// only the configurations whose name carries its value. runs and fullRuns
+// are the random runs per configuration in bounded and in full mode, and
+// fullWorkers the worker slots in full mode. configs lists the
+// configurations and explore explores one. known and expected are the
+// classes the model knows and expects beside the move model's.
+type modelRun[C fmt.Stringer] struct {
+	fullEnv, onlyEnv string
+	runs, fullRuns   int
+	fullWorkers      int
+	configs          func(full bool) []C
+	explore          func(t *testing.T, cfg C, full bool, seed int64, runs int) probeResult[C]
+	known            map[string]string
+	expected         map[string]bool
+}
+
+// runModel runs the model over the configurations keep admits, a bounded
+// number at a time in parallel, logs what each found and reports every
+// class, failing on the classes that are neither expected nor known.
+func runModel[C fmt.Stringer](t *testing.T, run modelRun[C], keep func(C) bool) {
+	t.Helper()
+	full := os.Getenv(run.fullEnv) == "full"
+	only := os.Getenv(run.onlyEnv)
+	runs, workers := run.runs, probeBoundedWorkers
 	if full {
-		runs, workers = 4, moveWorkers
+		runs, workers = run.fullRuns, run.fullWorkers
 	}
 	start := time.Now()
-	var configs []moveConfig
-	for _, cfg := range moveConfigs(full) {
+	var configs []C
+	for _, cfg := range run.configs(full) {
 		if keep(cfg) && (only == "" || strings.Contains(cfg.String(), only)) {
 			configs = append(configs, cfg)
 		}
 	}
-	results := make([]moveResult, len(configs))
+	results := make([]probeResult[C], len(configs))
 	admission := make(chan struct{}, workers)
 	t.Run("configurations", func(t *testing.T) {
 		for i, cfg := range configs {
@@ -2141,61 +2311,38 @@ func moveExplore(t *testing.T, keep func(moveConfig) bool) {
 				t.Parallel()
 				admission <- struct{}{}
 				defer func() { <-admission }()
-				began := time.Now()
-				w := newMoveWorld(t, cfg)
-				w.explore(full, int64(i+1), runs)
-				results[i] = moveResult{cfg: cfg, states: len(w.seen), ticks: w.ticks, passes: w.passes, gateCalls: w.gateCalls, probes: w.probes, skipped: w.skipped,
-					counts: w.counts, findings: w.findings, took: time.Since(began)}
+				results[i] = run.explore(t, cfg, full, int64(i+1), runs)
 			})
 		}
 	})
-	known := scaleKnownClasses()
-	totals := map[string]int{}
-	examples := map[string][]moveExample{}
-	configurations := map[string]int{}
-	var states, ticks, passes, gateCalls, probes, skipped int
+	tot := newProbeTotals[C]()
 	for n, res := range results {
-		states += res.states
-		ticks += res.ticks
-		passes += res.passes
-		gateCalls += res.gateCalls
-		probes += res.probes
-		skipped += res.skipped
+		tot.add(res)
 		var parts []string
 		for class, c := range res.counts {
-			totals[class] += c
 			parts = append(parts, fmt.Sprintf("%s=%d", class, c))
 		}
 		sort.Strings(parts)
 		t.Logf("config %d/%d [%s]: %d states, %d ticks, %d probes (%d skipped past the tick budget), %s: %s", n+1, len(configs), res.cfg, res.states, res.ticks, res.probes, res.skipped, res.took.Round(time.Second), strings.Join(parts, " "))
-		for class, f := range res.findings {
-			configurations[class]++
-			if len(examples[class]) < 6 {
-				examples[class] = append(examples[class], moveExample{cfg: res.cfg, finding: f})
-			}
-		}
 	}
-	classes := make([]string, 0, len(totals))
-	for class := range totals {
-		classes = append(classes, class)
-	}
-	sort.Strings(classes)
-	t.Logf("%d configurations, %d states, %d ticks, %d passes, %d gate questions, %d probes (%d skipped past the tick budget), %s", len(configs), states, ticks, passes, gateCalls, probes, skipped, time.Since(start).Round(time.Second))
-	for _, class := range classes {
-		t.Logf("%s: %d states in %d configurations", class, totals[class], configurations[class])
-		if moveExpectedClasses[class] {
-			continue
-		}
-		for _, ex := range examples[class] {
-			t.Logf("  [%s]\n    %s\n    path: %s\n    state: %s", ex.cfg, ex.finding.message, ex.finding.path, ex.finding.state)
-		}
-		switch {
-		case known[class] != "":
-			t.Logf("  known: %s", known[class])
-		default:
-			t.Errorf("%s: %d states (first: %s: %s)", class, totals[class], examples[class][0].cfg, examples[class][0].finding.message)
-		}
-	}
+	tot.report(t, len(configs), time.Since(start), run.known, moveExpectedClasses, run.expected)
+}
+
+// exploreMoveConfig explores one configuration and reports what it found.
+func exploreMoveConfig(t *testing.T, cfg moveConfig, full bool, seed int64, runs int) probeResult[moveConfig] {
+	t.Helper()
+	began := time.Now()
+	w := newMoveWorld(t, cfg)
+	w.explore(full, seed, runs)
+	return probeResultOf(w, cfg, began)
+}
+
+// moveExplore runs the model over the configurations keep admits, a
+// bounded number at a time in parallel, and reports every class, failing
+// on the classes that are neither expected nor known.
+func moveExplore(t *testing.T, keep func(moveConfig) bool) {
+	t.Helper()
+	runModel(t, modelRun[moveConfig]{fullEnv: moveHuntFullEnv, onlyEnv: moveHuntOnlyEnv, runs: 1, fullRuns: 4, fullWorkers: moveWorkers, configs: moveConfigs, explore: exploreMoveConfig, known: scaleKnownClasses()}, keep)
 }
 
 // TestMove_EveryMoveEndsBuiltOnceOrNamed explores every configuration: a

@@ -3743,6 +3743,9 @@ type supersededFixture struct {
 	// pacing seeds DesiredSpec.Pacing for the pass: a partition the roll
 	// holds on its revision, as a canary step holds its stable side.
 	pacing *workload.WorkloadPacing
+	// planGate, when set, is the plan gate the pass asks; a held gate
+	// admits no start on the target.
+	planGate func() (bool, workload.RolloutHoldGate, string)
 }
 
 const supersededPriorRevision = "llama-70b-engine-bad0bad0"
@@ -3799,6 +3802,7 @@ func (f *supersededFixture) run(t *testing.T) (writes int) {
 	input := buildTestInput(f.isvc, f.client, workload.ComponentEngine)
 	input.ObservedState.RetryBlocks = f.blocks
 	input.DesiredSpec.Pacing = f.pacing
+	input.PlanGate = f.planGate
 	inner := input.MutateInstance
 	input.MutateInstance = func(ctx context.Context, idx int32, mutate func(*workload.InstanceStatus) bool) error {
 		writes++
@@ -4054,7 +4058,12 @@ func TestCreate_PromotedInstanceAttemptUnderAMovedTarget(t *testing.T) {
 	// record (a backoff not yet due, a backoff that is due, or the record
 	// Held): a revision whose last attempt failed is not one to move a
 	// refill onto, so the refill finishes on the revision it ran and the
-	// roll takes the Instance once its schedule admits a start.
+	// roll takes the Instance once its schedule admits a start. It is kept
+	// as well while the plan gate admits no start on the target (no run
+	// records the plan, or the plan does not resolve): a refill moved there
+	// would build a pod on a revision the roll may not start, so it finishes
+	// on the revision it ran and the roll takes the Instance once a start is
+	// admitted.
 	for _, tc := range []movedTargetCase{
 		{name: "single pod, nothing up", retired: true},
 		{name: "gang, nothing up", gang: true, retired: true},
@@ -4064,6 +4073,7 @@ func TestCreate_PromotedInstanceAttemptUnderAMovedTarget(t *testing.T) {
 		{name: "gang, the target's backoff is not yet due", gang: true, block: backoffBlock(time.Hour)},
 		{name: "single pod, the target's backoff is due", block: backoffBlock(-time.Minute)},
 		{name: "single pod, the target Held", block: &workload.RetryBlock{State: workload.RetryBlockHeld}},
+		{name: "single pod, the plan gate holds", planHeld: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f, pod := seedAttemptUnderAMovedTarget(t, tc)
@@ -4090,15 +4100,17 @@ type movedTargetCase struct {
 	paused   bool
 	held     bool
 	// block seeds the target's retry record when set.
-	block   *workload.RetryBlock
-	retired bool
+	block *workload.RetryBlock
+	// planHeld makes the plan gate admit no start on the target.
+	planHeld bool
+	retired  bool
 }
 
 // seedAttemptUnderAMovedTarget builds the case's picture: the fixture's
 // half-built attempt on a row that served the attempt's revision, a member
-// brought up when the case says so, and the pause, the partition or the
-// target's retry record that holds the roll. It returns the fixture and the
-// attempt's one existing pod.
+// brought up when the case says so, and the pause, the partition, the
+// target's retry record or the plan gate that holds the roll. It returns
+// the fixture and the attempt's one existing pod.
 func seedAttemptUnderAMovedTarget(t *testing.T, tc movedTargetCase) (*supersededFixture, *corev1.Pod) {
 	t.Helper()
 	f := newSupersededFixture(t, tc.gang)
@@ -4129,6 +4141,9 @@ func seedAttemptUnderAMovedTarget(t *testing.T, tc movedTargetCase) (*superseded
 		block := *tc.block
 		block.TargetRevision = f.target.Name
 		f.blocks = []workload.RetryBlock{block}
+	}
+	if tc.planHeld {
+		f.planGate = planGateHolding
 	}
 	return f, pod
 }

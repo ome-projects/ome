@@ -69,6 +69,11 @@ data:
       "defaultReadyTimeout": "{{ .Values.ome.controller.rollout.defaultReadyTimeout | default "" }}",
       "canaryRequeue": "{{ .Values.ome.controller.rollout.canaryRequeue | default "" }}",
       "canaryParkedRequeue": "{{ .Values.ome.controller.rollout.canaryParkedRequeue | default "" }}"
+      {{- with .Values.ome.controller.rollout.forceComplete }},
+      "forceComplete": {
+        "maxDuration": "{{ .maxDuration }}"
+      }
+      {{- end }}
     }
 {{- with .Values.ome.metricProviders }}
 
@@ -170,8 +175,14 @@ data:
   {{- with .abandonedReplacementGracePeriod }}
   {{- $fields = append $fields (dict "abandonedReplacementGracePeriod" .) }}
   {{- end }}
+  {{- with .gangRestartGracePeriod }}
+  {{- $fields = append $fields (dict "gangRestartGracePeriod" .) }}
+  {{- end }}
   {{- with .gangScheduleTimeout }}
   {{- $fields = append $fields (dict "gangScheduleTimeout" (dict "min" .min "max" .max)) }}
+  {{- end }}
+  {{- if hasKey . "kueuePodGroups" }}
+  {{- $fields = append $fields (dict "kueuePodGroups" .kueuePodGroups) }}
   {{- end }}
   {{- with .audit }}
   {{- $fields = append $fields (dict "audit" (dict "maxInFlightMigrations" .maxInFlightMigrations "maxMigrationsPerWindow" .maxMigrationsPerWindow "window" .window)) }}

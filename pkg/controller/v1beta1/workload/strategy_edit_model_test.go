@@ -838,17 +838,16 @@ func strategyEditConfigs(full bool) []scaleConfig {
 }
 
 // knownStrategyEditFindingClasses are the finding classes the model shows
-// at present: the two ends endClass names, and the shared world's
-// pictures of the version mix after a move that re-plans the batches,
-// which a strategy or budget edit is one of. A finding in a known class
-// is reported and does not fail the run; a change of behaviour removes its entry and the
-// lock test that holds the picture.
+// at present: the end endClass names after the lockstep, and the
+// shared world's pictures of the version mix after a move that re-plans
+// the batches, which a strategy or budget edit is one of. A finding in a
+// known class is reported and does not fail the run; a change of
+// behaviour removes its entry and the lock test that holds the picture.
 var knownStrategyEditFindingClasses = strategyEditKnownClasses()
 
 func strategyEditKnownClasses() map[string]string {
 	out := map[string]string{
 		"held-by-the-lockstep-at-the-peers-partition": "under the ratio rule the lockstep reads a peer's share over all its Instances, not over the ones its partition lets the roll move, so a side patched in place beside a peer resting at its partition holds on the lockstep's outpace reason for as long as the partition stands; the batch step plans over the movable Instances and the lockstep does not (held by TestStrategyEdit_APartitionOnThePeerHoldsAnInPlaceSideUnderTheRatioRule)",
-		"in-place-attempt-stands-on-a-lost-node":      "an in-place attempt patches a pod whose node stopped reporting and waits for a kubelet that never answers; the force-delete policy that clears such a pod on the repair and the drain-first paths is never asked, so the attempt stands at its InPlace step with no hold (held by TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingStandsStill)",
 	}
 	for class, picture := range knownScaleFindingClasses {
 		out[class] = strings.Replace(picture, "(a resize, a partition, a roll back)", "(a resize, a partition, a roll back, a strategy or budget edit)", 1)
@@ -922,19 +921,17 @@ func TestStrategyEdit_APartitionOnThePeerHoldsAnInPlaceSideUnderTheRatioRule(t *
 	t.Logf("the decoder rests at %d of 10 on version 2 with %d on version 1 beside a prefill side at 10 of 20 under a partition of 10; its hold: %s", promoted, old, hold.Reason)
 }
 
-// TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingStandsStill
-// holds the picture the model found: 12 prefill and 8 decode patched in
-// place at ten percent, with a force-delete policy that clears a pod
-// whose node stopped reporting after five minutes. The node under the
-// prefill side's last Instance stops reporting, and the operator pushes
-// version 2. Every Instance on a live node moves. The Instances on the
-// lost node open their in-place attempt, patch a pod no kubelet will
-// restart, and wait: the attempt stands at its InPlace step with no hold
-// named, the roll never finishes, and the force-delete policy, which the
-// repair and the drain-first paths apply to such a pod, is never asked.
-// When the roll finishes past the lost node, this test fails, and the
-// lock goes with it.
-func TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingStandsStill(t *testing.T) {
+// TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingIsRebuilt
+// holds the rule: 12 prefill and 8 decode patched in place at ten
+// percent, with a force-delete policy that clears a pod whose node
+// stopped reporting after five minutes. The node under the prefill
+// side's last Instance stops reporting, and the operator pushes version
+// 2. Every Instance on a live node moves; the Instances on the lost node
+// open their in-place attempt, which removes their pods once the node
+// has been unreachable for the policy's threshold and rebuilds them on
+// a live node. The roll finishes on version 2 with every pod on a node
+// that reports.
+func TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingIsRebuilt(t *testing.T) {
 	inPlace := workloadtypes.UpdateStrategyInPlaceIfPossible
 	cfg := scaleConfig{shape: scaleShape{12, 8, 1}, settings: scaleSettings{prefill: inPlace, decode: inPlace}}
 	w := newScaleWorld(t, cfg)
@@ -943,21 +940,15 @@ func TestStrategyEdit_AnInPlaceAttemptOnAPodWhoseNodeStoppedReportingStandsStill
 	prefill := w.prefill()
 	w.apply(scaleMove{kind: moveLoseNode, side: 0, index: prefill.h.replicas - 1})
 	w.push(fixedImage)
-	settled := w.playOut(scaleTickBound(false))
-	if !settled {
-		t.Fatalf("the world did not settle: %s", w.picture())
+	if !w.playOut(scaleTickBound(false)) || !w.complete() {
+		t.Fatalf("the roll did not finish past the lost node: %s", w.picture())
 	}
-	if w.complete() {
-		t.Fatalf("the picture moved: the roll finished past the lost node; remove this lock: %s", w.picture())
-	}
-	standing := 0
-	for _, r := range w.rows(prefill) {
-		if r.Operation != nil && r.Operation.Type == workloadtypes.InstanceOperationUpdate && r.Operation.Step == workloadtypes.UpdateStepInPlace {
-			standing++
+	for _, s := range w.sides {
+		for _, pod := range s.h.livePods() {
+			if s.h.deadNodes[pod.Spec.NodeName] {
+				t.Fatalf("%s pod %s still stands on node %s, which stopped reporting: %s", s.comp, pod.Name, pod.Spec.NodeName, w.picture())
+			}
 		}
 	}
-	if standing == 0 || prefill.h.hold != nil {
-		t.Fatalf("the picture moved: %d attempts stand at the InPlace step and the side holds on %v: %s", standing, prefill.h.hold, w.picture())
-	}
-	t.Logf("%d in-place attempts stand on the lost node's pods with no hold: %s", standing, w.picture())
+	t.Logf("the roll finished on version 2 with every pod on a node that reports: %s", w.picture())
 }

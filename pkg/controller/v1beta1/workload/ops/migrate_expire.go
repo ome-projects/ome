@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/audit"
@@ -270,6 +271,15 @@ func failMigrationThroughRecord(
 	return closeMigrationRecord(ctx, input, uuid, workload.MigrationPhaseFailed, blocker)
 }
 
+// sourcePodPastSlack reports whether a source pod stands Terminating past
+// its deletion deadline (query.DeletionDeadline) by more than the
+// configured ForceDeletePolicy's OverdueSlack. Without a policy no pod reads
+// so.
+func sourcePodPastSlack(input workload.ReconcileInput, pod *corev1.Pod) bool {
+	return input.ForceDelete != nil && pod.DeletionTimestamp != nil &&
+		input.Now().After(query.DeletionDeadline(pod, input.DesiredSpec.Lifecycle).Add(input.ForceDelete.OverdueSlack))
+}
+
 // migrationTailReady reports whether an expired Draining record is one
 // idempotent drive tail away from Completed: every live source pod is
 // drained out of its routed Service AND the surge passes the drive
@@ -318,8 +328,7 @@ func migrationTailReady(ctx context.Context, deps workload.Deps, input workload.
 		// deadline (merely grazing it is routine on loaded nodes with
 		// large-grace pods). Unconfigured, the record parks
 		// non-terminal and the surge keeps serving.
-		if input.ForceDelete != nil && pod.DeletionTimestamp != nil &&
-			input.Now().After(pod.DeletionTimestamp.Add(input.ForceDelete.OverdueSlack)) {
+		if sourcePodPastSlack(input, pod) {
 			return false, nil
 		}
 		serviceName := drainServiceForPod(input, plan, pod)

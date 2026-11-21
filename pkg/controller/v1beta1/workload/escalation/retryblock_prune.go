@@ -20,7 +20,6 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	workloadops "sigs.k8s.io/ome/pkg/controller/v1beta1/workload/ops"
-	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/status"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/workload/types"
 )
 
@@ -123,7 +122,6 @@ func PruneOutlivedRetryBlocks(ctx context.Context, input types.ReconcileInput, p
 	}
 	now := input.Now()
 	rows := input.ObservedState.InstanceStatuses
-	desiredByIdx := status.DesiredPodCountByInstance(plan)
 	var byIdx map[int32][]*corev1.Pod
 	var pruned []string
 	for i := range input.ObservedState.RetryBlocks {
@@ -145,7 +143,7 @@ func PruneOutlivedRetryBlocks(ctx context.Context, input types.ReconcileInput, p
 			born = target.CreationTimestamp.Time
 		}
 		rollTarget := target != nil && rev == target.Name
-		if !rowsOutlived(rows, byIdx, desiredByIdx, rev, born, rollTarget, window, now, plan.RestartPolicy) {
+		if !rowsOutlived(rows, byIdx, plan, rev, born, rollTarget, window, now) {
 			continue
 		}
 		if err := input.MutateRetryBlock(ctx, rev, func(*types.RetryBlock) types.RetryBlockDisposition {
@@ -170,7 +168,7 @@ func PruneOutlivedRetryBlocks(ctx context.Context, input types.ReconcileInput, p
 // that rebuild until it opens. While rev is the roll target, a row off it
 // still has to roll onto it: the block paces that row's next attempt, so
 // rows that never left rev do not outlive the failure on its behalf.
-func rowsOutlived(rows []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, desiredByIdx map[int32]int32, rev string, revisionBorn time.Time, rollTarget bool, window int32, now time.Time, policy types.RestartPolicy) bool {
+func rowsOutlived(rows []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, plan types.ComponentPlan, rev string, revisionBorn time.Time, rollTarget bool, window int32, now time.Time) bool {
 	held := 0
 	for i := range rows {
 		row := &rows[i]
@@ -187,11 +185,11 @@ func rowsOutlived(rows []types.InstanceStatus, byIdx map[int32][]*corev1.Pod, de
 		if row.ReadySince == nil || now.Sub(row.ReadySince.Time) < time.Duration(window)*time.Second {
 			return false
 		}
-		desired := status.DesiredFor(desiredByIdx, row.Index, row.PodCount)
+		desired := plan.DesiredPodsFor(row.Index, row.PodCount)
 		if notServing, _, _ := workloadops.RolledInstanceNotServing(row, rev, revisionBorn, byIdx[row.Index], desired, window, now); notServing {
 			return false
 		}
-		if policy == types.RestartPolicyRecreateInstance {
+		if plan.RestartPolicy == types.RestartPolicyRecreateInstance {
 			for _, pod := range byIdx[row.Index] {
 				if _, restarted := workloadops.RunnerRestartedSinceReady(pod, row.ReadySince); restarted {
 					return false

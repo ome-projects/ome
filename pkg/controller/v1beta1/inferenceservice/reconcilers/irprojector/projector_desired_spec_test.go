@@ -2,9 +2,11 @@ package irprojector
 
 import (
 	"testing"
+	"time"
 
 	"github.com/onsi/gomega"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/ptr"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -191,6 +193,42 @@ var desiredSpecCases = []desiredSpecCase{
 			s.Expect(s.ir.Spec.Lifecycle).To(gomega.Equal(s.input.ComponentExt.Lifecycle))
 			s.Expect(s.ir.Spec.Lifecycle).NotTo(gomega.BeIdenticalTo(s.input.ComponentExt.Lifecycle), "the lifecycle is a copy")
 			s.Expect(s.ir.Spec.MinReadySeconds).To(gomega.Equal(int32(30)))
+		},
+	},
+	{
+		name: "a leader-gone grace on the merged component reaches the replica's lifecycle",
+		service: func(isvc *v1beta1.InferenceService) {
+			isvc.Spec.Engine.Lifecycle.LeaderGoneGracePeriod = &metav1.Duration{Duration: 30 * time.Second}
+		},
+		check: func(s *desiredSpec) {
+			s.Expect(s.ir.Spec.Lifecycle.LeaderGoneGracePeriod).To(gomega.HaveValue(gomega.Equal(metav1.Duration{Duration: 30 * time.Second})))
+		},
+	},
+	{
+		// A disruptive canary force replaces every Instance at once: the
+		// replica rolls under the override, and the rest of the lifecycle
+		// and the service's own spec stay as they were.
+		name: "an update strategy override replaces only the strategy on the replica",
+		service: func(isvc *v1beta1.InferenceService) {
+			surge := intstr.FromString("10%")
+			isvc.Spec.Engine.Lifecycle.MinReadySeconds = ptr.To(int32(30))
+			isvc.Spec.Engine.Lifecycle.UpdateStrategy = &v1beta1.UpdateStrategy{
+				Type:          v1beta1.UpdateStrategySurgeThenDrain,
+				RollingUpdate: &v1beta1.RollingUpdate{MaxSurge: &surge},
+			}
+		},
+		params: func(p *Params) {
+			all := intstr.FromString("100%")
+			p.UpdateStrategyOverride = &v1beta1.UpdateStrategy{
+				Type:          v1beta1.UpdateStrategyRecreatePod,
+				RollingUpdate: &v1beta1.RollingUpdate{MaxUnavailable: &all},
+			}
+		},
+		check: func(s *desiredSpec) {
+			s.Expect(s.ir.Spec.Lifecycle.UpdateStrategy).To(gomega.Equal(s.input.UpdateStrategyOverride))
+			s.Expect(s.ir.Spec.Lifecycle.UpdateStrategy).NotTo(gomega.BeIdenticalTo(s.input.UpdateStrategyOverride), "the override is a copy")
+			s.Expect(s.ir.Spec.MinReadySeconds).To(gomega.Equal(int32(30)))
+			s.Expect(s.input.ComponentExt.Lifecycle.UpdateStrategy.Type).To(gomega.Equal(v1beta1.UpdateStrategySurgeThenDrain), "the service's own strategy is untouched")
 		},
 	},
 	{

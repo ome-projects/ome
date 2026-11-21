@@ -68,6 +68,10 @@ type TickView struct {
 	// Revisions are the stored revisions of the Component after the pass,
 	// keyed by the hash a pod's revision label carries.
 	Revisions map[string]RevisionTemplate
+	// RollTarget is the revision the pass rolled toward: the one the spec
+	// renders, or the one a rollback names. A tick no pass ran in keeps the
+	// last pass's.
+	RollTarget string
 }
 
 // PodWrite is one write the engine made to a pod, with the pod as the
@@ -79,14 +83,23 @@ type PodWrite struct {
 	Pod  *corev1.Pod
 }
 
-// RevisionTemplate is what a stored revision asks a pod to run, as far as an
-// in-place patch moves it: the images of the leader and worker templates and
-// the pod template's own labels and annotations.
+// RevisionTemplate is what a stored revision asks a pod to run: the images,
+// the literal env values and the resource requests of the leader and worker
+// templates, and the pod template's own labels and annotations.
 type RevisionTemplate struct {
 	Images       map[string]string
 	WorkerImages map[string]string
-	Labels       map[string]string
-	Annotations  map[string]string
+	// Env and WorkerEnv are the env values a template sets by a literal, by
+	// container and by name, init containers included. A value the template
+	// reads from another source is not listed.
+	Env       map[string]map[string]string
+	WorkerEnv map[string]map[string]string
+	// Requests and WorkerRequests are the resource requests a template sets,
+	// by container, init containers included.
+	Requests       map[string]corev1.ResourceList
+	WorkerRequests map[string]corev1.ResourceList
+	Labels         map[string]string
+	Annotations    map[string]string
 }
 
 // MigrationCommit is one migration record write as the driver applied it.
@@ -113,6 +126,10 @@ type TickSpec struct {
 	MaxUnavailable *intstr.IntOrString
 	MaxSurge       *intstr.IntOrString
 	Partition      *int32
+	// StepPartition is the partition a canary step projects on the
+	// Component, which the engine reads ahead of the strategy's own; nil
+	// when no step projects one.
+	StepPartition *int32
 	// HeldTo are the budgets, in Instances, the capacity and surge-ceiling
 	// invariants hold the tick to: the spec's, widened to the budget an
 	// attempt still open was admitted under, since an attempt keeps the

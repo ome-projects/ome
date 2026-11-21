@@ -2,6 +2,7 @@ package ops
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,9 +22,10 @@ import (
 // The returned Pod carries:
 //   - stable name <key.Name>-<inst-idx>-<runner>-<ordinal>
 //   - hostname + subdomain so peer DNS resolves under the Component's
-//     headless service; multi-pod Instances fold the Instance
-//     incarnation into the hostname (query.PodHostname) so peer DNS
-//     never resolves to a previous incarnation's still-terminating pod
+//     headless service. A multi-pod Instance's hostname carries a
+//     recreation count (podHostname), so a pod set built at a new count
+//     takes no DNS name of the set before it; a pod made beside live
+//     pods of its set takes the hostnames they answer to (standing)
 //   - the workload labels (ome.io/inferenceservice / component /
 //     instance-index / instance-incarnation / runner / managed-by /
 //     pod-ordinal), plus ome.io/revision-hash when revisionHash is
@@ -43,6 +45,10 @@ import (
 // podTemplateObjectMeta may be nil for back-compat tests that don't
 // have a fully-built ObjectMeta in scope; user labels / annotations
 // are then skipped (workload-owned labels still land).
+//
+// standing is what the live pods of the pod's set answer to
+// (query.ReadPodSetHostnames). Its zero value is a set with no live pod,
+// which is built whole at inst's recreation count.
 func RenderWithRevision(
 	owner client.Object,
 	ownerGVK schema.GroupVersionKind,
@@ -51,6 +57,7 @@ func RenderWithRevision(
 	podTemplateObjectMeta *metav1.ObjectMeta,
 	plan workload.ComponentPlan,
 	inst workload.InstancePlan,
+	standing query.PodSetHostnames,
 	runner workload.RunnerPlan,
 	ordinal int32,
 	revisionHash string,
@@ -109,6 +116,9 @@ func RenderWithRevision(
 			anns[k] = v
 		}
 	}
+	if plan.KueuePodGroups && inst.TotalPods() > 1 && lbls[constants.KueueQueueLabelKey] != "" {
+		anns = addKueuePodGroup(lbls, anns, isvcName, plan.Component, inst, runner.Name)
+	}
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:        name,
@@ -122,7 +132,7 @@ func RenderWithRevision(
 		Spec: *podSpec.DeepCopy(),
 	}
 
-	pod.Spec.Hostname = podHostname(name, inst)
+	pod.Spec.Hostname = podHostname(name, inst, standing)
 	pod.Spec.Subdomain = subdomain
 	// Dedup the ome.io/serving gate when the user template / ServingRuntime
 	// already declared it. Kubelet ANDs all gates into PodReady, so two
@@ -145,7 +155,7 @@ func RenderWithRevision(
 	// render path is the single source of truth at apply time.
 	backfillEmptyContainerNames(&pod.Spec)
 
-	injectOMENativeEnv(pod, plan, inst, runner, ordinal, isvcName)
+	injectOMENativeEnv(pod, plan, inst, standing, runner, ordinal, isvcName)
 	injectGangDomainAffinity(pod, plan, inst, runner, isvcName)
 	injectTopologySpread(pod, plan, inst, runner, isvcName)
 	applyMigrationOverlay(pod, inst.MigrationOverlay)
@@ -466,6 +476,26 @@ func hasServingReadinessGate(gates []corev1.PodReadinessGate) bool {
 	return false
 }
 
+// addKueuePodGroup puts a queued multi-pod Instance's pod into the Kueue pod
+// group of the Instance's current build and returns the pod's annotations.
+// Without the group Kueue admits each pod on its own, and can start a leader
+// whose workers stay gated: a gang that holds quota and can never serve. The
+// group is marked serving because an inference server runs until it is
+// replaced: Kueue then never treats the group as finished, and it admits a pod
+// recreated into the group while the group's Workload stays admitted. The
+// runner name is the pod's Kueue role, so the Workload lists the leader and
+// the workers under their own names.
+func addKueuePodGroup(lbls, anns map[string]string, isvc string, component workload.ComponentType, inst workload.InstancePlan, runner string) map[string]string {
+	lbls[constants.KueuePodGroupNameLabelKey] = query.KueuePodGroupName(isvc, component, inst.Index, inst.Incarnation)
+	if anns == nil {
+		anns = make(map[string]string, 3)
+	}
+	anns[constants.KueuePodGroupTotalCountAnnotationKey] = strconv.Itoa(int(inst.TotalPods()))
+	anns[constants.KueuePodGroupServingAnnotationKey] = "true"
+	anns[constants.KueuePodRoleAnnotationKey] = runner
+	return anns
+}
+
 func podLabels(isvc string, component workload.ComponentType, instanceIdx int32, runner string, incarnation int64, ordinal int32) map[string]string {
 	return map[string]string{
 		constants.InferenceServicePodLabelKey: isvc,
@@ -482,13 +512,13 @@ func podLabels(isvc string, component workload.ComponentType, instanceIdx int32,
 // container. If a container declared a variable with the same Name,
 // the workload value replaces it (the controller-owned values are the
 // authoritative source for these names).
-func injectOMENativeEnv(pod *corev1.Pod, plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, ordinal int32, isvcName string) {
-	env := buildOMENativeEnv(plan, inst, runner, ordinal, isvcName)
+func injectOMENativeEnv(pod *corev1.Pod, plan workload.ComponentPlan, inst workload.InstancePlan, standing query.PodSetHostnames, runner workload.RunnerPlan, ordinal int32, isvcName string) {
+	env := buildOMENativeEnv(plan, inst, standing, runner, ordinal, isvcName)
 	// Multi-host TPU runtimes (JAX/libtpu) read the peer host list directly to
 	// build the cross-host device mesh. GKE injects it only for LWS pods, so
 	// OMENative supplies it for any TPU-requesting pod from the same peer info.
 	if podRequestsResource(pod, constants.GoogleTPUResourceType) {
-		env = append(env, buildTPUTopologyEnv(plan, inst, runner, ordinal, isvcName)...)
+		env = append(env, buildTPUTopologyEnv(plan, inst, standing, runner, ordinal, isvcName)...)
 	}
 	owned := make(map[string]bool, len(env))
 	for _, e := range env {
@@ -505,7 +535,7 @@ func injectOMENativeEnv(pod *corev1.Pod, plan workload.ComponentPlan, inst workl
 	}
 }
 
-func buildOMENativeEnv(plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, ordinal int32, isvcName string) []corev1.EnvVar {
+func buildOMENativeEnv(plan workload.ComponentPlan, inst workload.InstancePlan, standing query.PodSetHostnames, runner workload.RunnerPlan, ordinal int32, isvcName string) []corev1.EnvVar {
 	// OME_RUNNER_INDEX reports the runner's position within the gang
 	// (0..runner.Size-1), NOT the pod-naming ordinal. For single-pod
 	// runners (Size=1) it's always 0; SurgeThenDrain alternates the pod
@@ -541,7 +571,7 @@ func buildOMENativeEnv(plan workload.ComponentPlan, inst workload.InstancePlan, 
 	// (leader and worker each index from 0) and can't be a gang-wide rank,
 	// so without these every multi-node runtime has to reconstruct the rank
 	// itself (leader=0, worker=index+1). Same multi-pod gate as the address.
-	if addr := leaderAddressForInstance(isvcName, plan.Component, inst); addr != "" {
+	if addr := leaderAddressForInstance(isvcName, plan.Component, inst, standing); addr != "" {
 		env = append(env,
 			corev1.EnvVar{Name: "OME_LEADER_ADDRESS", Value: addr},
 			corev1.EnvVar{Name: "OME_INSTANCE_POD_RANK", Value: fmt.Sprintf("%d", instancePodRank(inst, runner, ordinal))},
@@ -571,20 +601,22 @@ func instancePodRank(inst workload.InstancePlan, runner workload.RunnerPlan, ord
 	return offset + ordinal
 }
 
-// podHostname returns the spec.hostname Render stamps on one pod of the
-// Instance. Pods of a multi-pod Instance — the only pods OME publishes
-// peer DNS names for (OME_LEADER_ADDRESS, the TPU peer host list) —
-// carry the Instance incarnation in their hostname via query.PodHostname,
-// so a peer-DNS lookup can never resolve to a previous incarnation's
-// pod: the old pod may still be draining while the headless Service
-// publishes its not-ready address, and the bare pod name is deliberately
-// stable across rebuilds. Single-pod Instances keep hostname == pod
-// name: nothing addresses them by peer DNS.
-func podHostname(name string, inst workload.InstancePlan) string {
+// podHostname returns the spec.hostname Render writes on one pod of the
+// Instance. A single-pod Instance, which nothing addresses by peer DNS,
+// keeps its pod name. Pods of a multi-pod Instance are the only pods OME
+// publishes peer DNS names for (OME_LEADER_ADDRESS, the TPU peer host
+// list). A set of them built whole carries the Instance's recreation count
+// in its hostnames through query.PodHostname, so it takes no DNS name of
+// the set before it. A pod made beside live pods of its set takes the
+// hostnames they answer to (standing), their pod names or the count their
+// hostnames carry, because it must fit the addresses they hold. Every peer
+// address Render hands out is built from this one answer, so the pods of a
+// set always name each other by hostnames that exist.
+func podHostname(name string, inst workload.InstancePlan, standing query.PodSetHostnames) string {
 	if inst.TotalPods() <= 1 {
 		return name
 	}
-	return query.PodHostname(name, inst.Incarnation)
+	return standing.Hostname(name, inst.Incarnation)
 }
 
 // leaderAddressForInstance returns the peer-DNS address of the Instance's
@@ -595,13 +627,13 @@ func podHostname(name string, inst workload.InstancePlan) string {
 // resolves the same as the fully-qualified
 // `<hostname>.<headless>.<ns>.svc.cluster.local` form without the
 // controller needing to discover the cluster's actual DNS domain. The
-// leader hostname carries the Instance incarnation (podHostname), so the
-// address always names the current incarnation's leader.
-func leaderAddressForInstance(isvcName string, component workload.ComponentType, inst workload.InstancePlan) string {
+// leader hostname is the one podHostname gives the leader pod, so the
+// address names the hostname the leader of this pod set answers to.
+func leaderAddressForInstance(isvcName string, component workload.ComponentType, inst workload.InstancePlan, standing query.PodSetHostnames) string {
 	for _, r := range inst.Runners {
 		if r.Name == workload.RunnerLeader {
 			return fmt.Sprintf("%s.%s",
-				podHostname(query.PodName(isvcName, component, inst.Index, "leader", 0), inst),
+				podHostname(query.PodName(isvcName, component, inst.Index, "leader", 0), inst, standing),
 				query.HeadlessServiceName(isvcName, component),
 			)
 		}
@@ -619,8 +651,8 @@ const tpuProcessPort = 8476
 // process-address list JAX/libtpu reads to form the cross-host device mesh.
 // Returns nil for single-pod Instances, where GKE's default single-host slice is
 // correct. Gated by the caller on the pod requesting google.com/tpu.
-func buildTPUTopologyEnv(plan workload.ComponentPlan, inst workload.InstancePlan, runner workload.RunnerPlan, ordinal int32, isvcName string) []corev1.EnvVar {
-	hosts := instancePeerHostnames(isvcName, plan.Component, inst)
+func buildTPUTopologyEnv(plan workload.ComponentPlan, inst workload.InstancePlan, standing query.PodSetHostnames, runner workload.RunnerPlan, ordinal int32, isvcName string) []corev1.EnvVar {
+	hosts := instancePeerHostnames(isvcName, plan.Component, inst, standing)
 	if len(hosts) < 2 {
 		return nil
 	}
@@ -642,30 +674,30 @@ func buildTPUTopologyEnv(plan workload.ComponentPlan, inst workload.InstancePlan
 // ordinals 0..Size-1, the same order instancePodRank counts, so hosts[rank] is
 // the pod whose TPU_WORKER_ID is rank.
 //
-// The list depends only on (isvcName, component, inst) — identical for every
-// pod in the gang — so the gang-render loop precomputes it once into
+// The list depends only on (isvcName, component, inst, standing) — identical
+// for every pod in the gang — so the gang-render loop precomputes it once into
 // inst.PeerHostnames and Render reuses it here, avoiding the O(gangsize^2)
 // per-pod rebuild. When the cache is unset (single-pod paths, direct Render
 // callers, tests) it falls back to deriving the list from Runners.
-func instancePeerHostnames(isvcName string, component workload.ComponentType, inst workload.InstancePlan) []string {
+func instancePeerHostnames(isvcName string, component workload.ComponentType, inst workload.InstancePlan, standing query.PodSetHostnames) []string {
 	if inst.PeerHostnames != nil {
 		return inst.PeerHostnames
 	}
-	return buildInstancePeerHostnames(isvcName, component, inst)
+	return buildInstancePeerHostnames(isvcName, component, inst, standing)
 }
 
 // buildInstancePeerHostnames computes the Instance's ordered peer-DNS host
 // list from its Runners (the uncached path). Exported within the package so
-// the gang-render loop can prime inst.PeerHostnames once per gang. Each entry
-// is the pod's per-incarnation spec.hostname under the Component's headless
-// Service, matching what Render stamps on the pods themselves.
-func buildInstancePeerHostnames(isvcName string, component workload.ComponentType, inst workload.InstancePlan) []string {
+// the gang-render loop can prime inst.PeerHostnames once per gang. Each
+// entry is the pod's spec.hostname under the Component's headless Service,
+// the same hostname Render writes on the pod itself.
+func buildInstancePeerHostnames(isvcName string, component workload.ComponentType, inst workload.InstancePlan, standing query.PodSetHostnames) []string {
 	headless := query.HeadlessServiceName(isvcName, component)
 	var hosts []string
 	for _, r := range inst.Runners {
 		for o := int32(0); o < r.Size; o++ {
 			hosts = append(hosts, fmt.Sprintf("%s.%s",
-				podHostname(query.PodName(isvcName, component, inst.Index, r.Name, o), inst), headless))
+				podHostname(query.PodName(isvcName, component, inst.Index, r.Name, o), inst, standing), headless))
 		}
 	}
 	return hosts

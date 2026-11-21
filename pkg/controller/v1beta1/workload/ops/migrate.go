@@ -539,18 +539,22 @@ func (m *migrationPass) replacementRevisionName() string {
 // rollTakesSource reports whether the roll would take the source from
 // where it stands: the Component has a roll target the source does not
 // run, the roll could start on it (rollTargetOpen: the Component not
-// paused, the target's retry record not Held) and the partition does not
-// hold the Instance (RollHeldIndices). A Backoff block paces the roll's
-// start without holding it, so a move during one builds on the target
-// instead of waiting out the schedule: the source keeps serving until its
+// paused, the target's retry record not Held), the plan gate admits a
+// start on it (planGateAdmits: a run records the plan, and the plan
+// resolves) and the partition does not hold the Instance
+// (RollHeldIndices). A Backoff block paces the roll's start without
+// holding it, so a move during one builds on the target instead of
+// waiting out the schedule: the source keeps serving until its
 // replacement is up, so nothing is down while the target proves itself.
-// A source the roll holds, or a roll that cannot start, keeps the
-// Instance on the revision it runs, and so does its move.
+// A source the roll holds, a roll that cannot start, or a plan gate that
+// admits no start keeps the Instance on the revision it runs, and so does
+// its move: the replacement is built on the source's revision, and the
+// roll moves the Instance once a start is admitted.
 func (m *migrationPass) rollTakesSource() bool {
 	if m.source == nil || m.target == nil || m.source.RunningRevision == "" || m.source.RunningRevision == m.target.Name {
 		return false
 	}
-	return rollTargetOpen(m.input, m.plan, m.target) && !RollHeldIndices(m.input, m.plan, m.target)[m.sourceIdx]
+	return rollTargetOpen(m.input, m.plan, m.target) && planGateAdmits(m.input) && !RollHeldIndices(m.input, m.plan, m.target)[m.sourceIdx]
 }
 
 // operationRevision is what the pair's operations carry as their target
@@ -929,7 +933,7 @@ func (m *migrationPass) createSurgePods(ctx context.Context) (bool, error) {
 	if !m.deps.ExpectationsCache().Satisfied(m.input.Key.Namespace, m.input.Key.OwnerName, m.input.Key.Component, m.surgeIdx) {
 		return true, nil
 	}
-	if _, err := createMissingPods(ctx, m.deps, m.input, m.plan, m.surgePlan, m.surgeIdx, missing, m.surgeTemplate); err != nil {
+	if _, err := createMissingPods(ctx, m.deps, m.input, m.plan, m.surgePlan, m.surgeIdx, missing, m.surgePods, m.surgeTemplate); err != nil {
 		return m.answerSurgeCreateError(ctx, err)
 	}
 	return true, nil
@@ -1052,10 +1056,15 @@ func (m *migrationPass) drainSource(ctx context.Context) (bool, error) {
 // an empty stale view would skip the deletes and leave the pods behind
 // when the source's row is removed. A pod that sits Terminating on a
 // node that stopped reporting never satisfies its delete expectation, so
-// the force-delete escalation runs before the expectations gate; once
-// every source pod is past its own deletion deadline the record waits
-// on the kubelet and says so, and the pass returns without the deletes,
-// which would skip every pod anyway.
+// the force-delete escalation runs before the expectations gate.
+//
+// Once every source pod has stood past its deletion time for one
+// requeue of this pass, the record waits on the kubelet and says so,
+// and the pass returns without the deletes, which would skip every pod
+// anyway. The requeue is the wait because a healthy teardown reads the
+// same way for a moment: the kubelet's last delete moves the deletion
+// time to the present second before the pod is removed, and such a pod
+// is gone by the next pass. With no requeue configured there is no wait.
 func (m *migrationPass) deleteSource(ctx context.Context) (bool, error) {
 	pods, err := m.livePods(ctx, m.sourceIdx)
 	if err != nil {
@@ -1074,7 +1083,7 @@ func (m *migrationPass) deleteSource(ctx context.Context) (bool, error) {
 				"pod", pod.Name, "error", err.Error())
 		}
 	}
-	if evidence.AllPodsTerminatingOverdue(pods, m.input.Now()) {
+	if evidence.AllPodsTerminatingOverdueFor(pods, m.input.DesiredSpec.Lifecycle, m.input.Now(), MigrateRequeueInterval(m.input)) {
 		if err := parkMigrationOnSourceTeardown(ctx, m.deps, m.input, m.record, pods); err != nil {
 			return false, fmt.Errorf("Migrate: park on source teardown (uuid=%s): %w", m.requestUUID, err)
 		}
@@ -1429,8 +1438,11 @@ func replacementClaimsIndex(statuses []workload.InstanceStatus, idx int32) bool 
 // Manual record still Accepted with no replacement of its own names the
 // Instance wherever the roll put it, and goes on from there. A record
 // already executing owns its source and is left alone, as is a terminal
-// one. Idempotent, so the caller runs it on every pass that reaches the
-// source's removal and a crash between the two writes loses nothing.
+// one. A record waiting for the roll keeps that word on its message: the
+// wait's text is what measures its window again once the roll's surges
+// end, and the event records the follow. Idempotent, so the caller runs
+// it on every pass that reaches the source's removal and a crash between
+// the two writes loses nothing.
 func followHandoffForPendingMigrations(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, sourceIdx, surgeIdx int32) error {
 	if input.MutateMigration == nil {
 		return nil
@@ -1447,7 +1459,9 @@ func followHandoffForPendingMigrations(ctx context.Context, deps workload.Deps, 
 				return false
 			}
 			m.SourceInstance = surgeIdx
-			m.Message = fmt.Sprintf("following the Instance rebuilt as instance=%d", surgeIdx)
+			if !migrationWaitedForRoll(m) {
+				m.Message = fmt.Sprintf("following the Instance rebuilt as instance=%d", surgeIdx)
+			}
 			followed = true
 			return true
 		}); err != nil {
@@ -1957,13 +1971,14 @@ func migrationParkedMessage(input workload.ReconcileInput, sourcePods []*corev1.
 	return msg
 }
 
-// parkMigrationOnSourceTeardown records that the move is waiting on a
-// kubelet that missed the source pods' own deadlines: the record keeps
-// its Draining phase and carries the reason, and one Warning names the
-// pod. The write and the event happen on the pass that starts the wait,
-// not on every pass of it. The dispatcher reads the same pods to move
-// the head past the record, which the event says; the pass keeps
-// tending the record and completes it once the pods are gone.
+// parkMigrationOnSourceTeardown records that the move is waiting on
+// source pods nothing has removed since their deletion time: the record
+// keeps its Draining phase and carries the reason, and one Warning names
+// the pod. The write and the event happen on the pass that starts the
+// wait, not on every pass of it. The dispatcher has moved the head past
+// the record by then, since it reads the same pods without this wait,
+// and the event says so; the pass keeps tending the record and completes
+// it once the pods are gone.
 func parkMigrationOnSourceTeardown(ctx context.Context, deps workload.Deps, input workload.ReconcileInput, entry *workload.MigrationRecord, sourcePods []*corev1.Pod) error {
 	msg := migrationParkedMessage(input, sourcePods)
 	opened, err := recordMigrationWait(ctx, input, entry, msg)

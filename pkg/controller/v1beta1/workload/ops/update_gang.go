@@ -481,7 +481,7 @@ func (r *gangSurgeRoll) createReplacementPods(ctx context.Context, deps workload
 	if !found {
 		return false, announceRevisionGone(ctx, deps, input, r.sourceIdx, r.revision)
 	}
-	if _, cerr := createMissingPods(ctx, deps, input, renderPlan, r.replacementPlan, r.surgeIdx, missing, tmpl); cerr != nil {
+	if _, cerr := createMissingPods(ctx, deps, input, renderPlan, r.replacementPlan, r.surgeIdx, missing, r.replacementPods, tmpl); cerr != nil {
 		if createRejectionHandled(cerr) {
 			return false, nil
 		}

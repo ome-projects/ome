@@ -80,6 +80,7 @@ func rollBackOnGateFailure(in ReconcileInputs, cs *v1beta1.CanaryStatus) *Result
 		return (&Result{Active: true, Partition: in.DesiredReplicas}).wake(in.ParkedRequeue)
 	}
 	cs.RolledBackRevisionHash = cs.CanaryRevisionHash
+	forceUndoneByRollback(cs)
 	return reconcileRollback(in, cs)
 }
 

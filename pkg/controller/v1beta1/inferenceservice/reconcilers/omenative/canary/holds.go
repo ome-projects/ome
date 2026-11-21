@@ -389,6 +389,7 @@ func applyHolds(ctx context.Context, in ReconcileInputs, g *v1beta1.RolloutGroup
 			// through the hold, and no other unit acts on it.
 			warnEmptyRollbackTargets(in, cs)
 			cs.RolledBackRevisionHash = cs.CanaryRevisionHash
+			forceUndoneByRollback(cs)
 			cs.RollbackRequested = true
 			cs.Failed = nil
 			recordRollback(in.ISVC, in.Component, "manual")

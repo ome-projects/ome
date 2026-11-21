@@ -50,7 +50,7 @@ func reportNodeUnknown(ctx context.Context, in PassInput, row Row) (reading, err
 	var held []*corev1.Pod
 	var nodeLost map[string]struct{}
 	for _, pod := range evidence.UnreportedTargetPods(own, targetPodNames(in, row), in.Input.ForceDelete) {
-		kind, err := evidence.ReadUnreportedPod(ctx, in.Deps.NodeReaders(), pod, in.Input.ForceDelete, in.Input.Now())
+		kind, err := evidence.ReadUnreportedPod(ctx, in.Deps.NodeReaders(), pod, in.Input.ForceDelete, in.Input.DesiredSpec.Lifecycle, in.Input.Now())
 		if err != nil {
 			return reading{}, err
 		}

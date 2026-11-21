@@ -43,11 +43,17 @@ const (
 	// The CRD schema carries the same Minimum=0 bound; the pure validator
 	// keeps the rule enforceable off-cluster.
 	ReasonInvalidMinReadySeconds = "InvalidMinReadySeconds"
+	// ReasonInvalidLeaderGoneGracePeriod rejects a
+	// lifecycle.leaderGoneGracePeriod that is not above zero. The CRD schema
+	// carries the same rule; the pure validator keeps it enforceable
+	// off-cluster.
+	ReasonInvalidLeaderGoneGracePeriod = "InvalidLeaderGoneGracePeriod"
 )
 
 // ValidateLifecycle inspects every Component's LifecycleSpec on the
 // InferenceService: UpdateStrategy.RollingUpdate.MaxUnavailable and
-// .MaxSurge (both *intstr.IntOrString) and MinReadySeconds.
+// .MaxSurge (both *intstr.IntOrString), MinReadySeconds and
+// LeaderGoneGracePeriod.
 // Wired into the webhook from inference_service_validation.go.
 func ValidateLifecycle(spec *v1beta1.InferenceServiceSpec) error {
 	for _, r := range declaredRoles(spec) {
@@ -66,6 +72,9 @@ func validateComponentLifecycle(name string, lc *v1beta1.LifecycleSpec) error {
 		return fmt.Errorf("spec.%s.lifecycle.minReadySeconds must be >= 0, got %d (%s)",
 			name, *lc.MinReadySeconds, ReasonInvalidMinReadySeconds)
 	}
+	if err := ValidateLeaderGoneGracePeriod(fmt.Sprintf("spec.%s.lifecycle", name), lc); err != nil {
+		return err
+	}
 	if lc.UpdateStrategy == nil || lc.UpdateStrategy.RollingUpdate == nil {
 		return nil
 	}
@@ -81,6 +90,19 @@ func validateComponentLifecycle(name string, lc *v1beta1.LifecycleSpec) error {
 		return err
 	}
 	return nil
+}
+
+// ValidateLeaderGoneGracePeriod rejects a lifecycle.leaderGoneGracePeriod
+// that is set and not above zero. The engine hands the value to a pod as its
+// termination grace, and a grace of zero would remove the pod object before
+// its kubelet reported the containers stopped. path is the field path of the
+// lifecycle block that carries the field.
+func ValidateLeaderGoneGracePeriod(path string, lc *v1beta1.LifecycleSpec) error {
+	if lc == nil || lc.LeaderGoneGracePeriod == nil || lc.LeaderGoneGracePeriod.Duration > 0 {
+		return nil
+	}
+	return fmt.Errorf("%s.leaderGoneGracePeriod is %s and must be above 0s: set a duration such as 30s, or leave the field unset to keep the termination grace each pod has (%s)",
+		path, lc.LeaderGoneGracePeriod.Duration, ReasonInvalidLeaderGoneGracePeriod)
 }
 
 // validateRollingUpdateNotBothZero rejects maxSurge and maxUnavailable

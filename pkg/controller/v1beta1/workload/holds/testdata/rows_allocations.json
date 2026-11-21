@@ -1,18 +1,18 @@
 {
   "recordedOn": {
-    "date": "2026-11-06",
+    "date": "2026-11-17",
     "machine": "linux/amd64, 192 cores, go1.26.7"
   },
-  "reason": "Building the hold pass's rows over a Component at rest (RowsForPlan over every observed row, as every pass builds them ahead of the hold pass), at 1,000 and 4,000 single-pod Instances, 160 gangs of a leader and seven workers and 1,725 gangs of a leader and one worker; every row Ready on the spec revision with every pod serving and the plan covering every row. Each row reads the observed row in place, 24 bytes per row beside the two maps of the plan's entries and pod counts by index, which are most of the bytes left. Before, each row carried its own copy of the observed row: 277,152 / 1,092,224 / 48,208 / 432,800 bytes at the four shapes with the same 11 / 35 / 7 / 11 allocations, recorded on the same day and machine.",
+  "reason": "Building the hold pass's rows over a Component at rest (RowsForPlan over every observed row, as every pass builds them ahead of the hold pass), at 1,000 and 4,000 single-pod Instances, 160 gangs of a leader and seven workers and 1,725 gangs of a leader and one worker; every row Ready on the spec revision with every pod serving and the plan covering every row. Each row reads the observed row in place, 24 bytes per row beside the two maps of the plan's entries and pod counts by index, which are most of the bytes left. Before, each row carried its own copy of the observed row: 277,152 / 1,092,224 / 48,208 / 432,800 bytes at the four shapes with the same 11 / 35 / 7 / 11 allocations, recorded on the same day and machine. Re-recorded with the rows asking the plan for each row's entry and desired count (ComponentPlan.InstanceAt, ComponentPlan.DesiredPodsFor) instead of building two maps over the plan's Instances first: 11 / 35 / 7 / 11 allocations to 1 / 1 / 1 / 1 and 88,736 / 354,944 / 12,624 / 113,312 bytes to 32,768 / 131,072 / 5,376 / 57,344 at 1000x1 / 4000x1 / 160x8 / 1725x2, what remains being the rows themselves.",
   "tolerancePercent": 10,
   "budgets": {
-    "1000x1/rows/allocations": 11,
-    "1000x1/rows/bytes": 88736,
-    "160x8/rows/allocations": 7,
-    "160x8/rows/bytes": 12624,
-    "1725x2/rows/allocations": 11,
-    "1725x2/rows/bytes": 113312,
-    "4000x1/rows/allocations": 35,
-    "4000x1/rows/bytes": 354944
+    "1000x1/rows/allocations": 1,
+    "1000x1/rows/bytes": 32768,
+    "160x8/rows/allocations": 1,
+    "160x8/rows/bytes": 5376,
+    "1725x2/rows/allocations": 1,
+    "1725x2/rows/bytes": 57344,
+    "4000x1/rows/allocations": 1,
+    "4000x1/rows/bytes": 131072
   }
 }

@@ -1,12 +1,12 @@
 {
   "recordedOn": {
-    "date": "2026-11-03",
+    "date": "2026-11-12",
     "machine": "linux/amd64, 192 cores, go1.26.7"
   },
-  "reason": "First recording: the endpoint reading over a service at rest, 1,000 and 4,000 single-pod Instances serving on one revision, every pod a Ready endpoint, the revision's slices already read by the rotation. The reading names the routed Service once per revision; what it builds per pod is nothing.",
+  "reason": "Re-recorded: the serving count the reading ends with (servingPodsByRevision over the pods kept as listed) builds no map per Instance for single pods, so the reading allocates 10 times at 1,000 and at 4,000 Instances where it allocated 50 and 102, the count's two maps with one entry per Instance. Earlier recording: First recording: the endpoint reading over a service at rest, 1,000 and 4,000 single-pod Instances serving on one revision, every pod a Ready endpoint, the revision's slices already read by the rotation. The reading names the routed Service once per revision; what it builds per pod is nothing.",
   "tolerancePercent": 10,
   "budgets": {
-    "1000x1/one-revision": 50,
-    "4000x1/one-revision": 102
+    "1000x1/one-revision": 10,
+    "4000x1/one-revision": 10
   }
 }

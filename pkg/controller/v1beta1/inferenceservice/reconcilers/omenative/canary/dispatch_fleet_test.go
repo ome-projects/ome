@@ -39,10 +39,10 @@ var updateDispatchAllocations = flag.Bool("update-dispatch", false, "re-record t
 
 // The controller runs one canary dispatch per canary group on every pass of
 // the service, whether a roll is open or not. The dispatch reads every
-// member's pods and its replica, and the service's own record, through the
-// live API reader, so its cost is what the apiserver and the manager pay for
-// a service with a canary group at rest, once per pass, for as long as the
-// service exists. The shapes
+// member's replica and the service's own record through the live API reader
+// and every member's pods through the manager's cache, so its cost is what
+// the apiserver and the manager pay for a service with a canary group at
+// rest, once per pass, for as long as the service exists. The shapes
 // here are the reference ones: engine units of 1,000 and 4,000 single-pod
 // Instances and of 160 gangs of eight, and prefill/decode units of 12:8 and
 // 30:10 behind four routers.
@@ -386,7 +386,7 @@ func (f *dispatchFleet) pass(tb testing.TB) {
 func (f *dispatchFleet) resetCounts() {
 	f.live.gets, f.live.serviceGets, f.live.lists, f.live.podsListed = 0, 0, 0, 0
 	f.cache.reads, f.cache.writes = 0, 0
-	f.cache.podLists, f.cache.podsListed, f.cache.podsCopied = 0, 0, 0
+	f.cache.podLists, f.cache.podListsByIndex, f.cache.podsListed, f.cache.podsCopied = 0, 0, 0, 0
 }
 
 // checkAtRest holds the unit where the state says: holding, the primary's
@@ -663,8 +663,10 @@ type cacheStandIn struct {
 	podSets       []podSet
 	reads, writes int64
 	podLists      int64
-	podsListed    int64
-	podsCopied    int64
+	// podListsByIndex is how many of the pod lists named the pod index.
+	podListsByIndex int64
+	podsListed      int64
+	podsCopied      int64
 }
 
 // storeKey names one stored object by its type, namespace and name.
@@ -716,6 +718,9 @@ func (c *cacheStandIn) List(_ context.Context, list client.ObjectList, opts ...c
 // for the cache's own objects.
 func (c *cacheStandIn) listPods(pods *corev1.PodList, options client.ListOptions) error {
 	c.podLists++
+	if options.FieldSelector != nil {
+		c.podListsByIndex++
+	}
 	for i := range c.podSets {
 		set := &c.podSets[i]
 		if set.namespace != options.Namespace || !set.selectedBy(options) {
