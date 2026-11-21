@@ -8,7 +8,7 @@ def recommendations($time):
   {data:{"last-cycle.json":({timestamp:$time,mode:"execute",recommendations:[
     {workload:"alfred-e2e/single",component:"engine",instance:0,fromNode:$base.source.node,
      policy:"nodehealth",reason:"NodeMaintenance",outcome:"advisory",advisoryReason:"OMENativeStateIneligible"}]}|tojson),
-    ("node."+$base.source.node):({maintenance:{requested:true},maintenanceDrainedAt:null,omeGpuOccupantsPresent:true}|tojson)}};
+    ("node."+$base.source.node):({maintenance:{requested:true},maintenanceDrainedAt:null,omeAcceleratorOccupantsPresent:true}|tojson)}};
 def sample($revision;$paused;$time):
   {isvc:{metadata:{uid:"isvc-new",name:"single",namespace:"alfred-e2e",
     labels:{"ome.io/placement-origin":"alfred-e2e-source"},

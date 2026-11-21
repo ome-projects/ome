@@ -18,5 +18,5 @@ length > 0 and all(.[];
     elif $kind == "recommendations" then
       (.data[$key] // "null" | fromjson) as $record |
       $record == null or ($record.maintenanceDrainedAt == null and $record.drainedAt == null and
-        ($record.maintenance.requested != true or $record.omeGpuOccupantsPresent == true))
+        ($record.maintenance.requested != true or $record.omeAcceleratorOccupantsPresent == true))
     else false end))

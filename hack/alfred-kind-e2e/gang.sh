@@ -217,7 +217,7 @@ while (( SECONDS < request_deadline )); do
     if [[ -n "${request}" ]] && whole_gang "${replacement}" false false &&
        [[ "$(jq -r '.zone' <<<"${replacement}")" != "${source_zone}" ]]; then
       record="$(node_record)"
-      if [[ -n "${record}" ]] && jq -e '.maintenance.requested and .maintenanceDrainedAt == null and .omeGpuOccupantsPresent' <<<"${record}" >/dev/null; then
+      if [[ -n "${record}" ]] && jq -e '.maintenance.requested and .maintenanceDrainedAt == null and .omeAcceleratorOccupantsPresent' <<<"${record}" >/dev/null; then
         replacement_uids="$(jq -c '.pods|map(.uid)' <<<"${replacement}")"
         hold_start="${SECONDS}"
         echo "Holding entire scheduled replacement gang for ${surge_hold_seconds}s"
@@ -230,11 +230,11 @@ while (( SECONDS < request_deadline )); do
             echo 'replacement was not continuously whole, scheduled and held' >&2; exit 1;
           }
           record="$(node_record)"
-          jq -e '.maintenanceDrainedAt == null and .omeGpuOccupantsPresent' <<<"${record}" >/dev/null || { echo 'Alfred prematurely reported drained source' >&2; exit 1; }
+          jq -e '.maintenanceDrainedAt == null and .omeAcceleratorOccupantsPresent' <<<"${record}" >/dev/null || { echo 'Alfred prematurely reported drained source' >&2; exit 1; }
           jq -cn --argjson source "$(instance_summary 0)" --argjson replacement "${replacement}" --argjson node "${record}" '{source:$source,replacement:$replacement,node:$node}' >>"${artifact_dir}/held-samples.jsonl"
           sleep 0.2
         done
-        surge="$(jq -cn --argjson replacement "${replacement}" --argjson hold "$((SECONDS - hold_start))" --argjson source "$(instance_summary 0)" --argjson record "${record}" '$replacement + {holdSeconds:$hold,sourcePodsPresent:($source.pods|length),sourcePodsReady:([$source.pods[]|select(.ready)]|length),sourcePodsServing:([$source.pods[]|select(.serving)]|length),sourceLeaderEndpointReady:$source.leaderEndpointReady,replacementLeaderEndpointReady:$replacement.leaderEndpointReady,alfredMaintenanceDrainedAt:$record.maintenanceDrainedAt,alfredOMEGPUOccupantsPresent:$record.omeGpuOccupantsPresent}')"
+        surge="$(jq -cn --argjson replacement "${replacement}" --argjson hold "$((SECONDS - hold_start))" --argjson source "$(instance_summary 0)" --argjson record "${record}" '$replacement + {holdSeconds:$hold,sourcePodsPresent:($source.pods|length),sourcePodsReady:([$source.pods[]|select(.ready)]|length),sourcePodsServing:([$source.pods[]|select(.serving)]|length),sourceLeaderEndpointReady:$source.leaderEndpointReady,replacementLeaderEndpointReady:$replacement.leaderEndpointReady,alfredMaintenanceDrainedAt:$record.maintenanceDrainedAt,alfredOMEGPUOccupantsPresent:$record.omeAcceleratorOccupantsPresent}')"
         if [[ "${variant}" == partial-restart ]]; then
           source "${dir}/partial-gang.sh"
           partial_gang_restart
@@ -265,9 +265,9 @@ while (( SECONDS < request_deadline )); do
   dispatch_raw="$("${kube[@]}" -n "${alfred_namespace}" get configmap alfred-dispatch-state -o jsonpath='{.data.state\.json}')"
   dispatch="$(jq -c --arg uuid "${uuid}" '[.entries[]?|select(.uuid == $uuid)]|if length == 1 then .[0] else empty end' <<<"${dispatch_raw}")"
   if [[ -n "${record}" && -n "${dispatch}" ]] &&
-    jq -e '.maintenance.requested and .maintenanceDrainedAt != null and (.omeGpuOccupantsPresent|not)' <<<"${record}" >/dev/null &&
+    jq -e '.maintenance.requested and .maintenanceDrainedAt != null and (.omeAcceleratorOccupantsPresent|not)' <<<"${record}" >/dev/null &&
     jq -e '.phase == "completed" and .completedAt != null' <<<"${dispatch}" >/dev/null; then
-    alfred="$(jq -cn --argjson recommendation "${recommendation}" --argjson record "${record}" --argjson dispatch "${dispatch}" '{workload:$recommendation.workload,component:$recommendation.component,instance:$recommendation.instance,policy:$recommendation.policy,reason:$recommendation.reason,fromNode:$recommendation.fromNode,requestUUID:$dispatch.uuid,dispatchStatus:$dispatch.phase,maintenanceTriggers:$record.maintenance.triggers,maintenanceRequestedAt:$record.maintenanceRequestedAt,maintenanceDrainedAt:$record.maintenanceDrainedAt,omeGPUOccupantsPresent:$record.omeGpuOccupantsPresent}')"
+    alfred="$(jq -cn --argjson recommendation "${recommendation}" --argjson record "${record}" --argjson dispatch "${dispatch}" '{workload:$recommendation.workload,component:$recommendation.component,instance:$recommendation.instance,policy:$recommendation.policy,reason:$recommendation.reason,fromNode:$recommendation.fromNode,requestUUID:$dispatch.uuid,dispatchStatus:$dispatch.phase,maintenanceTriggers:$record.maintenance.triggers,maintenanceRequestedAt:$record.maintenanceRequestedAt,maintenanceDrainedAt:$record.maintenanceDrainedAt,omeGPUOccupantsPresent:$record.omeAcceleratorOccupantsPresent}')"
     break
   fi
   sleep 1
