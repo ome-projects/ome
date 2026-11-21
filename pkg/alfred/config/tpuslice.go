@@ -26,6 +26,9 @@ type TPUSlicePartitions struct {
 	StateLabel string `json:"stateLabel"`
 	// HealthyState is the state label value that marks a partition usable.
 	HealthyState string `json:"healthyState"`
+	// PodLabel is the node label whose value names the TPU pod a host belongs
+	// to: the set of hosts the TPU interconnect can join into one slice.
+	PodLabel string `json:"podLabel"`
 }
 
 // applyDefaults fills unset label settings with GKE's TPU partition labels.
@@ -35,6 +38,7 @@ func (t *TPUSlicePartitions) applyDefaults() {
 	defaultStr(&t.IDLabel, "cloud.google.com/gke-tpu-partition-%s-id")
 	defaultStr(&t.StateLabel, "cloud.google.com/gke-tpu-partition-%s-state")
 	defaultStr(&t.HealthyState, "HEALTHY")
+	defaultStr(&t.PodLabel, "cloud.google.com/gce-topology-block")
 }
 
 // validate requires label keys that form valid Kubernetes label keys, label
@@ -45,6 +49,9 @@ func (t *TPUSlicePartitions) validate() error {
 	}
 	if len(validation.IsQualifiedName(t.SliceLabel)) != 0 {
 		return fmt.Errorf("tpuSlicePartitions.sliceLabel is invalid: %q", t.SliceLabel)
+	}
+	if len(validation.IsQualifiedName(t.PodLabel)) != 0 {
+		return fmt.Errorf("tpuSlicePartitions.podLabel is invalid: %q", t.PodLabel)
 	}
 	for _, f := range []struct{ name, value string }{
 		{"idLabel", t.IDLabel},

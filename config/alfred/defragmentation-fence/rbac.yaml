@@ -1,0 +1,26 @@
+# Optional: apply with config/alfred and add --enable-defragmentation-fence=true
+# to the deployment to let execute mode cordon the TPU partitions the TPU
+# defragmentation policy drains, and uncordon them when the drain ends. Alfred
+# uncordons only nodes carrying its alfred.ome.io/cordoned-for-defragmentation
+# annotation. patch allows any node field, and only Alfred's code limits it.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: ome-alfred-defragmentation-fence
+rules:
+  - apiGroups: [ "" ]
+    resources: [ "nodes" ]
+    verbs: [ "get", "patch" ]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: ome-alfred-defragmentation-fence
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: ome-alfred-defragmentation-fence
+subjects:
+  - kind: ServiceAccount
+    name: ome-alfred
+    namespace: ome

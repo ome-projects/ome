@@ -95,8 +95,9 @@ type Config struct {
 
 // Policies groups the per-policy blocks.
 type Policies struct {
-	Defragmentation Defragmentation `json:"defragmentation"`
-	NodeHealth      NodeHealth      `json:"nodeHealth"`
+	Defragmentation    Defragmentation    `json:"defragmentation"`
+	NodeHealth         NodeHealth         `json:"nodeHealth"`
+	TPUDefragmentation TPUDefragmentation `json:"tpuDefragmentation"`
 }
 
 // Defragmentation is Policy #1's block.
@@ -234,6 +235,8 @@ func (c *Config) applyDefaults() {
 	}
 	defaultInt(&n.HealthCooldownFloorMinutes, 5)
 	defaultInt(&n.NodeSuspicionWindowMinutes, 30)
+
+	c.Policies.TPUDefragmentation.applyDefaults()
 
 	if c.DefaultMovable == nil {
 		c.DefaultMovable = boolPtr(true)
@@ -376,6 +379,9 @@ func (c *Config) validate() error {
 		return fmt.Errorf("policies.nodeHealth.aggressiveness %q invalid", n.Aggressiveness)
 	}
 	if err := n.validateTriggers(); err != nil {
+		return err
+	}
+	if err := c.Policies.TPUDefragmentation.validate(c); err != nil {
 		return err
 	}
 
