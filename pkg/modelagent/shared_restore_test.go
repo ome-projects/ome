@@ -2,12 +2,12 @@ package modelagent
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -38,14 +38,16 @@ func newSharedRestoreFixture(t *testing.T) (*Gopher, *GopherTask, hfArtifactTask
 	return s, task, input
 }
 
-func testRequestLabel(task *GopherTask) string {
-	digest := sha256.Sum256([]byte(getModelUID(task)))
-	return fmt.Sprintf("ome.io/artifact-%x", digest[:24])
-}
-
 func TestSharedRestoreHealthyReuseReportsBeforeLabels(t *testing.T) {
 	s, task, input := newSharedRestoreFixture(t)
 	ctx := context.Background()
+	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	key, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+	require.NoError(t, err)
+	delete(node.Labels, key)
+	_, err = s.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	require.NoError(t, err)
 	validations := 0
 	patches := 0
 	s.kubeClient.(*fake.Clientset).PrependReactor("patch", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
@@ -66,42 +68,42 @@ func TestSharedRestoreHealthyReuseReportsBeforeLabels(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, hfArtifactTaskDone, result.Outcome, "%+v", result)
 	require.Zero(t, validations, "a new request reuses a trusted Ready parent")
-	require.Positive(t, patches, "old Ready alone does not acknowledge a new request")
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Equal(t, "request-1", node.Labels[testRequestLabel(task)])
+	require.Positive(t, patches, "missing Ready label must publish after the report")
 }
 
 func TestSharedRestoreReadyReuseSkipsHashAcrossSources(t *testing.T) {
-	for _, source := range []string{"HF-origin OCI", "HF"} {
-		for _, allowDownload := range []bool{false, true} {
-			t.Run(fmt.Sprintf("%s/download-worker=%v", source, allowDownload), func(t *testing.T) {
-				s, task, input := newSharedRestoreFixture(t)
-				if source == "HF" {
-					task.BaseModel.Spec.Storage.StorageUri = ptr("hf://" + input.Parent.Identity.ModelID)
+	for _, request := range []string{"request-1", "restore/request", strings.Repeat("r", 80)} {
+		for _, source := range []string{"HF-origin OCI", "HF"} {
+			for _, allowDownload := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/download-worker=%v/request=%s", source, allowDownload, request), func(t *testing.T) {
+					s, task, input := newSharedRestoreFixture(t)
+					task.BaseModel.Annotations[testRestoreAnnotation] = request
 					_, err := s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
 					require.NoError(t, err)
-				}
-				result, err := s.runHfArtifactDownload(context.Background(), task, input, allowDownload,
-					func(string) (bool, error) {
-						t.Fatal("Ready parent must not be rehashed for a new request")
-						return false, nil
-					},
-					func(string) error { t.Fatal("Ready parent must not download"); return nil })
-				require.NoError(t, err)
-				require.Equal(t, hfArtifactTaskDone, result.Outcome, "%+v", result)
-				require.False(t, task.NormalPriorityOnly, "Ready reuse does not need a download worker")
-				assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
-				cm, err := s.configMapReconciler.getConfigMap(context.Background())
-				require.NoError(t, err)
-				entry, err := existingModelEntry(cm.Data, input.ChildModelKey)
-				require.NoError(t, err)
-				require.Equal(t, ModelStatusReady, entry.Status)
-				require.Equal(t, "request-1", entry.ArtifactRehydrationID)
-				node, err := s.kubeClient.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
-				require.NoError(t, err)
-				require.Equal(t, "request-1", node.Labels[testRequestLabel(task)])
-			})
+					if source == "HF" {
+						task.BaseModel.Spec.Storage.StorageUri = ptr("hf://" + input.Parent.Identity.ModelID)
+						_, err := s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(context.Background(), task.BaseModel, metav1.UpdateOptions{})
+						require.NoError(t, err)
+					}
+					result, err := s.runHfArtifactDownload(context.Background(), task, input, allowDownload,
+						func(string) (bool, error) {
+							t.Fatal("Ready parent must not be rehashed for a new request")
+							return false, nil
+						},
+						func(string) error { t.Fatal("Ready parent must not download"); return nil })
+					require.NoError(t, err)
+					require.Equal(t, hfArtifactTaskDone, result.Outcome, "%+v", result)
+					require.False(t, task.NormalPriorityOnly, "Ready reuse does not need a download worker")
+					assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+					cm, err := s.configMapReconciler.getConfigMap(context.Background())
+					require.NoError(t, err)
+					entry, err := existingModelEntry(cm.Data, input.ChildModelKey)
+					require.NoError(t, err)
+					require.Equal(t, ModelStatusReady, entry.Status)
+					require.Equal(t, request, entry.ArtifactRehydrationID)
+					require.Equal(t, input.ChildModelUID, entry.ModelUID)
+				})
+			}
 		}
 	}
 }
@@ -142,9 +144,6 @@ func TestSharedRestoreReadyMarkerCannotBypassStartupValidation(t *testing.T) {
 	entry, err := existingModelEntry(cm.Data, input.ChildModelKey)
 	require.NoError(t, err)
 	require.Empty(t, entry.ArtifactRehydrationID)
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Empty(t, node.Labels[testRequestLabel(task)])
 }
 
 func TestSharedRestoreChecksStartupBeforeConfigMapWriteLock(t *testing.T) {
@@ -180,7 +179,7 @@ func TestSharedRestoreChecksStartupBeforeConfigMapWriteLock(t *testing.T) {
 }
 
 func TestSharedRestoreRejectsStaleAuthority(t *testing.T) {
-	for _, change := range []string{"request", "empty queued request", "model", "source", "path", "placement", "node", "invalid request"} {
+	for _, change := range []string{"request", "empty queued request", "model", "source", "path", "placement", "node"} {
 		t.Run(change, func(t *testing.T) {
 			s, task, input := newSharedRestoreFixture(t)
 			current := task.BaseModel.DeepCopy()
@@ -203,9 +202,6 @@ func TestSharedRestoreRejectsStaleAuthority(t *testing.T) {
 				node.DeletionTimestamp = &metav1.Time{Time: time.Now()}
 				_, err = s.kubeClient.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 				require.NoError(t, err)
-			case "invalid request":
-				current.Annotations[testRestoreAnnotation] = "invalid/request"
-				task.BaseModel.Annotations[testRestoreAnnotation] = "invalid/request"
 			}
 			_, err := s.omeClient.OmeV1beta1().BaseModels(current.Namespace).Update(context.Background(), current, metav1.UpdateOptions{})
 			require.NoError(t, err)
@@ -371,7 +367,6 @@ func TestSharedRestoreDeletePreservesReplacementReady(t *testing.T) {
 	key, err := getModelLabelKey(&NodeLabelOp{BaseModel: replacement})
 	require.NoError(t, err)
 	require.Equal(t, "Ready", node.Labels[key])
-	require.Empty(t, node.Labels[testRequestLabel(task)])
 }
 
 func TestSharedRestoreAfterEvictionAndCleanupRestart(t *testing.T) {
@@ -429,9 +424,6 @@ func TestSharedRestoreMissingParentDownloads(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, hfArtifactTaskDone, result.Outcome, "%+v", result)
 	require.Equal(t, 1, downloads)
-	node, err := s.kubeClient.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Equal(t, "request-1", node.Labels[testRequestLabel(task)])
 }
 
 func TestSharedRestoreReportRetriesRecheckAuthority(t *testing.T) {
@@ -476,9 +468,6 @@ func TestSharedRestoreReportRetriesRecheckAuthority(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, hfArtifactTaskRetry, result.Outcome)
 			require.Equal(t, 1, writes, "stale report must not retry the write")
-			node, err := s.kubeClient.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
-			require.NoError(t, err)
-			require.Empty(t, node.Labels[testRequestLabel(task)])
 		})
 	}
 }
@@ -503,6 +492,13 @@ func TestSharedRestoreLostResponses(t *testing.T) {
 					return true, nil, errors.New("lost report response")
 				})
 			} else {
+				node, err := client.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
+				require.NoError(t, err)
+				key, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+				require.NoError(t, err)
+				node.Labels[key] = string(Updating)
+				_, err = client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
+				require.NoError(t, err)
 				client.PrependReactor("patch", "nodes", func(action ktesting.Action) (bool, runtime.Object, error) {
 					if injected {
 						return false, nil, nil
@@ -516,7 +512,7 @@ func TestSharedRestoreLostResponses(t *testing.T) {
 					node := object.(*corev1.Node)
 					key, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
 					require.NoError(t, err)
-					node.Labels[key], node.Labels[testRequestLabel(task)] = "Ready", "request-1"
+					node.Labels[key] = "Ready"
 					if stage == "labels missing node" {
 						require.NoError(t, client.Tracker().Delete(corev1.SchemeGroupVersion.WithResource("nodes"), "", node.Name))
 					}
@@ -565,12 +561,9 @@ func TestSharedRestoreGenericReadyCannotAcknowledge(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, ModelStatusReady, entry.Status)
 	require.Empty(t, entry.ArtifactRehydrationID)
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	require.NoError(t, err)
-	require.Empty(t, node.Labels[testRequestLabel(task)])
 }
 
-func TestSharedRestoreOrdinaryDeleteRemovesRequestLabel(t *testing.T) {
+func TestSharedRestoreOrdinaryDeleteRemovesReadyLabel(t *testing.T) {
 	s, task, input := newSharedRestoreFixture(t)
 	result, err := s.runHfArtifactDownload(context.Background(), task, input, true, func(string) (bool, error) { return true, nil }, nil)
 	require.NoError(t, err)
@@ -583,7 +576,9 @@ func TestSharedRestoreOrdinaryDeleteRemovesRequestLabel(t *testing.T) {
 	require.NoError(t, s.safeNodeLabelReconciliation(context.Background(), &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Deleted}))
 	node, err := s.kubeClient.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Empty(t, node.Labels[testRequestLabel(task)])
+	key, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+	require.NoError(t, err)
+	require.NotContains(t, node.Labels, key)
 }
 
 func TestSharedRestoreProtectsDanglingUnrecordedAliases(t *testing.T) {

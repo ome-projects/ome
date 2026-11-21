@@ -108,7 +108,7 @@ func validateArtifactRestore(ctx context.Context) error {
 	return nil
 }
 
-// Retain file locks through the readiness checks, report CAS, and paired Node labels.
+// Retain file locks through the readiness checks, report CAS, and the Node Ready label.
 func reportArtifactRestore(ctx context.Context, key string, uid types.UID, validateEntry func(*corev1.ConfigMap, ModelEntry) error) error {
 	guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard)
 	if guard == nil {
@@ -144,13 +144,13 @@ func reportArtifactRestore(ctx context.Context, key string, uid types.UID, valid
 		return err
 	}
 	op := &NodeLabelOp{BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel,
-		ModelStateOnNode: Ready, artifactRequestID: artifactRehydrationID(task), requireNodeCAS: true}
+		ModelStateOnNode: Ready, requireNodeCAS: true}
 	op.validateReady = func() error { return s.validateArtifactRestoreReport(ctx, task) }
 	return s.nodeLabelReconciler.ReconcileNodeLabels(op)
 }
 
 // A retry may observe a committed report after a lost API response. It still
-// rechecks live authority and the exact report before publishing paired labels.
+// rechecks live authority and the exact report before publishing the Ready label.
 func (s *Gopher) validateArtifactRestoreReport(ctx context.Context, task *GopherTask) error {
 	if err := s.validateArtifactDownload(ctx, task); err != nil {
 		return err

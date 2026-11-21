@@ -344,7 +344,7 @@ func (s *Gopher) updateHfArtifactChildLabels(ctx context.Context, statuses map[s
 		if status == ModelStatusReady && s.omeClient != nil {
 			if artifactRehydrationID(&GopherTask{BaseModel: op.BaseModel, ClusterBaseModel: op.ClusterBaseModel}) != "" {
 				// Startup and sibling repair did not validate this request. Its
-				// normal download task owns reporting and paired label publication.
+				// normal download task owns reporting and Ready label publication.
 				continue
 			}
 			op.validateReady = func() error {

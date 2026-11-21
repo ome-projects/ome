@@ -30,7 +30,6 @@ func TestCompletedRestoreAllowsOrdinaryPolicyTransition(t *testing.T) {
 			require.NoError(t, err)
 			node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
 			require.NoError(t, err)
-			delete(node.Labels, testRequestLabel(task))
 			node.Labels["pool"] = "gpu"
 			_, err = s.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
 			require.NoError(t, err)
@@ -101,9 +100,6 @@ func TestCompletedRestoreAllowsOrdinaryPolicyTransition(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, ModelStatusReady, entry.Status)
 			require.Empty(t, entry.HfArtifactKey)
-			node, err = s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-			require.NoError(t, err)
-			require.Empty(t, node.Labels[testRequestLabel(task)], "ordinary readiness must not acknowledge restoration")
 			require.Equal(t, "request-1", task.BaseModel.Annotations[testRestoreAnnotation])
 			_, found, err := s.sharedHfArtifactHandler().repository.GetParentForChild(ctx, input.ChildModelKey)
 			require.NoError(t, err)
@@ -174,11 +170,6 @@ func TestCompletedRestoreAllowsOrdinaryOCIPolicyTransition(t *testing.T) {
 			s.metrics = NewMetrics(prometheus.NewRegistry())
 			s.modelConfigParser = modelparser.NewModelConfigParser(s.logger)
 			s.downloadRetry = 1
-			node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-			require.NoError(t, err)
-			delete(node.Labels, testRequestLabel(task))
-			_, err = s.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
-			require.NoError(t, err)
 			downloads := 0
 			downloader := func(_ context.Context, _ *ociobjectstore.ObjectURI, path string, _ *GopherTask) error {
 				downloads++
@@ -204,9 +195,6 @@ func TestCompletedRestoreAllowsOrdinaryOCIPolicyTransition(t *testing.T) {
 			_, found, err := s.sharedHfArtifactHandler().repository.GetParentForChild(ctx, input.ChildModelKey)
 			require.NoError(t, err)
 			require.False(t, found)
-			node, err = s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-			require.NoError(t, err)
-			require.Empty(t, node.Labels[testRequestLabel(task)])
 			require.Equal(t, "request-1", task.BaseModel.Annotations[testRestoreAnnotation])
 		})
 	}
