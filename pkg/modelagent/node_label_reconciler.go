@@ -26,7 +26,6 @@ type NodeLabelOp struct {
 	ClusterBaseModel *v1beta1.ClusterBaseModel
 	// Recheck live intent on every label retry, including readiness withdrawal.
 	validateReady      func() error
-	artifactRequestID  string
 	requireNodeCAS     bool // Require a live Node and resourceVersion-conditional label updates.
 	deleteReadyAllowed func() (bool, error)
 }
@@ -113,9 +112,11 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 			return err
 		}
 	}
-	requestKey := constants.GetModelArtifactRequestLabel(getModelResourceUID(op.BaseModel, op.ClusterBaseModel))
-	// Delete may remove the old UID's request label, but must preserve a
-	// same-name replacement's Ready label.
+	// Delete must preserve a same-name replacement's Ready label.
+	currentValue, labelExists := node.Labels[labelKey]
+	if op.ModelStateOnNode == Deleted && !labelExists {
+		return nil
+	}
 	removeReady := true
 	if op.ModelStateOnNode == Deleted && op.deleteReadyAllowed != nil {
 		removeReady, err = op.deleteReadyAllowed()
@@ -124,20 +125,17 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 		}
 	}
 
-	// Check current labels - make idempotent based on operation type
-	currentValue, labelExists := node.Labels[labelKey]
-
 	// Handle operation based on desired state and current state
 	switch op.ModelStateOnNode {
 	case Deleted:
-		// For delete operations, if the label doesn't exist, the operation is already complete
-		if (!labelExists || !removeReady) && node.Labels[requestKey] == "" {
-			n.logger.Infof("Label %s already removed from node %s for %s - operation is idempotent", labelKey, n.nodeName, modelInfo)
+		// deleteReadyAllowed preserves a same-name replacement's Ready label.
+		if !removeReady {
+			n.logger.Infof("Label %s on node %s preserved for %s - delete skipped", labelKey, n.nodeName, modelInfo)
 			return nil
 		}
 	case Ready, Updating, Failed:
 		// For add/update operations, if the label already has the desired value, skip
-		if labelExists && currentValue == string(op.ModelStateOnNode) && (op.artifactRequestID == "" || node.Labels[requestKey] == op.artifactRequestID) {
+		if labelExists && currentValue == string(op.ModelStateOnNode) {
 			n.logger.Infof("Label %s already set to %s on node %s for %s - operation is idempotent",
 				labelKey, string(op.ModelStateOnNode), n.nodeName, modelInfo)
 			return nil
@@ -161,14 +159,8 @@ func (n *NodeLabelReconciler) applyNodeLabelOperation(op *NodeLabelOp) error {
 			if removeReady && labelExists {
 				payload = append(payload, patchStringValue{Op: "remove", Path: "/metadata/labels/" + strings.ReplaceAll(labelKey, "/", "~1")})
 			}
-			if node.Labels[requestKey] != "" {
-				payload = append(payload, patchStringValue{Op: "remove", Path: "/metadata/labels/" + strings.ReplaceAll(requestKey, "/", "~1")})
-			}
 		} else {
 			payload = append(payload, patchStringValue{Op: "add", Path: "/metadata/labels/" + strings.ReplaceAll(labelKey, "/", "~1"), Value: string(op.ModelStateOnNode)})
-			if op.artifactRequestID != "" {
-				payload = append(payload, patchStringValue{Op: "add", Path: "/metadata/labels/" + strings.ReplaceAll(requestKey, "/", "~1"), Value: op.artifactRequestID})
-			}
 		}
 		payloadBytes, err = json.Marshal(payload)
 		if err != nil {

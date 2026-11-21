@@ -13,7 +13,6 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/util/retry"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -97,9 +96,6 @@ func (s *Gopher) validateArtifactDownloadWithUIDFence(ctx context.Context, task 
 	}
 	if request == "" {
 		return nil
-	}
-	if len(validation.IsValidLabelValue(request)) != 0 {
-		return fmt.Errorf("artifact restoration request must be a valid Kubernetes label value")
 	}
 	if getModelUID(task) == "" || requireUIDFence && s.configMapReconciler.isModelMutationBlocked(getModelID(task.BaseModel, task.ClusterBaseModel), types.UID(getModelUID(task))) {
 		return fmt.Errorf("artifact restoration model UID is absent or superseded")
