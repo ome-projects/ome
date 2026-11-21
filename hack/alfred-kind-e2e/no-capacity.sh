@@ -211,7 +211,7 @@ while (( SECONDS < observation_deadline )); do
   [[ "${counts}" == $'0\n0' ]] || { echo 'migration request/status observed' >&2; exit 1; }
   record="$("${kube[@]}" -n "${alfred_namespace}" get configmap alfred-recommendations -o json |
     jq -r --arg key "node.${source_node}" '.data[$key] // empty')"
-  if [[ -z "${record}" ]] || ! jq -e '.maintenance.requested and .omeGpuOccupantsPresent and .maintenanceDrainedAt == null and .drainedAt == null' <<<"${record}" >/dev/null; then
+  if [[ -z "${record}" ]] || ! jq -e '.maintenance.requested and .omeAcceleratorOccupantsPresent and .maintenanceDrainedAt == null and .drainedAt == null' <<<"${record}" >/dev/null; then
     sleep 1; continue
   fi
   worker_file="${artifact_dir}/worker-${sample_index}.json"
