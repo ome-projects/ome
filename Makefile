@@ -131,6 +131,12 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 
 	@echo "\n🔑 Step 2: Generating RBAC manifests..."
 	@$(CONTROLLER_GEN) rbac:roleName=ome-manager-role paths=./pkg/controller/... output:rbac:artifacts:config=config/rbac
+	@# controller-gen merges every marker in its scan paths into one role, so
+	@# grants only a feature-gated controller needs live in pkg/rbac/* and
+	@# generate their own roles; the chart renders each only when the feature
+	@# is enabled (step 6), keeping the base ome-manager-role minimal.
+	@$(CONTROLLER_GEN) rbac:roleName=ome-manager-multicluster-endpoint paths=./pkg/rbac/multiclusterendpoint/... output:rbac:artifacts:config=config/rbac/multiclusterendpoint
+	@$(CONTROLLER_GEN) rbac:roleName=ome-manager-tpu-slice paths=./pkg/rbac/tpuslice/... output:rbac:artifacts:config=config/rbac/tpuslice
 	@echo "✅ RBAC manifests generated"
 
 	@echo "\n📝 Step 3: Generating object boilerplate..."
@@ -196,6 +202,20 @@ manifests: controller-gen yq ## 📄 Generate WebhookConfiguration, ClusterRole 
 	@$(GO_CMD) run ./cmd/crd-gen helmchart --out charts/ome-crd/templates --partials _schemas.tpl --min-bytes 2048 config/crd/full/ome.io_*.yaml
 	@$(GO_CMD) run ./cmd/crd-gen shippedschema --out pkg/controller/v1beta1/irstatus/crdskew/zz_generated.shipped_schema.json config/crd/full/ome.io_*.yaml
 	@cp config/rbac/role.yaml charts/ome-resources/templates/ome-controller/rbac/role.yaml
+	@# The feature-gated manager roles are rebuilt from their generated
+	@# ClusterRole on every run, re-wrapped in the Helm gate that enables the
+	@# feature. Their bindings (multicluster_endpoint_binding.yaml,
+	@# tpu_slice_binding.yaml) are static templates next to them.
+	@{ \
+		echo '{{- if and .Values.ome.multicluster.enabled (eq .Values.ome.multicluster.role "control-plane") }}'; \
+		cat config/rbac/multiclusterendpoint/role.yaml; \
+		echo '{{- end }}'; \
+	} > charts/ome-resources/templates/ome-controller/rbac/multicluster_endpoint_role.yaml
+	@{ \
+		echo '{{- if .Values.ome.controller.tpuSliceProvisioning }}'; \
+		cat config/rbac/tpuslice/role.yaml; \
+		echo '{{- end }}'; \
+	} > charts/ome-resources/templates/ome-controller/rbac/tpu_slice_role.yaml
 	@# The policy CRD templates are Helm-gated (each feature installs
 	@# CRD + controller + webhook together); the generator writes plain
 	@# templates, so re-wrap after every run. The ome-crd render test fails

@@ -928,6 +928,102 @@ for role in control-plane workload; do
   fi
 done
 
+# Feature-gated manager RBAC. The placement endpoint publisher's EndpointSlice
+# and BackendTLSPolicy writes and TPU slice provisioning's Slice create/delete
+# must not sit in the base ome-manager-role a single-cluster deployment holds:
+# those writes steer service routing and backend TLS for any workload on the
+# cluster. Each grant renders as its own ClusterRole + binding only when the
+# feature that needs it is enabled.
+gated_base_role="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --show-only templates/ome-controller/rbac/role.yaml)"
+
+# role_rule <apiGroup> <resource>: prints the ClusterRole rule naming both,
+# empty when no rule does.
+role_rule() {
+  awk -v group="$1" -v resource="$2" '
+    /^- apiGroups:/ { if (g && r && !found) { printf "%s", rule; found=1 }; rule=""; g=r=0; section="apiGroups"; next }
+    /^  resources:/ { section="resources"; next }
+    /^  verbs:/ { section="verbs"; next }
+    /^  - / {
+      item = substr($0, 5)
+      if (section == "apiGroups" && item == group) g = 1
+      if (section == "resources" && item == resource) r = 1
+    }
+    { rule = rule $0 "\n" }
+    END { if (g && r && !found) printf "%s", rule }
+  '
+}
+
+endpointslices_rule="$(role_rule discovery.k8s.io endpointslices <<<"${gated_base_role}")"
+[[ -n "${endpointslices_rule}" ]] || fail "base ome-manager-role lost read-only EndpointSlice access"
+if grep -Eq '^  - (create|update|patch|delete|deletecollection|\*)$' <<<"${endpointslices_rule}"; then
+  fail "base ome-manager-role grants EndpointSlice writes without multi-cluster"
+fi
+if grep -Fq 'backendtlspolicies' <<<"${gated_base_role}"; then
+  fail "base ome-manager-role grants BackendTLSPolicy access without multi-cluster"
+fi
+if grep -Fq 'accelerator.gke.io' <<<"${gated_base_role}"; then
+  fail "base ome-manager-role grants Slice access without TPU slice provisioning"
+fi
+for gated_role in ome-manager-multicluster-endpoint ome-manager-tpu-slice; do
+  if grep -Fq "${gated_role}" <<<"${rendered}"; then
+    fail "${gated_role} rendered with its feature disabled"
+  fi
+done
+
+mc_endpoint_rbac="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.enabled=true \
+  --set-string ome.multicluster.role=control-plane \
+  --show-only templates/ome-controller/rbac/multicluster_endpoint_role.yaml \
+  --show-only templates/ome-controller/rbac/multicluster_endpoint_binding.yaml)"
+grep -Fq 'kind: ClusterRole' <<<"${mc_endpoint_rbac}" ||
+  fail "multi-cluster control plane did not render the endpoint ClusterRole"
+grep -Fq 'kind: ClusterRoleBinding' <<<"${mc_endpoint_rbac}" ||
+  fail "multi-cluster control plane did not render the endpoint ClusterRoleBinding"
+grep -Fqx '  - endpointslices' <<<"${mc_endpoint_rbac}" ||
+  fail "endpoint ClusterRole lacks EndpointSlice access"
+grep -Fqx '  - backendtlspolicies' <<<"${mc_endpoint_rbac}" ||
+  fail "endpoint ClusterRole lacks BackendTLSPolicy access"
+for verb in create delete update patch; do
+  grep -Fqx "  - ${verb}" <<<"${mc_endpoint_rbac}" ||
+    fail "endpoint ClusterRole lacks ${verb}"
+done
+grep -Fqx '  namespace: ome' <<<"${mc_endpoint_rbac}" ||
+  fail "endpoint ClusterRoleBinding does not bind the controller ServiceAccount in the release namespace"
+
+mc_workload_rbac="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set ome.multicluster.enabled=true \
+  --set-string ome.multicluster.role=workload)"
+if grep -Fq 'ome-manager-multicluster-endpoint' <<<"${mc_workload_rbac}"; then
+  fail "workload cluster acquired the endpoint publisher writes"
+fi
+
+tpu_rbac="$("${helm_bin}" template ome-resources "${chart_dir}" \
+  --namespace ome \
+  --set-json 'ome.controller.tpuSliceProvisioning={"chipResource":"google.com/tpu"}' \
+  --show-only templates/ome-controller/rbac/tpu_slice_role.yaml \
+  --show-only templates/ome-controller/rbac/tpu_slice_binding.yaml)"
+grep -Fq 'kind: ClusterRole' <<<"${tpu_rbac}" ||
+  fail "TPU slice provisioning did not render the slice ClusterRole"
+grep -Fq 'kind: ClusterRoleBinding' <<<"${tpu_rbac}" ||
+  fail "TPU slice provisioning did not render the slice ClusterRoleBinding"
+grep -Fqx '  - accelerator.gke.io' <<<"${tpu_rbac}" ||
+  fail "slice ClusterRole lacks the accelerator.gke.io group"
+grep -Fqx '  - slices' <<<"${tpu_rbac}" ||
+  fail "slice ClusterRole lacks Slice access"
+for verb in create delete get list watch; do
+  grep -Fqx "  - ${verb}" <<<"${tpu_rbac}" ||
+    fail "slice ClusterRole lacks ${verb}"
+done
+if grep -Eq '^  - (update|patch)$' <<<"${tpu_rbac}"; then
+  fail "slice ClusterRole grants update or patch, which provisioning does not use"
+fi
+grep -Fqx '  namespace: ome' <<<"${tpu_rbac}" ||
+  fail "slice ClusterRoleBinding does not bind the controller ServiceAccount in the release namespace"
+
 # The manager reads both from multicluster.placement, so a value that is not
 # rendered there leaves capacity placement pending however the chart is set.
 placement_config="$("${helm_bin}" template ome-resources "${chart_dir}" \

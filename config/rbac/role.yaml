@@ -47,16 +47,6 @@ rules:
   - patch
   - update
 - apiGroups:
-  - accelerator.gke.io
-  resources:
-  - slices
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
   - admissionregistration.k8s.io
   resources:
   - mutatingwebhookconfigurations
@@ -134,12 +124,8 @@ rules:
   resources:
   - endpointslices
   verbs:
-  - create
-  - delete
   - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - gateway.envoyproxy.io
@@ -156,7 +142,6 @@ rules:
 - apiGroups:
   - gateway.networking.k8s.io
   resources:
-  - backendtlspolicies
   - httproutes
   verbs:
   - create

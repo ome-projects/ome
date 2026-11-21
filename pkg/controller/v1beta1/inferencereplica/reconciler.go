@@ -79,7 +79,11 @@ import (
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=controllerrevisions,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=accelerator.gke.io,resources=slices,verbs=get;list;watch;create;delete
+// Slice access is deliberately NOT here: the reconciler touches TPU slices
+// only when TPU slice provisioning is configured (SetupWithManager gates even
+// the watch on it), so the grant generates as the separate
+// ome-manager-tpu-slice ClusterRole from pkg/rbac/tpuslice, rendered only
+// when the chart configures tpuSliceProvisioning.
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
 // +kubebuilder:rbac:groups=ome.io,resources=basemodels;clusterbasemodels;servingruntimes;clusterservingruntimes;finetunedweights,verbs=get;list;watch
 

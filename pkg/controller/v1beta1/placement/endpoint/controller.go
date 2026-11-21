@@ -41,9 +41,13 @@ type Reconciler struct {
 // +kubebuilder:rbac:groups=ome.io,resources=inferenceservices/finalizers,verbs=update
 // +kubebuilder:rbac:groups=ome.io,resources=trafficmaps,verbs=get;list;watch
 // +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=httproutes,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=gateway.networking.k8s.io,resources=backendtlspolicies,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=discovery.k8s.io,resources=endpointslices,verbs=get;list;watch;create;update;patch;delete
+// EndpointSlice and BackendTLSPolicy writes are deliberately NOT here:
+// controller-gen merges every marker under pkg/controller into the base
+// ome-manager-role, which a single-cluster deployment also holds. These
+// grants generate as the separate ome-manager-multicluster-endpoint
+// ClusterRole from pkg/rbac/multiclusterendpoint, rendered only for a
+// multi-cluster control plane.
 
 func (r *Reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	isvc := &v1beta1.InferenceService{}
