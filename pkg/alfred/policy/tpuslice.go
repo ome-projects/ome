@@ -100,6 +100,13 @@ func holdsAcceleratorPod(node *snapshot.Node) bool {
 	return false
 }
 
+// TPUReplacementHostFilter returns the test PlanTPUSliceReplacement applies to
+// each host of a candidate partition, or false when a pod's required node
+// affinity cannot be parsed.
+func TPUReplacementHostFilter(pods []snapshot.PodInfo, tc *config.TPUSlicePartitions) (func(*snapshot.Node) bool, bool) {
+	return replacementHostFilter(pods, tc)
+}
+
 // replacementHostFilter returns a test of whether a node can run every member
 // of the replacement. The replacement keeps the source pods' node selectors and
 // required node affinity, except the slice and topology selectors the slice

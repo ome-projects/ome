@@ -35,6 +35,14 @@ const (
 	// node it is actively deleting.
 	caToBeDeletedTaint = "ToBeDeletedByClusterAutoscaler"
 
+	// DefragmentationFenceAnnotation marks a node that the TPU
+	// defragmentation policy cordoned. Its value names the drain; Alfred
+	// removes the cordon only from nodes that carry it.
+	DefragmentationFenceAnnotation = "alfred.ome.io/cordoned-for-defragmentation"
+	// HoldCordonAnnotation asks Alfred to leave a fenced node cordoned when
+	// its drain ends.
+	HoldCordonAnnotation = "alfred.ome.io/hold-cordon"
+
 	// defaultWorkloadPriority is the alfred.ome.io/priority value assumed
 	// when the annotation is absent or unparsable.
 	defaultWorkloadPriority = 0.5
@@ -177,6 +185,9 @@ func buildNode(node *corev1.Node, opts *Options) *Node {
 		TotalGPUs:         total,
 		Cordoned:          node.Spec.Unschedulable,
 		ScaleDownDisabled: node.Annotations[caScaleDownDisabledAnnotation] == "true",
+
+		DefragmentationFence: node.Annotations[DefragmentationFenceAnnotation],
+		HoldCordon:           node.Annotations[HoldCordonAnnotation] == "true",
 	}
 	for _, taint := range node.Spec.Taints {
 		if taint.Key == caToBeDeletedTaint {

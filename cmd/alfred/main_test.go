@@ -226,8 +226,12 @@ func TestGetOptionsCustom(t *testing.T) {
 		"--config-key=alfred.yaml",
 		"--simulation-workers=/etc/alfred/workers.json",
 		"--simulation-timeout=7s",
+		"--enable-defragmentation-fence=true",
 	})
 	opts := GetOptions()
+	if !opts.defragmentationFence {
+		t.Fatal("--enable-defragmentation-fence not parsed")
+	}
 	if opts.simulationWorkers != "/etc/alfred/workers.json" || opts.simulationTimeout != 7*time.Second {
 		t.Fatalf("simulation options not parsed: %+v", opts)
 	}

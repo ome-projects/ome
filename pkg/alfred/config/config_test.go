@@ -188,6 +188,11 @@ func TestLoadRejectsInvalidConfigs(t *testing.T) {
 		{"negative cooldown", "schemaVersion: 1\nrecentPlacementCooldownMinutes: -5", "must be positive"},
 		{"negative cap", "schemaVersion: 1\nmaxInFlightMigrations: -1", "must be positive"},
 		{"negative tau", "schemaVersion: 1\npolicies:\n  defragmentation:\n    scoring:\n      pendingUrgencyTauMinutes: -30", "must be positive"},
+		{"bad TPU target shape", "schemaVersion: 1\npolicies:\n  tpuDefragmentation:\n    targetShapes: [4x4]", "invalid shape"},
+		{"duplicate TPU target shape", "schemaVersion: 1\npolicies:\n  tpuDefragmentation:\n    targetShapes: [2x2x4, 2x2x4]", "duplicate shape"},
+		{"negative TPU drain size", "schemaVersion: 1\npolicies:\n  tpuDefragmentation:\n    maxDrainPartitions: -1", "maxDrainPartitions must be positive"},
+		{"TPU defragmentation executes without windows", "schemaVersion: 1\nmode: execute\npolicies:\n  tpuDefragmentation:\n    enabled: true", "requires maintenanceWindows"},
+		{"bad TPU pod label", "schemaVersion: 1\ntpuSlicePartitions:\n  podLabel: 'bad label'", "podLabel is invalid"},
 		{"invalid scheduling profile", "schemaVersion: 1\nscheduling:\n  profiles:\n    custom-gang:\n      backend: simulator\n      schedulerVersion: ' v1'\n      configurationID: config", "schedulerVersion"},
 	}
 	for _, tc := range cases {
@@ -273,5 +278,34 @@ func TestStoreChangedSignalsSuccessfulUpdates(t *testing.T) {
 	}
 	if store.Get().DecisionLoopInterval.Duration != time.Minute {
 		t.Fatal("the following change must be visible through Get")
+	}
+}
+
+func TestTPUDefragmentationDefaultsAndWindows(t *testing.T) {
+	cfg := Default()
+	td := cfg.Policies.TPUDefragmentation
+	if *td.Enabled || len(td.TargetShapes) != 2 || td.TargetShapes[0] != "4x4x4" || td.MinGap != 2 ||
+		td.MaxDrainPartitions != 4 || td.MaxBusyHostsPerPartition != 8 || td.MaxMovesPerWorkloadPerDrain != 4 ||
+		td.DrainDeadline() != 4*time.Hour || td.FenceSettle() != time.Minute || td.FenceFailureBackoff() != 24*time.Hour {
+		t.Fatalf("tpuDefragmentation defaults = %+v", td)
+	}
+	if cfg.TPUSlicePartitions.PodLabel != "cloud.google.com/gce-topology-block" {
+		t.Fatalf("podLabel default = %q", cfg.TPUSlicePartitions.PodLabel)
+	}
+	if _, err := Load([]byte("schemaVersion: 1\nmode: execute\npolicies:\n  tpuDefragmentation:\n    enabled: true\nmaintenanceWindows:\n  - days: [Sat]\n    start: \"02:00\"\n    end: \"06:00\"")); err != nil {
+		t.Fatalf("execute with a window rejected: %v", err)
+	}
+	if chips, ok := ShapeChips("4x4x8"); !ok || chips != 128 {
+		t.Fatalf("ShapeChips(4x4x8) = %d, %v", chips, ok)
+	}
+	cfg.MaintenanceWindows = []MaintenanceWindow{{Days: []string{"Sat"}, Start: "02:00", End: "06:00"}}
+	for at, want := range map[time.Time]bool{
+		time.Date(2026, 11, 21, 3, 0, 0, 0, time.UTC): true,  // Saturday 03:00
+		time.Date(2026, 11, 21, 6, 0, 0, 0, time.UTC): false, // end is exclusive
+		time.Date(2026, 11, 22, 3, 0, 0, 0, time.UTC): false, // Sunday
+	} {
+		if got := cfg.MaintenanceWindowOpen(at); got != want {
+			t.Errorf("MaintenanceWindowOpen(%v) = %v, want %v", at, got, want)
+		}
 	}
 }

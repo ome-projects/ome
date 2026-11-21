@@ -135,6 +135,12 @@ type Node struct {
 	// Preemptible is set when the node matches a configured
 	// spot/preemptible label.
 	Preemptible bool
+	// DefragmentationFence is the raw DefragmentationFenceAnnotation value:
+	// the TPU defragmentation drain that cordoned this node. Empty when none.
+	DefragmentationFence string
+	// HoldCordon is set when an operator asks that a fenced node stay
+	// cordoned after its drain ends (HoldCordonAnnotation).
+	HoldCordon bool
 
 	// OMEPods retain OME-managed accelerator (GPU or TPU) occupancy,
 	// including unresolved owner evidence. An ambiguous owner projects

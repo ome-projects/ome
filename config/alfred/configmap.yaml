@@ -65,6 +65,18 @@ data:
           #   taint: {key: maintenance.example.com/patching, value: "true", effect: NoSchedule}
           # - name: patching-condition
           #   condition: {type: Patching, status: "True"}
+      # TPU partition defragmentation (OEP-0008.1). Execute mode also needs
+      # maintenanceWindows and the defragmentation-fence RBAC and flag.
+      tpuDefragmentation:
+        enabled: false
+        targetShapes: ["4x4x4", "2x2x4"]
+        minGap: 2
+        maxDrainPartitions: 4
+        maxBusyHostsPerPartition: 8
+        maxMovesPerWorkloadPerDrain: 4
+        drainDeadlineMinutes: 240
+        fenceSettleSeconds: 60
+        fenceFailureBackoffMinutes: 1440
 
     # Per-workload defaults; annotations on an InferenceService win over these.
     defaultMovable: true

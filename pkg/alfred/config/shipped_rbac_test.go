@@ -132,3 +132,22 @@ func TestMaintenanceCordonRBACMatchesAndStaysNarrow(t *testing.T) {
 		}
 	}
 }
+
+// TestDefragmentationFenceRBACMatchesAndStaysNarrow keeps the fence opt-in to
+// node get and patch, identical in both install paths.
+func TestDefragmentationFenceRBACMatchesAndStaysNarrow(t *testing.T) {
+	chart := grants(t, "../../../charts/ome-alfred/templates/defragmentation-fence-rbac.yaml", "ClusterRole")
+	kustomize := grants(t, "../../../config/alfred/defragmentation-fence/rbac.yaml", "ClusterRole")
+	want := map[string]bool{"/nodes:get": true, "/nodes:patch": true}
+	for name, got := range map[string]map[string]bool{"chart": chart, "kustomize": kustomize} {
+		if len(got) != len(want) {
+			t.Errorf("%s fence grants = %v, want exactly %v", name, got, want)
+			continue
+		}
+		for key := range want {
+			if !got[key] {
+				t.Errorf("%s fence grants = %v, want exactly %v", name, got, want)
+			}
+		}
+	}
+}

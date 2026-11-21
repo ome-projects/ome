@@ -49,6 +49,9 @@ type DecisionLoop struct {
 	// Cordoner is optional; it fences nodes under cordon maintenance rules
 	// before moves are decided.
 	Cordoner *MaintenanceCordoner
+	// Fencer is optional; it maintains the TPU defragmentation fence before
+	// moves are decided.
+	Fencer   *DefragmentationFencer
 	Arbiter  *Arbiter
 	Reporter *Reporter
 	Metrics  *metrics.Metrics
@@ -203,6 +206,7 @@ func (l *DecisionLoop) RunOnce(ctx context.Context) {
 
 	l.Reporter.ReportOMENativeState(snap.OMENativeExecutor.Available)
 	l.Cordoner.Reconcile(ctx, snap, cfg)
+	l.Fencer.Reconcile(ctx, snap, cfg)
 
 	var candidates []policy.Candidate
 	for _, p := range l.Policies {

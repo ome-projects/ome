@@ -10,6 +10,7 @@ import (
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/policy"
+	"sigs.k8s.io/ome/pkg/alfred/policy/tpudefrag"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
 	"sigs.k8s.io/ome/pkg/constants"
@@ -232,6 +233,8 @@ func entryCandidate(e dispatchEntry) policy.Candidate {
 			c.Policy = "nodehealth"
 		case policy.ReasonFragmentation:
 			c.Policy = "defragmentation"
+		case policy.ReasonTPUFragmentation:
+			c.Policy = tpudefrag.PolicyName
 		}
 	}
 	return c

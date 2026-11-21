@@ -38,6 +38,7 @@ import (
 	"sigs.k8s.io/ome/pkg/alfred/policy"
 	"sigs.k8s.io/ome/pkg/alfred/policy/defrag"
 	"sigs.k8s.io/ome/pkg/alfred/policy/nodehealth"
+	"sigs.k8s.io/ome/pkg/alfred/policy/tpudefrag"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling"
 	"sigs.k8s.io/ome/pkg/alfred/scheduling/process"
 	"sigs.k8s.io/ome/pkg/alfred/snapshot"
@@ -65,7 +66,7 @@ func init() {
 }
 
 func decisionPolicies() []policy.Policy {
-	return []policy.Policy{&nodehealth.Policy{}, &defrag.Policy{}}
+	return []policy.Policy{&nodehealth.Policy{}, &defrag.Policy{}, &tpudefrag.Policy{}}
 }
 
 // Options holds the command-line configuration.
@@ -83,6 +84,7 @@ type Options struct {
 	migrationAckTimeout     time.Duration
 	migrationFailureBackoff time.Duration
 	maintenanceCordon       bool
+	defragmentationFence    bool
 	zapOpts                 zap.Options
 }
 
@@ -119,6 +121,7 @@ func GetOptions() Options {
 	flag.StringVar(&opts.migrationAPIVersion, "migration-api-version", "", "Operator-confirmed migration API compatibility (v1); empty disables migration dispatch.")
 	flag.StringVar(&opts.migrationServiceAccount, "migration-service-account", "", "Alfred service account name enforced by the migration admission guard; required with migration-api-version.")
 	flag.BoolVar(&opts.maintenanceCordon, "enable-maintenance-cordon", false, "Let execute mode cordon nodes that a maintenance rule with cordon: true puts under maintenance. Requires node patch permission; Alfred never uncordons.")
+	flag.BoolVar(&opts.defragmentationFence, "enable-defragmentation-fence", false, "Let execute mode cordon the TPU partitions the TPU defragmentation policy drains, and uncordon them when the drain ends. Requires node patch permission; Alfred uncordons only nodes it fenced.")
 	flag.DurationVar(&opts.migrationAckTimeout, "migration-ack-timeout", opts.migrationAckTimeout, "Timeout before marking an unacknowledged request stalled (positive, at most 1h).")
 	flag.DurationVar(&opts.migrationFailureBackoff, "migration-failure-backoff", opts.migrationFailureBackoff, "Backoff after migration failure (positive, at most 1h).")
 	opts.zapOpts.BindFlags(flag.CommandLine)
@@ -200,7 +203,10 @@ func main() {
 		Store:   store,
 		Metrics: alfredMetrics,
 		Log:     ctrl.Log.WithName("alfred-observer"),
-		Scorer:  defrag.PublishScores,
+		Scorer: func(snap *snapshot.ClusterSnapshot, cfg *config.Config, m *metrics.Metrics) {
+			defrag.PublishScores(snap, cfg, m)
+			tpudefrag.PublishPartitions(snap, cfg, m)
+		},
 	}
 	if err := mgr.Add(observationLoop); err != nil {
 		setupLog.Error(err, "unable to add observation loop")
@@ -250,6 +256,15 @@ func main() {
 			Recorder: mgr.GetEventRecorderFor("alfred"),
 			Metrics:  alfredMetrics,
 			Log:      ctrl.Log.WithName("alfred-cordon"),
+		}
+	}
+	if opts.defragmentationFence {
+		decisionLoop.Fencer = &engine.DefragmentationFencer{
+			Client:   mgr.GetClient(),
+			Reader:   mgr.GetAPIReader(),
+			Recorder: mgr.GetEventRecorderFor("alfred"),
+			Metrics:  alfredMetrics,
+			Log:      ctrl.Log.WithName("alfred-defrag-fence"),
 		}
 	}
 	if err := configureMigration(opts, mgr.GetAPIReader(), mgr.GetClient(), observationLoop, decisionLoop); err != nil {
