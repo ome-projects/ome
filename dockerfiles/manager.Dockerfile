@@ -5,7 +5,7 @@
 ARG BASE_IMAGE=oraclelinux:10-slim
 
 # Build the manager binary
-FROM golang:1.26 AS builder
+FROM golang:1.27 AS builder
 
 # Install Rust and Cargo for building the XET library
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
