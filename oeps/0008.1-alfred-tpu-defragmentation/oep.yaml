@@ -1,0 +1,27 @@
+title: Alfred TPU partition defragmentation
+oep-number: "0008.1"
+authors:
+  - "@Huang-Wei"
+status: provisional
+creation-date: 2026-11-20
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+see-also:
+  - "/oeps/0008-alfred-gpu-cluster-caretaker"
+
+# The target maturity stage in the current dev cycle for this OEP.
+stage: alpha
+
+# Off by default; enabled per cluster with policies.tpuDefragmentation.enabled.
+feature-gates: []
+disable-supported: true
+
+# Metrics to monitor feature adoption and performance
+metrics:
+  - alfred_tpu_free_partitions
+  - alfred_tpu_packing_bound
+  - alfred_tpu_drains_total
+  - alfred_tpu_fenced_hosts
