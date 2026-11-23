@@ -57,4 +57,13 @@ released="$(line_of 'no_slice_labels')"
 stop_provider="$(line_of 'kill "${provider_pid}"')"
 [[ -n "${restore}" && -n "${delete_ns}" && -n "${released}" && -n "${stop_provider}" ]] || fail "cleanup steps missing"
 ((restore < delete_ns && delete_ns < released && released < stop_provider)) || fail "cleanup steps out of order"
+# drain_counts fails, rather than printing nothing, when the metrics cannot be
+# read or carry no drain count, so two failed reads never compare equal.
+metrics() { printf '%s\n' 'alfred_tpu_drains_total{outcome="completed"} 1' 'alfred_tpu_fenced_hosts 0' 'alfred_tpu_drains_total{outcome="aborted"} 0'; }
+[[ "$(drain_counts)" == $'alfred_tpu_drains_total{outcome="aborted"} 0\nalfred_tpu_drains_total{outcome="completed"} 1' ]] ||
+  fail "drain_counts must print every drain series, sorted"
+metrics() { echo 'alfred_tpu_fenced_hosts 0'; }
+! drain_counts >/dev/null || fail "drain_counts must fail when no drain series is present"
+metrics() { return 1; }
+! drain_counts >/dev/null || fail "drain_counts must fail when the metrics cannot be read"
 echo "tpu-defrag test: ok"

@@ -181,7 +181,20 @@ func (p *provider) place(ctx context.Context, u *unstructured.Unstructured, node
 		byName[n.Name] = n
 		hosts = append(hosts, hostOf(n))
 	}
-	id, members, ok := reserved(hosts, s.Name, s.Topology)
+	id, members, usable, ok := reserved(hosts, s.Name, s.Topology)
+	if ok && !usable {
+		// A host of the interrupted placement was cordoned or taken since.
+		// Release the hosts already labeled; the next pass places afresh.
+		for _, name := range members {
+			if n := byName[name]; n.Labels[sliceLabel] == s.Name {
+				if err := p.label(ctx, n, nil); err != nil {
+					return err
+				}
+			}
+		}
+		fmt.Printf("%s released the stale reservation of %s on %s\n", time.Now().UTC().Format(time.RFC3339), s.Name, id)
+		return nil
+	}
 	if !ok {
 		id, members, ok = choose(hosts, s.Topology)
 	}

@@ -51,3 +51,26 @@ func TestLayoutCountsHostsByTheirOwnSmallestShape(t *testing.T) {
 		t.Fatalf("free hosts pod-a=%d pod-b=%d, want 4 and 4", stats["pod-a"].freeHosts, stats["pod-b"].freeHosts)
 	}
 }
+
+// TestPartitionPodNeedsEveryHostToAgree: one host of A lost the pod label.
+// A is then pod-less on every build, whatever order the nodes are read in,
+// so its whole free count never flaps between passes.
+func TestPartitionPodNeedsEveryHostToAgree(t *testing.T) {
+	snap := newCluster(t).partition("pod-a", "A").partition("pod-a", "B").build()
+	delete(snap.Nodes["A-2"].Labels, podLabel)
+	for i := 0; i < 50; i++ {
+		l := buildLayout(snap, testConfig())
+		for _, s := range []string{"2x2x4", "2x2x2"} {
+			id := map[string]string{"2x2x4": "A", "2x2x2": "A-23"}[s]
+			if got := l.parts[s][id].pod; got != "" {
+				t.Fatalf("build %d: %s partition %s has pod %q, want none", i, s, id, got)
+			}
+		}
+		if got := l.parts["2x2x2"]["A-01"].pod; got != "pod-a" {
+			t.Fatalf("build %d: A-01 has pod %q, want pod-a", i, got)
+		}
+		if got := l.stats()["pod-a"].wholeFree["2x2x4"]; got != 1 {
+			t.Fatalf("build %d: whole free 2x2x4 in pod-a = %d, want 1 (B only)", i, got)
+		}
+	}
+}

@@ -40,6 +40,8 @@ type host struct {
 type partition struct {
 	shape string
 	id    string
+	// pod is the TPU pod every host of the partition names, empty when a host
+	// names none or the hosts disagree.
 	pod   string
 	hosts []string
 }
@@ -101,6 +103,8 @@ func buildLayout(snap *snapshot.ClusterSnapshot, cfg *config.Config) *layout {
 			if p == nil {
 				p = &partition{shape: s, id: id, pod: h.pod}
 				l.parts[s][id] = p
+			} else if p.pod != h.pod {
+				p.pod = ""
 			}
 			p.hosts = append(p.hosts, name)
 		}

@@ -91,15 +91,20 @@ func TestChooseSkipsUnhealthyAndIncompletePartitions(t *testing.T) {
 }
 
 // TestReservedResumesAnInterruptedPlacement: a placement that labeled host 4
-// for slice s1 and then failed resumes on host 4's partition.
+// for slice s1 and then failed resumes on host 4's partition, unless another
+// of its hosts stopped being free.
 func TestReservedResumesAnInterruptedPlacement(t *testing.T) {
 	hosts := pod()
 	hosts[4].slice, hosts[4].free = "s1", false
-	id, members, ok := reserved(hosts, "s1", "2x2x4")
-	if !ok || id != "q1" || !reflect.DeepEqual(members, []string{"tpu-4", "tpu-5", "tpu-6", "tpu-7"}) {
-		t.Fatalf("reserved() = %q %v %t, want q1 on hosts 4-7", id, members, ok)
+	id, members, usable, ok := reserved(hosts, "s1", "2x2x4")
+	if !ok || !usable || id != "q1" || !reflect.DeepEqual(members, []string{"tpu-4", "tpu-5", "tpu-6", "tpu-7"}) {
+		t.Fatalf("reserved() = %q %v %t %t, want usable q1 on hosts 4-7", id, members, usable, ok)
 	}
-	if id, _, ok := reserved(hosts, "s2", "2x2x4"); ok {
+	if id, _, _, ok := reserved(hosts, "s2", "2x2x4"); ok {
 		t.Fatalf("reserved() = %q for a slice no host carries", id)
+	}
+	hosts[6].free = false
+	if _, _, usable, ok := reserved(hosts, "s1", "2x2x4"); !ok || usable {
+		t.Fatalf("reserved() usable=%t ok=%t, want a stale reservation once host 6 is cordoned", usable, ok)
 	}
 }

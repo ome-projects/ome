@@ -172,9 +172,12 @@ metric_is() {
   metrics | awk -v series="$1" -v want="$2" '$1 == series { found = 1; ok = ($2 + 0 == want + 0) } END { exit !(found && ok) }'
 }
 
-# drain_counts prints every alfred_tpu_drains_total series, sorted.
+# drain_counts prints every alfred_tpu_drains_total series, sorted. It fails
+# when the metrics cannot be read or carry no drain count.
 drain_counts() {
-  metrics | grep '^alfred_tpu_drains_total' | sort || true
+  local out
+  out="$(metrics)" || return 1
+  grep '^alfred_tpu_drains_total' <<<"${out}" | sort
 }
 
 last_cycle() {

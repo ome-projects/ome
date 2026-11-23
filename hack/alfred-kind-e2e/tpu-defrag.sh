@@ -150,12 +150,13 @@ tpu_wait 60 'one whole free 2x2x4 in the metrics' metric_is "alfred_tpu_free_par
 metrics >"${art}/metrics-released.txt"
 
 echo 'Checking that three more decision cycles fence and move nothing'
-drains="$(drain_counts)"
+drains="$(drain_counts)" || { echo 'reading the drain counts failed' >&2; exit 1; }
 cycles_after "$(last_cycle)" 3
 capture settled
 [[ "$(fence_list)" == '[]' ]] || { echo 'a second drain was fenced' >&2; exit 1; }
 # A drain that opened and ended between two checks leaves no fence, only a count.
-[[ "$(drain_counts)" == "${drains}" ]] || { echo 'a drain opened and ended during the quiet cycles' >&2; exit 1; }
+after="$(drain_counts)" || { echo 'reading the drain counts failed' >&2; exit 1; }
+[[ "${after}" == "${drains}" ]] || { echo 'a drain opened and ended during the quiet cycles' >&2; exit 1; }
 read -r b_pod2 b_node2 b_uid2 <<<"$(ready_pod tpu-b)"
 [[ "${b_uid2}" == "${b_uid}" && "${b_node2}" == "${b_node}" ]] || { echo 'tpu-b was disturbed' >&2; exit 1; }
 # A watch that ended early would undercount the requests.

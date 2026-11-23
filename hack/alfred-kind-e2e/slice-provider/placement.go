@@ -123,7 +123,9 @@ func choose(hosts []host, shape string) (id string, members []string, ok bool) {
 // slice already labeled, and its hosts. Node labels outlive the provider, so
 // a retry, or a restarted provider, resumes the same placement instead of
 // reserving a second partition. ok is false when no host carries the label.
-func reserved(hosts []host, slice, shape string) (id string, members []string, ok bool) {
+// usable is false when a host that does not carry it yet is no longer free
+// and healthy; the caller then releases the reservation.
+func reserved(hosts []host, slice, shape string) (id string, members []string, usable, ok bool) {
 	for _, h := range hosts {
 		if h.slice == slice && h.ids[shape] != "" {
 			id = h.ids[shape]
@@ -131,13 +133,18 @@ func reserved(hosts []host, slice, shape string) (id string, members []string, o
 		}
 	}
 	if id == "" {
-		return "", nil, false
+		return "", nil, false, false
 	}
+	usable = true
 	for _, h := range hosts {
-		if h.ids[shape] == id {
-			members = append(members, h.name)
+		if h.ids[shape] != id {
+			continue
+		}
+		members = append(members, h.name)
+		if h.slice != slice && (!h.free || !h.healthy[shape]) {
+			usable = false
 		}
 	}
 	sort.Strings(members)
-	return id, members, true
+	return id, members, usable, true
 }
