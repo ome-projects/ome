@@ -474,6 +474,9 @@ func TestOpenDrainStopsOrWaitsWhenItsHostsChange(t *testing.T) {
 			if d.End != tt.want {
 				t.Fatalf("End = %q, want %q", d.End, tt.want)
 			}
+			if tt.want == OutcomeFenceNotHonored && !reflect.DeepEqual(d.Unhonored, []string{"A-1"}) {
+				t.Fatalf("unhonored = %v, want A-1", d.Unhonored)
+			}
 			if tt.want == "" && d.Settled {
 				t.Fatalf("drain settled with a source partition short of a host: %+v", d)
 			}

@@ -78,6 +78,10 @@ type OpenDrain struct {
 	Empty []string
 	// End is the outcome that ends the drain now; empty while it continues.
 	End string
+	// Unhonored lists, when End is fence_not_honored, the fenced hosts that
+	// show it. They are the only record of that outcome, so the fencer
+	// releases them last.
+	Unhonored []string
 }
 
 // Plan is the policy's view of one snapshot.
@@ -260,7 +264,7 @@ func openDrains(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, n
 				d.Settled = false
 			}
 		}
-		d.End = drainEnd(snap, cfg, l, d, now)
+		d.End, d.Unhonored = drainEnd(snap, cfg, l, d, now)
 		d.Busy, d.Moves = occupants(snap, l, d.Hosts, func(name string) string { return part[name] }, emptied)
 		out = append(out, d)
 	}
@@ -268,26 +272,31 @@ func openDrains(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, n
 	return out
 }
 
-// drainEnd returns the outcome that ends d now, or "". A drain stops when it
-// can no longer move anything: the policy is off, the mode is not execute, or
-// no migration API is configured. Its fence is not honored when a host free
-// at fence time now holds a slice, or when someone uncordoned a fenced host.
-func drainEnd(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, d *OpenDrain, now time.Time) string {
+// drainEnd returns the outcome that ends d now, or "", and for
+// fence_not_honored the hosts that show it. A drain stops when it can no
+// longer move anything: the policy is off, the mode is not execute, or no
+// migration API is configured. Its fence is not honored when a host free at
+// fence time now holds a slice, or when someone uncordoned a fenced host.
+func drainEnd(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, d *OpenDrain, now time.Time) (string, []string) {
 	switch {
 	case !Enabled(cfg) || cfg.Mode != config.ModeExecute || !snap.OMENativeExecutor.Available:
-		return OutcomeAborted
+		return OutcomeAborted, nil
 	case !now.Before(d.Deadline):
-		return OutcomeDeadline
+		return OutcomeDeadline, nil
 	case !cfg.MaintenanceWindowOpen(now):
-		return OutcomeWindowClosed
+		return OutcomeWindowClosed, nil
 	}
+	var unhonored []string
 	for _, name := range d.Fenced {
 		h := l.hosts[name]
 		if (h.fence.FreeAtFence && h.busy) || !h.node.Cordoned {
-			return OutcomeFenceNotHonored
+			unhonored = append(unhonored, name)
 		}
 	}
-	return ""
+	if len(unhonored) > 0 {
+		return OutcomeFenceNotHonored, unhonored
+	}
+	return "", nil
 }
 
 // occupants returns the busy hosts among hosts and one Move per Instance on

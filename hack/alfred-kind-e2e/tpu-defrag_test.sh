@@ -64,6 +64,7 @@ metrics() { printf '%s\n' 'alfred_tpu_drains_total{outcome="completed"} 1' 'alfr
   fail "drain_counts must print every drain series, sorted"
 metrics() { echo 'alfred_tpu_fenced_hosts 0'; }
 ! drain_counts >/dev/null || fail "drain_counts must fail when no drain series is present"
+(set +o pipefail && ! drain_counts >/dev/null) || fail "drain_counts must fail without the caller's pipefail too"
 metrics() { return 1; }
 ! drain_counts >/dev/null || fail "drain_counts must fail when the metrics cannot be read"
 echo "tpu-defrag test: ok"

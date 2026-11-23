@@ -474,6 +474,11 @@ annotation:
   its annotation and leaves the cordon to the operator.
 - **Uncordon** otherwise, and remove the annotation.
 
+When the fence was not honored, the hosts that show it are released last,
+after every other host. They are the only record of that outcome, so a
+partial release leaves them in place, and the next pass ends the drain again
+instead of fencing the released hosts.
+
 *Failure mode this leaves open:* a plain `kubectl cordon` on a host that is
 already fenced changes nothing on the node, so Alfred cannot see it, and
 uncordons the host when the drain ends. Goal 4 takes priority here, because the

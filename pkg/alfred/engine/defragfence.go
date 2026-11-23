@@ -66,7 +66,10 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 	}
 	for _, d := range plan.Open {
 		if d.End != "" {
-			removed, err := f.unfenceAll(ctx, snap, cfg, d.ID, d.Fenced, d.End)
+			if d.End == tpudefrag.OutcomeFenceNotHonored {
+				f.setBackoff(d.Pod, now.Add(cfg.Policies.TPUDefragmentation.FenceFailureBackoff()))
+			}
+			removed, err := f.end(ctx, snap, cfg, d)
 			fenced -= removed
 			if err != nil {
 				f.Log.Error(err, "ending TPU defragmentation drain", "drain", d.ID, "outcome", d.End)
@@ -74,9 +77,6 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 			}
 			f.Log.Info("ended TPU defragmentation drain", "drain", d.ID, "pod", d.Pod, "outcome", d.End)
 			f.countDrain(d.End)
-			if d.End == tpudefrag.OutcomeFenceNotHonored {
-				f.setBackoff(d.Pod, now.Add(cfg.Policies.TPUDefragmentation.FenceFailureBackoff()))
-			}
 			continue
 		}
 		if len(d.Empty) > 0 {
@@ -140,6 +140,29 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 func (f *DefragmentationFencer) mayFence(snap *snapshot.ClusterSnapshot, cfg *config.Config, now time.Time) bool {
 	return cfg.Mode == config.ModeExecute && tpudefrag.Enabled(cfg) && cfg.MaintenanceWindowOpen(now) &&
 		snap.OMENativeExecutor.Available
+}
+
+// end removes the fence of a drain that ends. The hosts that show its fence
+// was not honored are released last, and only once every other host is: they
+// are the only record of that outcome, so a partial release leaves them, and
+// the next pass ends the drain again instead of fencing the released hosts.
+func (f *DefragmentationFencer) end(ctx context.Context, snap *snapshot.ClusterSnapshot, cfg *config.Config, d *tpudefrag.OpenDrain) (int, error) {
+	last := map[string]bool{}
+	for _, name := range d.Unhonored {
+		last[name] = true
+	}
+	var first []string
+	for _, name := range d.Fenced {
+		if !last[name] {
+			first = append(first, name)
+		}
+	}
+	removed, err := f.unfenceAll(ctx, snap, cfg, d.ID, first, d.End)
+	if err != nil || len(d.Unhonored) == 0 {
+		return removed, err
+	}
+	more, err := f.unfenceAll(ctx, snap, cfg, d.ID, d.Unhonored, d.End)
+	return removed + more, err
 }
 
 // abort removes a drain's fence after a cordon failed.

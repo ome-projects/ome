@@ -17,6 +17,7 @@ import (
 	"k8s.io/client-go/tools/record"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"sigs.k8s.io/ome/pkg/alfred/config"
 	"sigs.k8s.io/ome/pkg/alfred/metrics"
@@ -137,13 +138,18 @@ type fenceFixture struct {
 }
 
 func newFenceFixture(snap *snapshot.ClusterSnapshot, mutate func(*corev1.Node)) *fenceFixture {
+	return newFenceFixtureWith(snap, mutate, interceptor.Funcs{})
+}
+
+// newFenceFixtureWith is newFenceFixture with funcs intercepting API calls.
+func newFenceFixtureWith(snap *snapshot.ClusterSnapshot, mutate func(*corev1.Node), funcs interceptor.Funcs) *fenceFixture {
 	objs := liveNodes(snap)
 	if mutate != nil {
 		for _, o := range objs {
 			mutate(o.(*corev1.Node))
 		}
 	}
-	cl := fake.NewClientBuilder().WithObjects(objs...).Build()
+	cl := fake.NewClientBuilder().WithObjects(objs...).WithInterceptorFuncs(funcs).Build()
 	m := metrics.New(prometheus.NewRegistry())
 	return &fenceFixture{
 		f:  &DefragmentationFencer{Client: cl, Recorder: record.NewFakeRecorder(64), Metrics: m, Log: logr.Discard(), Now: func() time.Time { return fenceNow }},
@@ -451,5 +457,66 @@ func TestFencerReleasesAFencedNodeThatLostItsPartitionLabels(t *testing.T) {
 	}
 	if got := x.drains(tpudefrag.OutcomeDeadline); got != 1 {
 		t.Fatalf("deadline = %v, want 1", got)
+	}
+}
+
+// TestFencerKeepsTheEvidenceUntilEveryOtherHostIsReleased: someone uncordoned
+// A-1, so the drain ends as fence_not_honored, and releasing A-2 fails once.
+// A-1 keeps its fence until every other host is released, so the next pass
+// ends the drain again instead of re-fencing the released hosts. The TPU pod
+// backs off at once.
+func TestFencerKeepsTheEvidenceUntilEveryOtherHostIsReleased(t *testing.T) {
+	deadline := fenceNow.Add(time.Hour)
+	uncordoned := func(i int) []testutil.NodeOption {
+		if i == 1 {
+			return []testutil.NodeOption{func(n *snapshot.Node) { n.Cordoned = false }}
+		}
+		return nil
+	}
+	snap := newFenceCluster().partition("A", fenceOn("A", deadline), uncordoned).partition("E").full("C").
+		instance("prod/a", "A-0").build()
+	failA2 := true
+	x := newFenceFixtureWith(snap, nil, interceptor.Funcs{
+		Patch: func(ctx context.Context, c client.WithWatch, obj client.Object, patch client.Patch, opts ...client.PatchOption) error {
+			if obj.GetName() == "A-2" && failA2 {
+				failA2 = false
+				return fmt.Errorf("injected conflict")
+			}
+			return c.Patch(ctx, obj, patch, opts...)
+		},
+	})
+	cfg := fenceConfig(config.ModeExecute)
+	x.f.Reconcile(context.Background(), snap, cfg)
+	fenced := func(name string) bool {
+		return x.node(t, name).Annotations[snapshot.DefragmentationFenceAnnotation] != ""
+	}
+	if fenced("A-0") || fenced("A-3") || !fenced("A-2") || !fenced("A-1") {
+		t.Fatalf("after a failed release of A-2: fenced A-0=%v A-1=%v A-2=%v A-3=%v, want only A-1 and A-2",
+			fenced("A-0"), fenced("A-1"), fenced("A-2"), fenced("A-3"))
+	}
+	if !x.f.inBackoff(fenceNow)("pod-a") {
+		t.Fatal("the TPU pod is not backed off after the release failed")
+	}
+	if got := x.drains(tpudefrag.OutcomeFenceNotHonored); got != 0 {
+		t.Fatalf("fence_not_honored = %v before the release finished, want 0", got)
+	}
+
+	// The next pass reads the two remaining fences back.
+	remaining := func(i int) []testutil.NodeOption {
+		if i == 1 || i == 2 {
+			return fenceOn("A", deadline)(i)
+		}
+		return nil
+	}
+	again := newFenceCluster().partition("A", remaining, uncordoned).partition("E").full("C").
+		instance("prod/a", "A-0").build()
+	x.f.Reconcile(context.Background(), again, cfg)
+	for i := 0; i < 4; i++ {
+		if node := x.node(t, fmt.Sprintf("A-%d", i)); node.Spec.Unschedulable || node.Annotations[snapshot.DefragmentationFenceAnnotation] != "" {
+			t.Fatalf("A-%d: unschedulable=%v annotations=%v, want released and not fenced again", i, node.Spec.Unschedulable, node.Annotations)
+		}
+	}
+	if got := x.drains(tpudefrag.OutcomeFenceNotHonored); got != 1 {
+		t.Fatalf("fence_not_honored = %v, want 1", got)
 	}
 }

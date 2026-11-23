@@ -177,7 +177,8 @@ metric_is() {
 drain_counts() {
   local out
   out="$(metrics)" || return 1
-  grep '^alfred_tpu_drains_total' <<<"${out}" | sort
+  out="$(grep '^alfred_tpu_drains_total' <<<"${out}")" || return 1
+  sort <<<"${out}"
 }
 
 last_cycle() {
