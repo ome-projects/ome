@@ -82,4 +82,24 @@ func TestChooseSkipsUnhealthyAndIncompletePartitions(t *testing.T) {
 	if id, _, _ := choose(hosts, "2x2x4"); id != "q0" {
 		t.Fatalf("choose() = %q, want q0 since q1 lost a host", id)
 	}
+	// An unhealthy 2x2x2 does not hide the whole free 2x2x4 around it.
+	hosts = pod(0, 1)
+	hosts[4].healthy["2x2x2"], hosts[5].healthy["2x2x2"] = false, false
+	if id, _, _ := choose(hosts, "2x2x1"); id != "p2" {
+		t.Fatalf("choose() = %q, want p2 since p4 lies in the whole free q1", id)
+	}
+}
+
+// TestReservedResumesAnInterruptedPlacement: a placement that labeled host 4
+// for slice s1 and then failed resumes on host 4's partition.
+func TestReservedResumesAnInterruptedPlacement(t *testing.T) {
+	hosts := pod()
+	hosts[4].slice, hosts[4].free = "s1", false
+	id, members, ok := reserved(hosts, "s1", "2x2x4")
+	if !ok || id != "q1" || !reflect.DeepEqual(members, []string{"tpu-4", "tpu-5", "tpu-6", "tpu-7"}) {
+		t.Fatalf("reserved() = %q %v %t, want q1 on hosts 4-7", id, members, ok)
+	}
+	if id, _, ok := reserved(hosts, "s2", "2x2x4"); ok {
+		t.Fatalf("reserved() = %q for a slice no host carries", id)
+	}
 }

@@ -19,6 +19,8 @@ type host struct {
 	// node's cordon taint onto every partition that contains it, and a slice
 	// scheduler that filters on taints never places a slice there.
 	free bool
+	// slice is the Slice whose label the node carries, empty when none.
+	slice string
 }
 
 // chips returns the chip count of a shape such as "2x2x4", 0 when malformed.
@@ -41,8 +43,9 @@ func chips(shape string) int {
 // choose returns the partition of shape a new slice is placed on, and its
 // hosts, using the slice scheduler's best fit: among wholly free partitions of
 // the shape, the one whose largest wholly free containing partition is
-// smallest, ties to the lowest id. ok is false when no partition of the shape
-// is wholly free.
+// smallest, ties to the lowest id. Every larger shape is checked, since each
+// reports its own health. ok is false when no partition of the shape is
+// wholly free.
 func choose(hosts []host, shape string) (id string, members []string, ok bool) {
 	parts := map[string]map[string][]string{}
 	shapes := map[string]bool{}
@@ -100,10 +103,9 @@ func choose(hosts []host, shape string) (id string, members []string, ok bool) {
 		score := chips(shape)
 		first := byName[parts[shape][pid][0]]
 		for _, s := range larger {
-			if !wholeFree(s, first.ids[s]) {
-				break
+			if wholeFree(s, first.ids[s]) {
+				score = chips(s)
 			}
-			score = chips(s)
 		}
 		if best == "" || score < bestScore {
 			best, bestScore = pid, score
@@ -115,4 +117,27 @@ func choose(hosts []host, shape string) (id string, members []string, ok bool) {
 	members = append([]string(nil), parts[shape][best]...)
 	sort.Strings(members)
 	return best, members, true
+}
+
+// reserved returns the partition of shape that an interrupted placement of
+// slice already labeled, and its hosts. Node labels outlive the provider, so
+// a retry, or a restarted provider, resumes the same placement instead of
+// reserving a second partition. ok is false when no host carries the label.
+func reserved(hosts []host, slice, shape string) (id string, members []string, ok bool) {
+	for _, h := range hosts {
+		if h.slice == slice && h.ids[shape] != "" {
+			id = h.ids[shape]
+			break
+		}
+	}
+	if id == "" {
+		return "", nil, false
+	}
+	for _, h := range hosts {
+		if h.ids[shape] == id {
+			members = append(members, h.name)
+		}
+	}
+	sort.Strings(members)
+	return id, members, true
 }

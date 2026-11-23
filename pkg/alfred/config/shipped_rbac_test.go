@@ -134,10 +134,23 @@ func TestMaintenanceCordonRBACMatchesAndStaysNarrow(t *testing.T) {
 }
 
 // TestDefragmentationFenceRBACMatchesAndStaysNarrow keeps the fence opt-in to
-// node get and patch, identical in both install paths.
+// node get and patch, identical in both install paths. The grant covers every
+// node: a resourceNames list would leave TPU nodes the fencer cannot cordon,
+// or cannot uncordon once it has cordoned them.
 func TestDefragmentationFenceRBACMatchesAndStaysNarrow(t *testing.T) {
-	chart := grants(t, "../../../charts/ome-alfred/templates/defragmentation-fence-rbac.yaml", "ClusterRole")
-	kustomize := grants(t, "../../../config/alfred/defragmentation-fence/rbac.yaml", "ClusterRole")
+	const chartPath = "../../../charts/ome-alfred/templates/defragmentation-fence-rbac.yaml"
+	const kustomizePath = "../../../config/alfred/defragmentation-fence/rbac.yaml"
+	for _, path := range []string{chartPath, kustomizePath} {
+		raw, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(raw), "resourceNames") {
+			t.Errorf("%s: the fence role must not restrict resourceNames", path)
+		}
+	}
+	chart := grants(t, chartPath, "ClusterRole")
+	kustomize := grants(t, kustomizePath, "ClusterRole")
 	want := map[string]bool{"/nodes:get": true, "/nodes:patch": true}
 	for name, got := range map[string]map[string]bool{"chart": chart, "kustomize": kustomize} {
 		if len(got) != len(want) {

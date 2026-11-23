@@ -1,7 +1,9 @@
 package tpudefrag
 
 import (
+	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -404,4 +406,139 @@ func TestBuildPlansWithoutAMigrationAPI(t *testing.T) {
 	if snap.OMENativeExecutor.Available {
 		t.Fatal("planning changed the caller's snapshot")
 	}
+}
+
+// TestOpenDrainNeverRefencesAnEmptiedPartition: B emptied, and releasing it
+// failed on B-2 alone. B's other hosts are not missing from the fence, since
+// an emptied partition is only ever released, so A's moves still settle.
+func TestOpenDrainNeverRefencesAnEmptiedPartition(t *testing.T) {
+	settled := now.Add(-2 * time.Minute)
+	snap := newCluster(t).
+		partition("pod-a", "A", func(i int) []testutil.NodeOption { return fenced("d1", "A", settled, i != 0)(i) }).
+		partition("pod-a", "B", func(i int) []testutil.NodeOption {
+			if i == 2 {
+				return fenced("d1", "B", settled, true)(i)
+			}
+			return nil
+		}).
+		partition("pod-a", "E").full("C").
+		instance("prod/a", "A-0").build()
+	plan := Build(snap, executeConfig(), now, nil)
+	if len(plan.Open) != 1 {
+		t.Fatalf("open = %+v, want one drain", plan.Open)
+	}
+	if d := plan.Open[0]; len(d.Missing) != 0 || !reflect.DeepEqual(d.Empty, []string{"B"}) || !d.Settled || d.End != "" {
+		t.Fatalf("open drain = %+v, want B empty, no host missing, settled", d)
+	}
+}
+
+// TestOpenDrainStopsOrWaitsWhenItsHostsChange: a drain ends when a fenced
+// host was uncordoned or no move can be submitted, and does not settle while
+// a source partition lacks a host.
+func TestOpenDrainStopsOrWaitsWhenItsHostsChange(t *testing.T) {
+	build := func() *snapshot.ClusterSnapshot {
+		return newCluster(t).
+			partition("pod-a", "A", func(i int) []testutil.NodeOption { return fenced("d1", "A", now.Add(-2*time.Minute), i != 0)(i) }).
+			partition("pod-a", "E").full("C").
+			instance("prod/a", "A-0").build()
+	}
+	if d := Build(build(), executeConfig(), now, nil).Open[0]; !d.Settled || d.End != "" {
+		t.Fatalf("unchanged drain = %+v, want settled and open", d)
+	}
+	stripPartitionLabels := func(s *snapshot.ClusterSnapshot) {
+		for k := range s.Nodes["A-1"].Labels {
+			if strings.HasPrefix(k, "cloud.google.com/gke-tpu-partition-") {
+				delete(s.Nodes["A-1"].Labels, k)
+			}
+		}
+	}
+	tests := []struct {
+		name   string
+		mutate func(*snapshot.ClusterSnapshot)
+		want   string
+	}{
+		{"someone uncordoned a fenced host", func(s *snapshot.ClusterSnapshot) { s.Nodes["A-1"].Cordoned = false }, OutcomeFenceNotHonored},
+		{"no migration API is configured", func(s *snapshot.ClusterSnapshot) { s.OMENativeExecutor.Available = false }, OutcomeAborted},
+		{"a source host left the cluster", func(s *snapshot.ClusterSnapshot) { delete(s.Nodes, "A-3") }, ""},
+		{"a fenced host lost its partition labels", stripPartitionLabels, ""},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			snap := build()
+			tt.mutate(snap)
+			plan := Build(snap, executeConfig(), now, nil)
+			if len(plan.Open) != 1 {
+				t.Fatalf("open = %+v, want one drain", plan.Open)
+			}
+			d := plan.Open[0]
+			if d.End != tt.want {
+				t.Fatalf("End = %q, want %q", d.End, tt.want)
+			}
+			if tt.want == "" && d.Settled {
+				t.Fatalf("drain settled with a source partition short of a host: %+v", d)
+			}
+			if _, ok := snap.Nodes["A-1"]; ok && !contains(d.Fenced, "A-1") {
+				t.Fatalf("fenced = %v, want A-1 still read back", d.Fenced)
+			}
+		})
+	}
+}
+
+// TestBuildPredictsInDispatchOrder: A holds a 2x2x1 Instance and a 2x2x2 one
+// (prod/b) that runs only on tpu7x hosts. Outside A, G-01 is the only free
+// 2x2x2 on tpu7x hosts; M-01 is free but on other hosts. Both moves leave
+// the same partition, so the dispatcher submits them by name. When the 2x2x1
+// goes first, best fit puts it on G-0 and prod/b has nowhere to go.
+func TestBuildPredictsInDispatchOrder(t *testing.T) {
+	build := func(small string) *snapshot.ClusterSnapshot {
+		snap := newCluster(t).
+			partition("pod-a", "A").partition("pod-a", "G").partition("pod-a", "M").full("C").
+			instance(small, "A-0").instance("prod/b", "A-2", "A-3").
+			instance("prod/g", "G-2", "G-3").instance("prod/m", "M-2", "M-3").build()
+		for _, name := range []string{"prod/g", "prod/m"} {
+			snap.Workloads[key(name, 0).Workload].Movable = false
+		}
+		for i := 0; i < 4; i++ {
+			snap.Nodes[fmt.Sprintf("M-%d", i)].Labels["node.kubernetes.io/instance-type"] = "other"
+		}
+		for _, pod := range snap.Workloads[key("prod/b", 0).Workload].Components["engine"].Instances[0].Pods {
+			pod.NodeSelector["node.kubernetes.io/instance-type"] = "tpu7x"
+		}
+		return snap
+	}
+	if plan := Build(build("prod/a"), testConfig(), now, nil); len(plan.Intents) != 0 {
+		t.Fatalf("intents = %+v, want none: prod/a moves first and takes G-0, which prod/b needs", plan.Intents)
+	}
+	if plan := Build(build("prod/z"), testConfig(), now, nil); len(plan.Intents) != 1 {
+		t.Fatalf("intents = %+v, want A drained: prod/b moves first and takes G-01", plan.Intents)
+	}
+}
+
+// TestHostsWithoutATPUPodAreNeverPlanned: hosts without the pod label could
+// belong to different TPU pods, so they get no drain and no gauge.
+func TestHostsWithoutATPUPodAreNeverPlanned(t *testing.T) {
+	c := newCluster(t)
+	for _, id := range []string{"A", "B", "C", "D"} {
+		c.partition("", id)
+	}
+	snap := c.instance("prod/c0", "C-0", "C-1").instance("prod/c2", "C-2", "C-3").
+		instance("prod/d0", "D-0", "D-1").instance("prod/d2", "D-2", "D-3").
+		instance("prod/a", "A-0").instance("prod/b", "B-0").build()
+	if plan := Build(snap, testConfig(), now, nil); len(plan.Intents) != 0 {
+		t.Fatalf("intents = %+v, want none", plan.Intents)
+	}
+	m := metrics.New(prometheus.NewRegistry())
+	PublishPartitions(snap, testConfig(), m)
+	if n := promtestutil.CollectAndCount(m.TPUFreePartitions); n != 0 {
+		t.Fatalf("published %d free-partition series for unlabeled hosts, want 0", n)
+	}
+}
+
+func contains(list []string, s string) bool {
+	for _, v := range list {
+		if v == s {
+			return true
+		}
+	}
+	return false
 }

@@ -172,6 +172,11 @@ metric_is() {
   metrics | awk -v series="$1" -v want="$2" '$1 == series { found = 1; ok = ($2 + 0 == want + 0) } END { exit !(found && ok) }'
 }
 
+# drain_counts prints every alfred_tpu_drains_total series, sorted.
+drain_counts() {
+  metrics | grep '^alfred_tpu_drains_total' | sort || true
+}
+
 last_cycle() {
   "${k[@]}" -n ome get configmap alfred-recommendations -o jsonpath='{.data.last-cycle\.json}' | jq -r '.timestamp'
 }

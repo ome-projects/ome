@@ -31,8 +31,8 @@ const (
 // DefragmentationFencer is the only writer of the TPU defragmentation fence.
 // Before each decision pass it ends drains that must stop, uncordons
 // partitions that have emptied, completes a fence that is missing hosts, and,
-// in execute mode inside a maintenance window, fences the drains the policy
-// proposes. It re-reads every node before writing and writes with an
+// in execute mode inside a maintenance window with a migration API
+// configured, fences the drains the policy proposes. It re-reads every node before writing and writes with an
 // optimistic lock. It uncordons only nodes that carry its annotation.
 type DefragmentationFencer struct {
 	// Client writes. Reader serves the read before each write and should
@@ -103,7 +103,7 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 				continue
 			}
 		}
-		if len(d.Missing) > 0 && f.mayFence(cfg, now) {
+		if len(d.Missing) > 0 && f.mayFence(snap, cfg, now) {
 			added, err := f.fenceAll(ctx, snap, cfg, &d.Drain, d.Missing, now)
 			fenced += added
 			if err != nil {
@@ -112,7 +112,7 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 			}
 		}
 	}
-	if f.mayFence(cfg, now) {
+	if f.mayFence(snap, cfg, now) {
 		for _, d := range plan.Intents {
 			d.ID = drainID(d, now)
 			added, err := f.fenceAll(ctx, snap, cfg, d, d.Hosts, now)
@@ -134,8 +134,12 @@ func (f *DefragmentationFencer) Reconcile(ctx context.Context, snap *snapshot.Cl
 	}
 }
 
-func (f *DefragmentationFencer) mayFence(cfg *config.Config, now time.Time) bool {
-	return cfg.Mode == config.ModeExecute && tpudefrag.Enabled(cfg) && cfg.MaintenanceWindowOpen(now)
+// mayFence reports whether the fencer may cordon hosts now. Without a
+// migration API no move can be submitted, so a fence would only hold
+// capacity.
+func (f *DefragmentationFencer) mayFence(snap *snapshot.ClusterSnapshot, cfg *config.Config, now time.Time) bool {
+	return cfg.Mode == config.ModeExecute && tpudefrag.Enabled(cfg) && cfg.MaintenanceWindowOpen(now) &&
+		snap.OMENativeExecutor.Available
 }
 
 // abort removes a drain's fence after a cordon failed.
@@ -236,9 +240,9 @@ func (f *DefragmentationFencer) unfenceAll(ctx context.Context, snap *snapshot.C
 	return removed, errors.Join(errs...)
 }
 
-// unfence removes drain id's fence from one node. A node that is unhealthy or
-// under maintenance stays cordoned for the node-health policy and the
-// maintenance tooling; a node whose maintenance rule cordons also receives
+// unfence removes drain id's fence from one node. A node that is unhealthy,
+// in the snapshot or on the live read, or under maintenance stays cordoned
+// for the node-health policy and the maintenance tooling; a node whose maintenance rule cordons also receives
 // that rule's maintenance annotation, as the maintenance cordoner skips nodes
 // that are already cordoned. A node carrying the hold-cordon annotation stays
 // cordoned for the operator. Every other node is uncordoned.
@@ -255,7 +259,8 @@ func (f *DefragmentationFencer) unfence(ctx context.Context, observed *snapshot.
 	delete(patched.Annotations, snapshot.DefragmentationFenceAnnotation)
 	triggers := cfg.Policies.NodeHealth.Maintenance.Triggers
 	maintenance := snapshot.ObserveNodeMaintenance(live, triggers, f.now())
-	unhealthy := observed != nil && observed.Health.Quarantined()
+	unhealthy := (observed != nil && observed.Health.Quarantined()) ||
+		snapshot.ObserveNodeHealth(live, cfg.Policies.NodeHealth.TriggerConditions, f.now(), cfg.NodeSuspicionWindow()).Quarantined()
 	keep := ""
 	switch {
 	case unhealthy || maintenance.Requested:

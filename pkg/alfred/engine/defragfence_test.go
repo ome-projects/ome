@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -358,5 +359,97 @@ func TestFencerNeverUncordonsAnotherCordon(t *testing.T) {
 	}
 	if node := x.node(t, "A-0"); node.Spec.Unschedulable {
 		t.Fatal("A-0 was not released")
+	}
+}
+
+// TestFencerNeverRefencesAnEmptiedPartition: releasing emptied partition B
+// failed on B-2 alone last pass. This pass releases B-2, leaves B's other
+// hosts uncordoned, and keeps A fenced.
+func TestFencerNeverRefencesAnEmptiedPartition(t *testing.T) {
+	deadline := fenceNow.Add(time.Hour)
+	snap := newFenceCluster().partition("A", fenceOn("A", deadline)).
+		partition("B", func(i int) []testutil.NodeOption {
+			if i == 2 {
+				return fenceOn("B", deadline)(i)
+			}
+			return nil
+		}).
+		partition("E").full("C").instance("prod/a", "A-0").build()
+	x := newFenceFixture(snap, nil)
+	x.f.Reconcile(context.Background(), snap, fenceConfig(config.ModeExecute))
+	for i := 0; i < 4; i++ {
+		if node := x.node(t, fmt.Sprintf("B-%d", i)); node.Spec.Unschedulable || node.Annotations[snapshot.DefragmentationFenceAnnotation] != "" {
+			t.Fatalf("B-%d is fenced after B emptied: %+v", i, node)
+		}
+		if node := x.node(t, fmt.Sprintf("A-%d", i)); !node.Spec.Unschedulable {
+			t.Fatalf("A-%d was released while A still holds an Instance", i)
+		}
+	}
+}
+
+// TestFencerNeedsAMigrationAPI: without a configured migration API no move can
+// be submitted, so the fencer opens no drain and ends the open one.
+func TestFencerNeedsAMigrationAPI(t *testing.T) {
+	cfg := fenceConfig(config.ModeExecute)
+	snap := drainable().build()
+	snap.OMENativeExecutor.Available = false
+	x := newFenceFixture(snap, nil)
+	x.f.Reconcile(context.Background(), snap, cfg)
+	if node := x.node(t, "A-1"); node.Spec.Unschedulable || len(node.Annotations) != 0 {
+		t.Fatalf("A-1 was fenced without a migration API: %+v", node)
+	}
+
+	open := newFenceCluster().partition("A", fenceOn("A", fenceNow.Add(time.Hour))).partition("E").full("C").
+		instance("prod/a", "A-0").build()
+	open.OMENativeExecutor.Available = false
+	y := newFenceFixture(open, nil)
+	y.f.Reconcile(context.Background(), open, cfg)
+	if node := y.node(t, "A-1"); node.Spec.Unschedulable || node.Annotations[snapshot.DefragmentationFenceAnnotation] != "" {
+		t.Fatalf("A-1 kept the fence without a migration API: %+v", node)
+	}
+	if got := y.drains(tpudefrag.OutcomeAborted); got != 1 {
+		t.Fatalf("aborted = %v, want 1", got)
+	}
+}
+
+// TestFencerReadsLiveHealthBeforeUncordoning: A-1 turned unhealthy after the
+// snapshot. When the drain ends, A-1 stays cordoned and A-0 is uncordoned.
+func TestFencerReadsLiveHealthBeforeUncordoning(t *testing.T) {
+	cfg := fenceConfig(config.ModeExecute)
+	snap := newFenceCluster().partition("A", fenceOn("A", fenceNow.Add(-time.Minute))).partition("E").full("C").build()
+	x := newFenceFixture(snap, func(n *corev1.Node) {
+		if n.Name == "A-1" {
+			n.Status.Conditions = []corev1.NodeCondition{{
+				Type:               corev1.NodeConditionType(cfg.Policies.NodeHealth.TriggerConditions[0]),
+				Status:             corev1.ConditionTrue,
+				LastTransitionTime: metav1.NewTime(fenceNow.Add(-time.Second)),
+			}}
+		}
+	})
+	x.f.Reconcile(context.Background(), snap, cfg)
+	if node := x.node(t, "A-1"); !node.Spec.Unschedulable || node.Annotations[snapshot.DefragmentationFenceAnnotation] != "" {
+		t.Fatalf("A-1: unschedulable=%v annotations=%v, want cordoned without the fence", node.Spec.Unschedulable, node.Annotations)
+	}
+	if node := x.node(t, "A-0"); node.Spec.Unschedulable {
+		t.Fatal("A-0 was not released")
+	}
+}
+
+// TestFencerReleasesAFencedNodeThatLostItsPartitionLabels: A-1 lost every
+// partition label during the drain. Its fence still ends with the drain.
+func TestFencerReleasesAFencedNodeThatLostItsPartitionLabels(t *testing.T) {
+	snap := newFenceCluster().partition("A", fenceOn("A", fenceNow.Add(-time.Minute))).partition("E").full("C").build()
+	for k := range snap.Nodes["A-1"].Labels {
+		if strings.HasPrefix(k, "cloud.google.com/gke-tpu-partition-") {
+			delete(snap.Nodes["A-1"].Labels, k)
+		}
+	}
+	x := newFenceFixture(snap, nil)
+	x.f.Reconcile(context.Background(), snap, fenceConfig(config.ModeExecute))
+	if node := x.node(t, "A-1"); node.Spec.Unschedulable || node.Annotations[snapshot.DefragmentationFenceAnnotation] != "" {
+		t.Fatalf("A-1 kept the fence: unschedulable=%v annotations=%v", node.Spec.Unschedulable, node.Annotations)
+	}
+	if got := x.drains(tpudefrag.OutcomeDeadline); got != 1 {
+		t.Fatalf("deadline = %v, want 1", got)
 	}
 }

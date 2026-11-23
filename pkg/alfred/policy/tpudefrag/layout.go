@@ -54,8 +54,10 @@ type layout struct {
 	parts  map[string]map[string]*partition
 }
 
-// buildLayout reads every node that carries a partition id label. Shapes come
-// from the label keys that match tpuSlicePartitions.idLabel.
+// buildLayout reads every node that carries a partition id label or this
+// policy's fence. A fenced node that lost its partition labels is kept so its
+// drain still releases it. Shapes come from the label keys that match
+// tpuSlicePartitions.idLabel.
 func buildLayout(snap *snapshot.ClusterSnapshot, cfg *config.Config) *layout {
 	tc := &cfg.TPUSlicePartitions
 	prefix, suffix, _ := strings.Cut(tc.IDLabel, "%s")
@@ -79,7 +81,7 @@ func buildLayout(snap *snapshot.ClusterSnapshot, cfg *config.Config) *layout {
 			h.ids[name] = id
 			h.healthy[name] = node.Labels[tc.Label(tc.StateLabel, name)] == tc.HealthyState
 		}
-		if len(h.ids) == 0 {
+		if len(h.ids) == 0 && node.DefragmentationFence == "" {
 			continue
 		}
 		h.busy = node.Labels[tc.SliceLabel] != "" || holdsAccelerators(node)
@@ -137,14 +139,6 @@ func holdsAccelerators(node *snapshot.Node) bool {
 	return false
 }
 
-// smallest returns the smallest shape on the cluster, false when none exists.
-func (l *layout) smallest() (shape, bool) {
-	if len(l.shapes) == 0 {
-		return shape{}, false
-	}
-	return l.shapes[0], true
-}
-
 // complete reports whether the partition has every host its shape implies.
 // A partition that lost a node cannot take a slice of its shape.
 func (l *layout) complete(p *partition) bool {
@@ -152,11 +146,19 @@ func (l *layout) complete(p *partition) bool {
 }
 
 // freeHost reports whether a host could take part in a new slice once any
-// fence of this policy is removed: no slice, no accelerator pod, healthy, and
-// not blocked for another reason.
+// fence of this policy is removed: no slice, no accelerator pod, not blocked
+// for another reason, and healthy in the smallest shape it carries. Node
+// pools may carry different shapes, so that shape is the host's own.
 func (l *layout) freeHost(h *host) bool {
-	s, ok := l.smallest()
-	return ok && !h.busy && !h.blocked && h.healthy[s.name]
+	if h.busy || h.blocked {
+		return false
+	}
+	for _, s := range l.shapes {
+		if _, ok := h.ids[s.name]; ok {
+			return h.healthy[s.name]
+		}
+	}
+	return false
 }
 
 // wholeFree reports whether a slice of the partition's shape could be placed
@@ -175,7 +177,8 @@ func (l *layout) wholeFree(p *partition, taken, fenced map[string]bool) bool {
 }
 
 // podStats counts, per TPU pod, the free hosts and the whole free partitions
-// of each shape.
+// of each shape. Hosts without the pod label are left out: they may belong to
+// different TPU pods, so no gap, drain or gauge is computed for them.
 type podStats struct {
 	freeHosts int
 	wholeFree map[string]int
@@ -190,6 +193,9 @@ func (l *layout) stats() map[string]*podStats {
 		return out[pod]
 	}
 	for _, h := range l.hosts {
+		if h.pod == "" {
+			continue
+		}
 		st := get(h.pod)
 		if l.freeHost(h) {
 			st.freeHosts++
@@ -197,7 +203,7 @@ func (l *layout) stats() map[string]*podStats {
 	}
 	for s, parts := range l.parts {
 		for _, p := range parts {
-			if l.wholeFree(p, nil, nil) {
+			if p.pod != "" && l.wholeFree(p, nil, nil) {
 				get(p.pod).wholeFree[s]++
 			}
 		}
@@ -216,7 +222,8 @@ func (l *layout) packingBound(st *podStats, s shape) int {
 
 // ancestorChips returns the chip count of the largest wholly free partition
 // that contains p, p itself included. slice-scheduler prefers the partition
-// whose value is smallest.
+// whose value is smallest. Every larger shape is checked: a host may carry no
+// partition of an intermediate shape, and each shape reports its own health.
 func (l *layout) ancestorChips(p *partition, taken, fenced map[string]bool) int {
 	best := l.byName[p.shape].chips
 	first := l.hosts[p.hosts[0]]
@@ -226,7 +233,7 @@ func (l *layout) ancestorChips(p *partition, taken, fenced map[string]bool) int 
 		}
 		ancestor := l.parts[s.name][first.ids[s.name]]
 		if ancestor == nil || !l.wholeFree(ancestor, taken, fenced) {
-			break
+			continue
 		}
 		best = s.chips
 	}

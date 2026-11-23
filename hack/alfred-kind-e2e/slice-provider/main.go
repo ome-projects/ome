@@ -3,8 +3,10 @@
 // OME creates on a wholly free partition of its topology, using the slice
 // scheduler's best fit and skipping cordoned hosts. It then labels the
 // partition's nodes with the Slice name and topology, records the partition
-// on the Slice, and reports it ACTIVE. Once a Slice is gone it removes those
-// labels. It never creates, deletes or changes any other object.
+// on the Slice, and reports it ACTIVE. A placement interrupted by a failed
+// write resumes on the next pass with the same partition. Once a Slice is
+// gone it removes those labels. It never creates, deletes or changes any
+// other object.
 package main
 
 import (
@@ -106,7 +108,7 @@ func (p *provider) reconcile(ctx context.Context) error {
 		return fmt.Errorf("list slices: %w", err)
 	}
 	live := map[string]bool{}
-	var pending []*unstructured.Unstructured
+	var pending, inactive []*unstructured.Unstructured
 	for i := range list.Items {
 		u := &list.Items[i]
 		s, err := gke.Parse(u)
@@ -117,8 +119,11 @@ func (p *provider) reconcile(ctx context.Context) error {
 			continue
 		}
 		live[s.Name] = true
-		if len(s.PartitionIDs) == 0 {
+		switch {
+		case len(s.PartitionIDs) == 0:
 			pending = append(pending, u)
+		case s.State != activeState:
+			inactive = append(inactive, u)
 		}
 	}
 	// Release first, so a partition freed by a deleted Slice is available
@@ -139,6 +144,18 @@ func (p *provider) reconcile(ctx context.Context) error {
 		}
 		return pending[i].GetName() < pending[j].GetName()
 	})
+	// A Slice that holds a partition but whose activation failed is
+	// activated on that partition.
+	for _, u := range inactive {
+		s, err := gke.Parse(u)
+		if err != nil {
+			return err
+		}
+		if err := p.activate(ctx, u, s.PartitionIDs[0]); err != nil {
+			return err
+		}
+		fmt.Printf("%s activated %s on %s\n", time.Now().UTC().Format(time.RFC3339), s.Name, s.PartitionIDs[0])
+	}
 	for _, u := range pending {
 		if err := p.place(ctx, u, nodes.Items); err != nil {
 			return err
@@ -164,12 +181,18 @@ func (p *provider) place(ctx context.Context, u *unstructured.Unstructured, node
 		byName[n.Name] = n
 		hosts = append(hosts, hostOf(n))
 	}
-	id, members, ok := choose(hosts, s.Topology)
+	id, members, ok := reserved(hosts, s.Name, s.Topology)
+	if !ok {
+		id, members, ok = choose(hosts, s.Topology)
+	}
 	if !ok {
 		return nil
 	}
 	for _, name := range members {
 		n := byName[name]
+		if n.Labels[sliceLabel] == s.Name {
+			continue
+		}
 		if err := p.label(ctx, n, map[string]string{sliceLabel: s.Name, topologyLabel: s.Topology}); err != nil {
 			return err
 		}
@@ -179,6 +202,16 @@ func (p *provider) place(ctx context.Context, u *unstructured.Unstructured, node
 	if err := p.mergePatch(ctx, u, spec, false); err != nil {
 		return fmt.Errorf("assign slice %s: %w", s.Name, err)
 	}
+	if err := p.activate(ctx, u, id); err != nil {
+		return err
+	}
+	fmt.Printf("%s placed %s (%s) on %s: %s\n", time.Now().UTC().Format(time.RFC3339),
+		s.Name, s.Topology, id, strings.Join(members, ","))
+	return nil
+}
+
+// activate reports u ACTIVE on partition id.
+func (p *provider) activate(ctx context.Context, u *unstructured.Unstructured, id string) error {
 	status := map[string]any{"status": map[string]any{"conditions": []map[string]any{{
 		"type":               "Ready",
 		"status":             string(metav1.ConditionTrue),
@@ -187,10 +220,8 @@ func (p *provider) place(ctx context.Context, u *unstructured.Unstructured, node
 		"lastTransitionTime": time.Now().UTC().Format(time.RFC3339),
 	}}}}
 	if err := p.mergePatch(ctx, u, status, true); err != nil {
-		return fmt.Errorf("activate slice %s: %w", s.Name, err)
+		return fmt.Errorf("activate slice %s: %w", u.GetName(), err)
 	}
-	fmt.Printf("%s placed %s (%s) on %s: %s\n", time.Now().UTC().Format(time.RFC3339),
-		s.Name, s.Topology, id, strings.Join(members, ","))
 	return nil
 }
 
@@ -207,7 +238,8 @@ func hostOf(n *corev1.Node) host {
 		h.ids[shape] = v
 		h.healthy[shape] = n.Labels[idPrefix+shape+stateSuffix] == healthyState
 	}
-	h.free = n.Labels[sliceLabel] == "" && !cordoned(n)
+	h.slice = n.Labels[sliceLabel]
+	h.free = h.slice == "" && !cordoned(n)
 	return h
 }
 

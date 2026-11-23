@@ -65,11 +65,13 @@ type Drain struct {
 type OpenDrain struct {
 	Drain
 	// Fenced hosts carry this drain's fence; Missing hosts belong to its
-	// partitions but do not.
+	// partitions that still hold a slice but do not. An emptied partition is
+	// only ever released, so its hosts are never missing.
 	Fenced  []string
 	Missing []string
-	// Settled: every host is fenced and cordoned, and the last cordon has
-	// stood for fenceSettleSeconds.
+	// Settled: every partition still holding a slice has all its hosts, every
+	// host is fenced and cordoned, and the last cordon has stood for
+	// fenceSettleSeconds.
 	Settled bool
 	// Empty lists partitions that hold no slice any more. The fencer removes
 	// their fence at once.
@@ -186,9 +188,12 @@ func openDrains(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, n
 		f := h.fence
 		d := byID[f.Drain]
 		if d == nil {
-			d = &OpenDrain{Drain: Drain{ID: f.Drain, Pod: h.pod, Unit: f.Unit, Deadline: f.Deadline}}
+			d = &OpenDrain{Drain: Drain{ID: f.Drain, Unit: f.Unit, Deadline: f.Deadline}}
 			byID[f.Drain] = d
 			partitions[f.Drain] = map[string]bool{}
+		}
+		if d.Pod == "" {
+			d.Pod = h.pod
 		}
 		if f.Deadline.Before(d.Deadline) {
 			d.Deadline = f.Deadline
@@ -206,68 +211,70 @@ func openDrains(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, n
 		for _, name := range d.Fenced {
 			fenced[name] = true
 		}
-		hosts := map[string]bool{}
+		// part names each host's drain partition: its fence's partition when
+		// fenced, its partition label's otherwise.
+		part := map[string]string{}
 		for pid := range partitions[id] {
 			d.Partitions = append(d.Partitions, pid)
-			members := []string(nil)
 			if p := l.parts[d.Unit][pid]; p != nil {
-				members = p.hosts
-			}
-			empty := true
-			for _, name := range members {
-				hosts[name] = true
-				if l.hosts[name].busy {
-					empty = false
+				for _, name := range p.hosts {
+					part[name] = pid
 				}
-			}
-			for _, name := range d.Fenced {
-				if l.hosts[name].fence.Partition == pid {
-					hosts[name] = true
-					if l.hosts[name].busy {
-						empty = false
-					}
-				}
-			}
-			if empty {
-				d.Empty = append(d.Empty, pid)
 			}
 		}
+		for _, name := range d.Fenced {
+			part[name] = l.hosts[name].fence.Partition
+		}
 		sort.Strings(d.Partitions)
-		sort.Strings(d.Empty)
-		for name := range hosts {
+		busy := map[string]bool{}
+		for name, pid := range part {
+			if l.hosts[name].busy {
+				busy[pid] = true
+			}
+		}
+		emptied := map[string]bool{}
+		complete := true
+		for _, pid := range d.Partitions {
+			if !busy[pid] {
+				emptied[pid] = true
+				d.Empty = append(d.Empty, pid)
+				continue
+			}
+			// A partition that lost a host cannot become a whole free one, so
+			// its moves wait until the host returns or the drain ends.
+			if p := l.parts[d.Unit][pid]; p == nil || !l.complete(p) {
+				complete = false
+			}
+		}
+		for name, pid := range part {
 			d.Hosts = append(d.Hosts, name)
-			if !fenced[name] {
+			if !fenced[name] && !emptied[pid] {
 				d.Missing = append(d.Missing, name)
 			}
 		}
 		sort.Strings(d.Hosts)
 		sort.Strings(d.Missing)
-		d.Settled = len(d.Missing) == 0 && now.Sub(latest[id]) >= td.FenceSettle()
+		d.Settled = complete && len(d.Missing) == 0 && now.Sub(latest[id]) >= td.FenceSettle()
 		for _, name := range d.Fenced {
 			if !l.hosts[name].node.Cordoned {
 				d.Settled = false
 			}
 		}
-		d.End = drainEnd(cfg, l, d, now)
-		emptied := map[string]bool{}
-		for _, pid := range d.Empty {
-			emptied[pid] = true
-		}
-		d.Busy, d.Moves = occupants(snap, l, d.Hosts, func(name string) string {
-			if f := l.hosts[name].fence; f != nil && f.Drain == id {
-				return f.Partition
-			}
-			return l.hosts[name].ids[d.Unit]
-		}, emptied)
+		d.End = drainEnd(snap, cfg, l, d, now)
+		d.Busy, d.Moves = occupants(snap, l, d.Hosts, func(name string) string { return part[name] }, emptied)
 		out = append(out, d)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
 
-func drainEnd(cfg *config.Config, l *layout, d *OpenDrain, now time.Time) string {
+// drainEnd returns the outcome that ends d now, or "". A drain stops when it
+// can no longer move anything: the policy is off, the mode is not execute, or
+// no migration API is configured. Its fence is not honored when a host free
+// at fence time now holds a slice, or when someone uncordoned a fenced host.
+func drainEnd(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, d *OpenDrain, now time.Time) string {
 	switch {
-	case !Enabled(cfg) || cfg.Mode != config.ModeExecute:
+	case !Enabled(cfg) || cfg.Mode != config.ModeExecute || !snap.OMENativeExecutor.Available:
 		return OutcomeAborted
 	case !now.Before(d.Deadline):
 		return OutcomeDeadline
@@ -276,7 +283,7 @@ func drainEnd(cfg *config.Config, l *layout, d *OpenDrain, now time.Time) string
 	}
 	for _, name := range d.Fenced {
 		h := l.hosts[name]
-		if h.fence.FreeAtFence && h.busy {
+		if (h.fence.FreeAtFence && h.busy) || !h.node.Cordoned {
 			return OutcomeFenceNotHonored
 		}
 	}
@@ -381,10 +388,11 @@ type candidate struct {
 
 // mover is one Instance a prediction places.
 type mover struct {
-	key      InstanceKey
-	topology string
-	chips    int
-	pods     []snapshot.PodInfo
+	key InstanceKey
+	// partition is the drained partition the Instance leaves.
+	partition string
+	topology  string
+	pods      []snapshot.PodInfo
 }
 
 // selectDrain picks the partitions of one TPU pod to drain: candidates in
@@ -507,21 +515,30 @@ func feasible(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, uni
 			if len(inst.Pods) > 0 {
 				topology = inst.Pods[0].NodeSelector[cfg.TPUSlicePartitions.TopologyLabel]
 			}
-			s, ok := l.byName[topology]
-			if !ok {
+			if _, ok := l.byName[topology]; !ok {
 				return false
 			}
-			movers = append(movers, mover{key: m.Key, topology: topology, chips: s.chips, pods: inst.Pods})
+			movers = append(movers, mover{key: m.Key, partition: c.p.id, topology: topology, pods: inst.Pods})
 		}
 	}
-	sort.Slice(movers, func(i, j int) bool {
-		if movers[i].chips != movers[j].chips {
-			return movers[i].chips > movers[j].chips
-		}
-		return movers[i].key.String() < movers[j].key.String()
-	})
-	taken := map[string]bool{}
+	// Predict in the order the moves are submitted: one at a time, from the
+	// partition with the fewest moves left, then by workload, component and
+	// instance, as Evaluate ranks them.
+	left := map[string]int{}
 	for _, m := range movers {
+		left[m.partition]++
+	}
+	taken := map[string]bool{}
+	for len(movers) > 0 {
+		next := 0
+		for i := range movers {
+			if submittedBefore(movers[i], movers[next], left) {
+				next = i
+			}
+		}
+		m := movers[next]
+		movers = append(movers[:next], movers[next+1:]...)
+		left[m.partition]--
 		p, chips := bestFit(l, cfg, m, taken, fenced)
 		if p == nil || chips >= unit.chips {
 			return false
@@ -531,6 +548,21 @@ func feasible(snap *snapshot.ClusterSnapshot, cfg *config.Config, l *layout, uni
 		}
 	}
 	return true
+}
+
+// submittedBefore reports whether a's move is submitted before b's, given the
+// moves left per partition.
+func submittedBefore(a, b mover, left map[string]int) bool {
+	if left[a.partition] != left[b.partition] {
+		return left[a.partition] < left[b.partition]
+	}
+	if wa, wb := a.key.Workload.String(), b.key.Workload.String(); wa != wb {
+		return wa < wb
+	}
+	if a.key.Component != b.key.Component {
+		return a.key.Component < b.key.Component
+	}
+	return a.key.Instance < b.key.Instance
 }
 
 // bestFit copies slice-scheduler's rule: among whole free partitions of the
