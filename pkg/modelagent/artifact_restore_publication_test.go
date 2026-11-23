@@ -35,7 +35,7 @@ func TestSharedRestoreRefreshesMetadataAfterReadyReportCommits(t *testing.T) {
 		if changed || err != nil || entry.Status != ModelStatusReady || entry.ArtifactRehydrationID != "request-1" {
 			return false, nil, nil
 		}
-		// Commit the Ready report, then change authority before paired labels publish.
+		// Commit the Ready report, then change authority before the Ready label publishes.
 		require.NoError(t, client.Tracker().Update(schema.GroupVersionResource{Version: "v1", Resource: "configmaps"}, cm, cm.Namespace))
 		changed = true
 		current = current.DeepCopy()
@@ -63,13 +63,12 @@ func TestSharedRestoreRefreshesMetadataAfterReadyReportCommits(t *testing.T) {
 	require.Equal(t, "request-1", entry.ArtifactRehydrationID)
 	node, err := client.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Empty(t, node.Labels[testRequestLabel(task)], "stale attempt must not publish completion labels")
+	require.NotEqual(t, string(Ready), node.Labels[constants.GetBaseModelLabel(task.BaseModel.Namespace, task.BaseModel.Name)], "stale attempt must not publish Ready")
 	refreshed := receiveDirectRetry(t, s)
 	require.NotSame(t, task, refreshed)
 	require.Equal(t, "changed after report", refreshed.BaseModel.Annotations["description"])
 	require.NoError(t, s.processTaskWithSourceAdapters(refreshed, true, adapter, nil))
 	node, err = client.CoreV1().Nodes().Get(context.Background(), s.configMapReconciler.nodeName, metav1.GetOptions{})
 	require.NoError(t, err)
-	require.Equal(t, "request-1", node.Labels[testRequestLabel(task)])
 	require.Equal(t, string(Ready), node.Labels[constants.GetBaseModelLabel(task.BaseModel.Namespace, task.BaseModel.Name)])
 }

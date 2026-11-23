@@ -338,8 +338,8 @@ func (s *Gopher) safeNodeLabelReconciliation(ctx context.Context, op *NodeLabelO
 		labelOp.validateReady = func() error {
 			return s.validateArtifactDownload(ctx, task)
 		}
-		if request := artifactRehydrationID(task); activeArtifactRestore(ctx, task) {
-			labelOp.artifactRequestID, labelOp.requireNodeCAS = request, true
+		if activeArtifactRestore(ctx, task) {
+			labelOp.requireNodeCAS = true
 			labelOp.validateReady = func() error { return s.validateArtifactRestoreReport(ctx, task) }
 			// The attachment path already committed the report. Do not let a
 			// generic status update replace its proof with marker-only readiness.

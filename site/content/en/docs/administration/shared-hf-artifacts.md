@@ -260,8 +260,8 @@ Resident files are not migrated between storage layouts.
 ## Restoring or validating a Shared artifact
 
 Remove `ome.io/artifact-residency: Evicted` and set a new, nonempty
-`ome.io/artifact-rehydration-id` on an eligible Shared model. Use a Kubernetes
-label value, for example `restore-20260929-1`. Changing these controls queues
+`ome.io/artifact-rehydration-id` on an eligible Shared model. For example, use
+`restore-20260929-1`. Changing these controls queues
 normal reuse. Shared restoration reattaches a Ready parent without repeating
 its content hashes solely for the new request. Startup integrity checks and
 explicit overrides still apply; missing or failed parents use the existing
@@ -279,9 +279,8 @@ existing behavior.
 
 The agent first records `Ready`, `modelUID`, and `artifactRehydrationID`
 in the per-node ConfigMap. Node names must not be reused across Node instances. It then publishes the model's existing
-Ready label together with `ome.io/artifact-<UID hash>` set to that request ID.
-The hash is the first 24 bytes of SHA-256 of the model UID, encoded as hex.
-An older Ready label alone is not acknowledgement of the new request. Each
+Ready label. The ConfigMap report acknowledges the request; an older Ready
+label alone is not acknowledgement of a new request. Each
 node reports independently; replaced models, replaced Nodes, or changed
 requests cannot complete an older attempt.
 
