@@ -83,7 +83,7 @@ def placement_sample($phase; $source; $isvcUID; $irUID; $uuid; $replacement):
   elif $phase == "paused-safe" then pp_paused_safe($source;$isvcUID;$irUID)
   elif $phase == "paused" then
     pp_paused_safe($source;$isvcUID;$irUID) and
-    (pp_node($source.node) | .maintenance.requested == true and .maintenanceDrainedAt == null and .omeGpuOccupantsPresent == true) and
+    (pp_node($source.node) | .maintenance.requested == true and .maintenanceDrainedAt == null and .omeAcceleratorOccupantsPresent == true) and
     (pp_cycle | any(.recommendations[]; .workload == "alfred-e2e/single" and .component == "engine" and
       .instance == $source.instance and .fromNode == $source.node and .policy == "nodehealth" and
       .reason == "NodeMaintenance" and .outcome == "advisory" and .advisoryReason == "OMENativeStateIneligible" and

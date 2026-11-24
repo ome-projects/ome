@@ -514,7 +514,7 @@ while (( SECONDS < request_deadline )); do
       if [[ -n "${node_record}" ]] && jq -e --arg scenario "${scenario}" '
         (if $scenario == "unhealthy-single" then .state == "Unhealthy" and .drainedAt == null
          else .maintenance.requested == true and .maintenanceDrainedAt == null end) and
-        .omeGpuOccupantsPresent == true' <<<"${node_record}" >/dev/null; then
+        .omeAcceleratorOccupantsPresent == true' <<<"${node_record}" >/dev/null; then
         echo "Holding replacement $(jq -r '.name' <<<"${replacement_json}") not-ready for ${surge_hold_seconds}s"
         if [[ "${scenario}" == "placement-pause-single" ]]; then placement_pause_allocated; fi
         hold_deadline=$((SECONDS + surge_hold_seconds))
@@ -554,7 +554,7 @@ while (( SECONDS < request_deadline )); do
           recommendations_cm="$("${kube[@]}" -n "${alfred_namespace}" get configmap alfred-recommendations -o json)"
           held_node_record="$(jq -r --arg key "node.${source_node}" '.data[$key] // empty' <<<"${recommendations_cm}")"
           if [[ -z "${held_node_record}" ]] || ! jq -e --arg scenario "${scenario}" '
-            .maintenanceDrainedAt == null and .omeGpuOccupantsPresent == true and
+            .maintenanceDrainedAt == null and .omeAcceleratorOccupantsPresent == true and
             ($scenario != "unhealthy-single" or .drainedAt == null)' \
             <<<"${held_node_record}" >/dev/null; then
             echo "Alfred reported the maintenance node drained while its source was serving" >&2
@@ -586,7 +586,7 @@ while (( SECONDS < request_deadline )); do
             heartbeat_node_record="$("${kube[@]}" -n "${alfred_namespace}" get configmap alfred-recommendations -o json |
               jq -r --arg key "node.${source_node}" '.data[$key] // empty')"
             if [[ -z "${heartbeat_node_record}" ]] || ! jq -e '
-              .drainedAt == null and .omeGpuOccupantsPresent == true' <<<"${heartbeat_node_record}" >/dev/null; then
+              .drainedAt == null and .omeAcceleratorOccupantsPresent == true' <<<"${heartbeat_node_record}" >/dev/null; then
               echo "Alfred reported the unhealthy node drained during held heartbeat observation" >&2; exit 1
             fi
             health_condition="$("${kube[@]}" get node "${source_node}" -o json |
@@ -737,7 +737,7 @@ while (( SECONDS < request_deadline )); do
        else .maintenance.requested == true and
        .maintenance.triggers == ["patching"] and
        .maintenanceRequestedAt != null and .maintenanceDrainedAt != null end) and
-       .omeGpuOccupantsPresent == false' <<<"${node_record}" >/dev/null &&
+       .omeAcceleratorOccupantsPresent == false' <<<"${node_record}" >/dev/null &&
      jq -e '.phase == "completed" and .completedAt != null' <<<"${dispatch_entry}" >/dev/null; then
     alfred_json="$(jq -cn --argjson recommendation "${recommendation_json}" \
       --argjson node "${node_record}" --argjson dispatch "${dispatch_entry}" \
@@ -749,7 +749,7 @@ while (( SECONDS < request_deadline )); do
         maintenanceRequestedAt:$node.maintenanceRequestedAt,
         maintenanceDrainedAt:$node.maintenanceDrainedAt,
         healthState:$node.state, signaledAt:$node.signaledAt, drainedAt:$node.drainedAt,
-        omeGPUOccupantsPresent:$node.omeGpuOccupantsPresent}')"
+        omeGPUOccupantsPresent:$node.omeAcceleratorOccupantsPresent}')"
     break
   fi
   sleep 1
