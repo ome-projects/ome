@@ -501,3 +501,17 @@ func TestBuildTPUPodsOccupyNodesWithoutGPUCapacity(t *testing.T) {
 		t.Fatalf("pending TPU pods entered GPU pending pressure: %+v", snap.PendingPods)
 	}
 }
+
+func TestBuildNodeReadsDefragmentationAnnotations(t *testing.T) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "tpu-0", Annotations: map[string]string{
+		DefragmentationFenceAnnotation: `{"drain":"d1"}`,
+		HoldCordonAnnotation:           "true",
+	}}}
+	got := buildNode(node, &Options{})
+	if got.DefragmentationFence != `{"drain":"d1"}` || !got.HoldCordon {
+		t.Fatalf("node = %+v", got)
+	}
+	if got := buildNode(&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "tpu-1"}}, &Options{}); got.DefragmentationFence != "" || got.HoldCordon {
+		t.Fatalf("unannotated node = %+v", got)
+	}
+}

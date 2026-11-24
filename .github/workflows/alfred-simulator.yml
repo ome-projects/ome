@@ -114,4 +114,4 @@ jobs:
           for test in hack/alfred-kind-e2e/*_test.sh; do
             bash "$test"
           done
-          go test -race -count=1 ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/simulator-barrier
+          go test -race -count=1 ./hack/alfred-kind-e2e/ir-status ./hack/alfred-kind-e2e/worker-result ./hack/alfred-kind-e2e/simulator-barrier ./hack/alfred-kind-e2e/slice-provider

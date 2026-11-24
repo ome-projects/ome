@@ -142,6 +142,11 @@ fi
 "${k[@]}" apply -f "${podgroup_crd}"
 "${k[@]}" wait --for=condition=Established crd/podgroups.scheduling.x-k8s.io --timeout=60s
 
+# The manager reads its TPU slice provisioning configuration at startup and
+# watches Slices, so the stand-in Slice CRD is established first as well.
+"${k[@]}" apply -f "${manifests}/slice-crd.yaml"
+"${k[@]}" wait --for=condition=Established crd/slices.accelerator.gke.io --timeout=60s
+
 "${h[@]}" upgrade --install ome-crd "${project_dir}/charts/ome-crd" \
   --namespace ome --create-namespace --wait --timeout 3m
 

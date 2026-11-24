@@ -372,39 +372,10 @@ func inCooldown(w *snapshot.Workload, cfg *config.Config, now time.Time) bool {
 	return now.Sub(*w.LastMigration) < cooldown
 }
 
-var weekdayNames = map[time.Weekday]string{
-	time.Monday: "Mon", time.Tuesday: "Tue", time.Wednesday: "Wed",
-	time.Thursday: "Thu", time.Friday: "Fri", time.Saturday: "Sat", time.Sunday: "Sun",
-}
-
 // maintenanceOpen reports whether defragmentation may dispatch now: no
 // windows means always, otherwise inside at least one weekly UTC window.
-// Window syntax is validated at config load.
 func maintenanceOpen(cfg *config.Config, now time.Time) bool {
-	if len(cfg.MaintenanceWindows) == 0 {
-		return true
-	}
-	utc := now.UTC()
-	day := weekdayNames[utc.Weekday()]
-	minute := utc.Hour()*60 + utc.Minute()
-	for _, w := range cfg.MaintenanceWindows {
-		dayMatch := false
-		for _, d := range w.Days {
-			if d == day {
-				dayMatch = true
-				break
-			}
-		}
-		if !dayMatch {
-			continue
-		}
-		start, _ := time.Parse("15:04", w.Start)
-		end, _ := time.Parse("15:04", w.End)
-		if minute >= start.Hour()*60+start.Minute() && minute < end.Hour()*60+end.Minute() {
-			return true
-		}
-	}
-	return false
+	return cfg.MaintenanceWindowOpen(now)
 }
 
 // rankCandidates orders by FinalScore descending, breaking ties toward the

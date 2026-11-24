@@ -19,6 +19,14 @@ func (h NodeHealthObservation) Quarantined() bool {
 	return h.State != "" && h.State != NodeHealthClear
 }
 
+// ObserveNodeHealth classifies a live node's health from its conditions, as a
+// snapshot build does. Empty triggerConditions and a non-positive
+// suspicionWindow take the snapshot defaults.
+func ObserveNodeHealth(node *corev1.Node, triggerConditions []string, now time.Time, suspicionWindow time.Duration) NodeHealthObservation {
+	opts := Options{TriggerConditions: triggerConditions, NodeSuspicionWindow: suspicionWindow}
+	return observeNodeHealth(node.Status.Conditions, opts.triggerConditions(), now, opts.nodeSuspicionWindow())
+}
+
 func observeNodeHealth(
 	conditions []corev1.NodeCondition,
 	triggerConditions []string,

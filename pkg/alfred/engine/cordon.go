@@ -78,13 +78,8 @@ func (c *MaintenanceCordoner) reconcile(ctx context.Context, snap *snapshot.Clus
 		return nil
 	}
 	triggers := cfg.Policies.NodeHealth.Maintenance.Triggers
-	cordonRules := map[string]bool{}
-	for _, t := range triggers {
-		if t.Cordon {
-			cordonRules[t.Name] = true
-		}
-	}
-	if len(cordonRules) == 0 {
+	rules := cordonRules(triggers)
+	if len(rules) == 0 {
 		return nil
 	}
 	names := make([]string, 0, len(snap.Nodes))
@@ -97,12 +92,12 @@ func (c *MaintenanceCordoner) reconcile(ctx context.Context, snap *snapshot.Clus
 		node := snap.Nodes[name]
 		rule := ""
 		if node != nil && !node.Cordoned {
-			rule = cordonRule(node.Maintenance, cordonRules)
+			rule = cordonRule(node.Maintenance, rules)
 		}
 		if rule == "" {
 			continue
 		}
-		if err := c.cordon(ctx, name, node.UID, triggers, cordonRules); err != nil {
+		if err := c.cordon(ctx, name, node.UID, triggers, rules); err != nil {
 			err = fmt.Errorf("cordon node %s for maintenance rule %q: %w", name, rule, err)
 			if apierrors.IsConflict(err) {
 				// The node changed after the read; the next pass reads it again.
@@ -116,7 +111,7 @@ func (c *MaintenanceCordoner) reconcile(ctx context.Context, snap *snapshot.Clus
 	return errors.Join(failed...)
 }
 
-func (c *MaintenanceCordoner) cordon(ctx context.Context, name string, uid types.UID, triggers []config.MaintenanceTrigger, cordonRules map[string]bool) error {
+func (c *MaintenanceCordoner) cordon(ctx context.Context, name string, uid types.UID, triggers []config.MaintenanceTrigger, rules map[string]bool) error {
 	reader := c.Reader
 	if reader == nil {
 		reader = c.Client
@@ -133,7 +128,7 @@ func (c *MaintenanceCordoner) cordon(ctx context.Context, name string, uid types
 	if live.UID != uid || live.Spec.Unschedulable || !live.DeletionTimestamp.IsZero() {
 		return nil
 	}
-	rule := cordonRule(snapshot.ObserveNodeMaintenance(&live, triggers, c.now()), cordonRules)
+	rule := cordonRule(snapshot.ObserveNodeMaintenance(&live, triggers, c.now()), rules)
 	if rule == "" {
 		return nil
 	}

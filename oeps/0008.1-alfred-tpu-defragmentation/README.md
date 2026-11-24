@@ -340,6 +340,8 @@ on it. The policy derives, per cluster and per TPU pod:
 The TPU pod comes from a node label (`tpuSlicePartitions.podLabel`, new). On
 GKE, `cloud.google.com/gce-topology-block` takes one value per TPU pod, and
 `cloud.google.com/gce-topology-subblock` equals the host's `4x4x4` partition id.
+Hosts without the label are left out of planning and of the gauges, because
+they may belong to different TPU pods.
 
 Alfred does not read slice objects, and this policy does not need to. Today's
 TPU move check treats a host with no slice label and no accelerator pod as free;
@@ -404,7 +406,8 @@ deadline with it.
 The prediction copies slice-scheduler's documented rule for shapes up to one
 cube. Among wholly free partitions of the Instance's shape outside the fence, it
 takes the one whose largest wholly free ancestor is smallest; ties go to the
-lowest partition id. It places the drain's Instances largest shape first, each
+lowest partition id. It places the drain's Instances in the order their moves
+are submitted (the cube with the fewest moves left first, then by name), each
 against the state the previous placements left.
 
 The prediction covers every TPU pod in the cluster that the Instance's pods can
@@ -421,13 +424,16 @@ the drain, and against the observed slice after each move.
 ### Running a drain
 
 1. **Fence.** The fencer cordons every host of the drain's cubes and writes the
-   annotation. A failed cordon ends that drain before any move. It does not
+   annotation. It fences only when a migration API is configured, since
+   otherwise no move could follow. A failed cordon ends that drain before any
+   move. It does not
    block other dispatch: unlike the maintenance cordon, a missing defragmentation
    fence only means no drain move is emitted.
 2. **Prove the fence.** The policy emits move candidates for a drain only when
-   the snapshot shows every host of it cordoned with the annotation, and at
-   least `fenceSettleSeconds` (default 60) have passed since the latest fence
-   time recorded in those annotations. The clock therefore survives restarts.
+   the snapshot shows every host of it cordoned with the annotation, every cube
+   that still holds a slice has all its hosts, and at least
+   `fenceSettleSeconds` (default 60) have passed since the latest fence time
+   recorded in those annotations. The clock therefore survives restarts.
    The settle interval covers the partition-tree controller copying the taint.
    `TBD`: read the partition objects' taints directly instead (Open Question 4).
 3. **Emit candidates.** Each pass emits one candidate per remaining Instance,
@@ -440,6 +446,8 @@ the drain, and against the observed slice after each move.
    records it; two such outcomes in one TPU pod start the backoff.
 5. **Release cubes as they empty.** When no slice is left on a cube, the fencer
    removes that cube's fence at once, without waiting for the rest of the drain.
+   An emptied cube is only ever released: if part of a release fails, its other
+   hosts are not fenced again.
 
 ### Removing the fence
 
@@ -448,9 +456,11 @@ A drain ends when any of these happens:
 - every cube in it is empty (success);
 - its deadline passes (`drainDeadlineMinutes`, default 240), or the maintenance
   window that opened it closes, whichever comes first;
-- a replacement lands inside the fence;
+- a replacement lands inside the fence, or someone uncordons a fenced host
+  (both end it as `fence_not_honored` and start the backoff);
 - a cordon fails during fencing;
-- the mode leaves `execute`, or the policy is disabled.
+- the mode leaves `execute`, the policy is disabled, or no migration API is
+  configured.
 
 When a drain ends, the fencer visits every host that still carries its
 annotation:
@@ -463,6 +473,11 @@ annotation:
 - **Hold** if the host carries `alfred.ome.io/hold-cordon`. The fencer removes
   its annotation and leaves the cordon to the operator.
 - **Uncordon** otherwise, and remove the annotation.
+
+When the fence was not honored, the hosts that show it are released last,
+after every other host. They are the only record of that outcome, so a
+partial release leaves them in place, and the next pass ends the drain again
+instead of fencing the released hosts.
 
 *Failure mode this leaves open:* a plain `kubectl cordon` on a host that is
 already fenced changes nothing on the node, so Alfred cannot see it, and

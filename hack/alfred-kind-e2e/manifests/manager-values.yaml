@@ -27,6 +27,27 @@ ome:
       limits:
         cpu: "1"
         memory: 1Gi
+    # Only the tpu-defrag fixture's virtual TPU nodes carry the provisionOnly
+    # label, so no other fixture is provisioned a slice.
+    tpuSliceProvisioning:
+      chipResource: google.com/tpu
+      nodeLabels:
+        accelerator: cloud.google.com/gke-tpu-accelerator
+        topology: cloud.google.com/gke-tpu-topology
+        slice: cloud.google.com/gke-tpu-slice
+      provisionOnly:
+        key: cloud.google.com/gke-accelerator-topology-mode
+        value: PROVISION_ONLY
+      accelerators:
+        tpu7x:
+          sliceType: tpu7x
+          chipsPerHost: 4
+          topologies: ["2x2x1"]
+      slice:
+        ownerKindLabel: cloud.google.com/slice-owner-kind
+        ownerNameLabel: cloud.google.com/slice-owner-name
+        annotations: {}
+        readyStates: [ACTIVE]
 
 modelAgent:
   enabled: false
