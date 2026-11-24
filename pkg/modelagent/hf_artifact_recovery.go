@@ -15,7 +15,7 @@ import (
 
 // Cleanup cannot treat a lost ConfigMap as proof that ownership is absent.
 // Restore trusted cached state before Delete can evict its last cleanup receipt.
-func (c *ConfigMapReconciler) getConfigMapForHfArtifactCleanup(ctx context.Context) (*corev1.ConfigMap, error) {
+func (c *ConfigMapReconciler) getConfigMapForArtifactCleanup(ctx context.Context) (*corev1.ConfigMap, error) {
 	cm, err := c.getConfigMap(ctx)
 	if !apierrors.IsNotFound(err) {
 		return cm, err
@@ -98,7 +98,7 @@ func (c *ConfigMapReconciler) cacheCommittedModelEntryLocked(before, after map[s
 		entry = *current
 	}
 	raw := after[key]
-	if model.Status != ModelStatusEvicted && model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.HfArtifactPendingDownload == nil && entry.ModelEntryJSON == "" {
+	if model.Status != ModelStatusEvicted && model.HfArtifactKey == "" && model.HfArtifactPendingDeletion == nil && model.HfArtifactPendingDownload == nil && model.DirectPendingDeletion == nil && entry.ModelEntryJSON == "" {
 		// Live residency validation can suppress a cached Ready entry during
 		// reconstruction. Keep the typed cache aligned with that committed state.
 		if c.artifactModelClient != nil && c.modelCache[key] != nil && before[key] != raw {
@@ -207,6 +207,9 @@ func (c *ConfigMapReconciler) cachedConfigMapEntries() (map[string]string, map[s
 // but must not erase a known shared relationship or interrupted cleanup receipt.
 func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]string, key string) error {
 	child, childErr := existingModelEntry(data, key)
+	if childErr == nil && child.DirectPendingDeletion != nil {
+		return fmt.Errorf("model %s has unfinished Direct cleanup", key)
+	}
 	for parentKey, raw := range data {
 		if !isHfArtifactConfigMapKey(parentKey) {
 			continue
@@ -228,7 +231,8 @@ func (c *ConfigMapReconciler) validateHfArtifactChildMutation(data map[string]st
 	}
 	if cached.HfArtifactKey != "" && (childErr != nil || child.HfArtifactKey == "") ||
 		cached.HfArtifactPendingDownload != nil && (childErr != nil || child.HfArtifactPendingDownload == nil) ||
-		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) {
+		cached.HfArtifactPendingDeletion != nil && (childErr != nil || child.HfArtifactPendingDeletion == nil) ||
+		cached.DirectPendingDeletion != nil && (childErr != nil || child.DirectPendingDeletion == nil) {
 		return fmt.Errorf("shared artifact state for model %s requires reconciliation", key)
 	}
 	return nil

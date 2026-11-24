@@ -57,7 +57,7 @@ func (r *HfArtifactRepository) rememberDownload(ctx context.Context, input hfArt
 }
 
 func (r *HfArtifactRepository) pendingDownload(ctx context.Context, key string) (*HfArtifactPendingDownload, error) {
-	cm, err := r.configMaps.getConfigMapForHfArtifactCleanup(ctx)
+	cm, err := r.configMaps.getConfigMapForArtifactCleanup(ctx)
 	if err != nil {
 		return nil, err
 	}

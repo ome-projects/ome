@@ -94,6 +94,8 @@ type ModelEntry struct {
 	HfArtifactPendingDeletion *HfArtifactPendingDeletion `json:"hfArtifactPendingDeletion,omitempty"`
 	// Initial downloads retain their destination before a Ready reference exists.
 	HfArtifactPendingDownload *HfArtifactPendingDownload `json:"hfArtifactPendingDownload,omitempty"`
+	// Direct cleanup retains its original destination until file and status cleanup finish.
+	DirectPendingDeletion *DirectPendingDeletion `json:"directPendingDeletion,omitempty"`
 	// Pins artifact ownership and residency reports to this Model CR instance.
 	ModelUID              types.UID `json:"modelUID,omitempty"`
 	ArtifactRehydrationID string    `json:"artifactRehydrationID,omitempty"`

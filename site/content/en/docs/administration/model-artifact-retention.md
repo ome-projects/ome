@@ -68,6 +68,23 @@ The readiness label is `models.ome.io/clusterbasemodel.<name>` or
 `models.ome.io/<namespace>.basemodel.<name>`. The status ConfigMap is named after
 the node, in the agent's namespace (default `ome`).
 
+## Resuming interrupted Direct deletion
+
+For independent directories downloaded from `hf://` or `oci://`, the agent
+records the model UID, source, cleanup path and cleanup stage in the
+node ConfigMap before removing files. Readiness is withdrawn before file
+cleanup, and the record remains until status cleanup succeeds.
+
+After restart, existing model resources with pending cleanup resume deletion,
+including models that no longer match this node's placement. If the model is
+eligible again, committed cleanup finishes before a new download uses the path.
+File removal can be repeated after interruption; a completed file stage resumes
+only status cleanup. Existing reference and reserve-label checks still apply.
+
+Cleanup refuses a record whose UID, source or destination no longer matches.
+This recovery does not discover orphan records after the Model CR has disappeared.
+Shared artifact cleanup continues to use its existing recovery mechanism.
+
 ## Storage backends the agent never deletes
 
 File deletion applies to models the agent downloaded itself, i.e. `oci://`,

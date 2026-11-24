@@ -636,7 +636,7 @@ func TestHfArtifactCancellationSurvivesConfigMapLoss(t *testing.T) {
 	interruptTestHfArtifactDownload(t, h, input)
 	c := s.configMapReconciler
 	require.NoError(t, c.kubeClient.CoreV1().ConfigMaps(c.namespace).Delete(context.Background(), c.nodeName, metav1.DeleteOptions{}))
-	_, err := c.getConfigMapForHfArtifactCleanup(context.Background())
+	_, err := c.getConfigMapForArtifactCleanup(context.Background())
 	require.NoError(t, err)
 	parent := testRepairParent(t, h, input)
 	require.Equal(t, HfArtifactStatusUpdating, parent.Status)

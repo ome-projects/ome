@@ -108,7 +108,11 @@ func NewScout(ctx context.Context, nodeName string,
 
 	// Capture cleanup intents before workers start. Replay only initial Add
 	// events so subsequent placement updates retain informer delivery order.
-	startupCleanup := make(map[string]bool)
+	type startupCleanupIntent struct {
+		shared    bool
+		directUID string
+	}
+	startupCleanup := make(map[string]startupCleanupIntent)
 	cm, err := configMapReconciler.getConfigMap(ctx)
 	if err != nil && !errors.IsNotFound(err) {
 		return nil, fmt.Errorf("read startup shared artifact cleanup: %w", err)
@@ -124,7 +128,9 @@ func NewScout(ctx context.Context, nodeName string,
 				continue
 			}
 			if entry.HfArtifactPendingDeletion != nil || entry.HfArtifactPendingDownload != nil {
-				startupCleanup[key] = true
+				startupCleanup[key] = startupCleanupIntent{shared: true}
+			} else if entry.DirectPendingDeletion != nil {
+				startupCleanup[key] = startupCleanupIntent{directUID: string(entry.DirectPendingDeletion.ModelUID)}
 			}
 		}
 	}
@@ -159,8 +165,13 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := baseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
 		AddFunc: func(obj interface{}, initial bool) {
 			model, ok := obj.(*v1beta1.BaseModel)
-			if ok && initial && model.DeletionTimestamp.IsZero() && startupCleanup[getModelID(model, nil)] {
-				if scout.replayStartupCleanup(&GopherTask{TaskType: Delete, BaseModel: model, NodeIneligible: true, SharedArtifact: true}) {
+			var intent startupCleanupIntent
+			var cleanup bool
+			if ok {
+				intent, cleanup = startupCleanup[getModelID(model, nil)]
+			}
+			if ok && initial && model.DeletionTimestamp.IsZero() && cleanup && (intent.shared || intent.directUID != "" && intent.directUID == string(model.UID)) {
+				if scout.replayStartupCleanup(&GopherTask{TaskType: Delete, BaseModel: model, NodeIneligible: true, SharedArtifact: intent.shared}) {
 					return
 				}
 			}
@@ -175,8 +186,13 @@ func NewScout(ctx context.Context, nodeName string,
 	if _, err := clusterBaseModelInformer.Informer().AddEventHandler(cache.ResourceEventHandlerDetailedFuncs{
 		AddFunc: func(obj interface{}, initial bool) {
 			model, ok := obj.(*v1beta1.ClusterBaseModel)
-			if ok && initial && model.DeletionTimestamp.IsZero() && startupCleanup[getModelID(nil, model)] {
-				if scout.replayStartupCleanup(&GopherTask{TaskType: Delete, ClusterBaseModel: model, NodeIneligible: true, SharedArtifact: true}) {
+			var intent startupCleanupIntent
+			var cleanup bool
+			if ok {
+				intent, cleanup = startupCleanup[getModelID(nil, model)]
+			}
+			if ok && initial && model.DeletionTimestamp.IsZero() && cleanup && (intent.shared || intent.directUID != "" && intent.directUID == string(model.UID)) {
+				if scout.replayStartupCleanup(&GopherTask{TaskType: Delete, ClusterBaseModel: model, NodeIneligible: true, SharedArtifact: intent.shared}) {
 					return
 				}
 			}
@@ -200,7 +216,7 @@ func (w *Scout) replayStartupCleanup(task *GopherTask) bool {
 	if w.shouldDownloadModel(taskModelSpec(task).Storage) {
 		return false
 	}
-	w.logger.Infof("Resuming shared artifact cleanup for ineligible model %s", getModelInfoForLogging(task))
+	w.logger.Infof("Resuming artifact cleanup for ineligible model %s", getModelInfoForLogging(task))
 	w.gopherChan <- task
 	return true
 }

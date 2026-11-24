@@ -550,6 +550,36 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 		}
 	}
 
+	// Finish a committed Direct cleanup before a newer download can publish
+	// Updating or replace the same path, including an eligible model at restart.
+	if (task.TaskType == Download || task.TaskType == DownloadOverride) && hasEvictableArtifactSource(task) {
+		pending, err := s.loadDirectDeletionRecord(ctx, task)
+		if err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if strings.HasPrefix(*baseModelSpec.Storage.StorageUri, storage.HuggingFaceStoragePrefix) {
+				s.recordDirectHfDownloadFailure(ctx, task, err)
+			}
+			return err
+		}
+		if pending != nil {
+			cleanup := *task
+			cleanup.TaskType, cleanup.NodeIneligible = Delete, true
+			kind, err := storage.GetStorageType(pending.SourceURI)
+			if err != nil {
+				return err
+			}
+			waiting, err := s.processDirectModelDelete(ctx, &cleanup, kind)
+			if err != nil {
+				return err
+			}
+			if waiting {
+				return s.requeueTaskOnWait(task, gopherTaskWait)
+			}
+		}
+	}
+
 	// For Download and DownloadOverride tasks, set the node label to "Updating"
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
 		s.logger.Infof("Setting model %s status to Updating before download", modelInfo)
@@ -704,12 +734,7 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 				return ctx.Err()
 			}
 			if err != nil {
-				if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") {
-					s.logger.Warnf("Rate limited while downloading Hugging Face model %s: %v", modelInfo, err)
-					s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second) // Preserve the existing estimated wait.
-				}
-				s.metrics.RecordFailedDownload(modelType, namespace, name, "download_error")
-				s.markModelOnNodeFailed(ctx, task)
+				s.recordDirectHfDownloadFailure(ctx, task, err)
 				return err
 			}
 			if waiting {
@@ -781,160 +806,18 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 			return nil
 		}
 		if !sharedDeletionHandled {
-			// Shared handling can fall back to the Direct deletion path.
-			if isDirectFileStorageType(storageType) {
-				acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
-				if err != nil {
-					return err
-				}
-				if !acquired {
-					err := s.requeueTaskOnWait(task, gopherTaskWait)
-					keepDeleteBarrier = err == nil
-					return err
-				}
-				if s.isTaskModelReplaced(task) {
-					return nil
-				}
-			}
-			// Keep the child entry until file cleanup succeeds. Ready withdrawal
-			// and status publication use the same mutex as download completion.
-			err = func() error {
-				s.configMapMutex.Lock()
-				defer s.configMapMutex.Unlock()
-				validateUID := func() error {
-					if err := ctx.Err(); err != nil {
-						return err
-					}
-					if s.isTaskModelReplaced(task) {
-						return fmt.Errorf("deletion model UID changed")
-					}
-					if s.omeClient != nil {
-						current, err := liveArtifactModel(ctx, s.omeClient, task)
-						if apierrors.IsNotFound(err) {
-							return nil
-						}
-						if err != nil {
-							return err
-						}
-						if getModelUID(current) != getModelUID(task) {
-							return fmt.Errorf("deletion model UID changed")
-						}
-					}
-					return nil
-				}
-				if err := validateUID(); err != nil {
-					return err
-				}
-				if isDirectFileStorageType(storageType) {
-					if err := s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
-						BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel, ModelStatus: ModelStatusUpdating,
-					}); err != nil {
-						return err
-					}
-				}
-				return s.nodeLabelReconciler.ReconcileNodeLabels(&NodeLabelOp{
-					BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel,
-					ModelStateOnNode: Deleted, requireNodeCAS: isDirectFileStorageType(storageType) || s.omeClient != nil, validateReady: validateUID,
-				})
-			}()
+			waiting, err := s.processDirectModelDelete(ctx, task, storageType)
 			if err != nil {
 				return err
 			}
-			switch storageType {
-			case storage.StorageTypeOCI, storage.StorageTypeModelPack:
-				s.logger.Infof("Starting deletion for model %s", modelInfo)
-				destPath := getDestPath(&baseModelSpec, s.modelRootDir)
-				// check if it needs to skip artifact deletion
-				isSkippingDeletion, _, _, _ := s.isSkippingArtifactDeletion(ctx, task, destPath, false)
-				if !isSkippingDeletion {
-					err = s.deleteModel(destPath, task)
-					if err != nil {
-						s.logger.Errorf("Failed to delete model %s: %v", modelInfo, err)
-						return err
-					}
-					if task.BaseModel != nil {
-						s.logger.Infof("Successfully deleted the BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
-					} else {
-						s.logger.Infof("Successfully deleted the ClusterBaseModel %s", task.ClusterBaseModel.Name)
-					}
-				}
-			case storage.StorageTypeVendor:
-				s.logger.Infof("Skipping deletion for model %s", modelInfo)
-			case storage.StorageTypeHuggingFace:
-				s.logger.Infof("Removing Hugging Face model %s", modelInfo)
-				if !s.isModelRemovalConfirmed(task) {
-					s.logger.Warnf("Keeping files of Hugging Face model %s because it is not being deleted and was not moved off this node", modelInfo)
-					break
-				}
-				// Use getDestPath to get the same path used during download
-				destPath := getDestPath(&baseModelSpec, s.modelRootDir)
-
-				// check if it needs to skip artifact deletion
-				isSkippingDeletion, isRemoveParent, parentName, parentDir := s.isSkippingArtifactDeletion(ctx, task, destPath, true)
-
-				if !isSkippingDeletion {
-					err = s.deleteModel(destPath, task)
-					if err != nil {
-						s.logger.Errorf("Failed to delete Hugging Face model %s: %v", modelInfo, err)
-						return err
-					}
-					s.logger.Infof("Successfully deleted Hugging Face model %s", modelInfo)
-				} else {
-					s.logger.Infof("model %s artifact deletion will be skipped", modelInfo)
-				}
-				if isRemoveParent && parentName != "" && parentDir != "" {
-					acquired, err := s.tryLockDirectModelPath(ctx, parentDir)
-					if err != nil {
-						return err
-					}
-					if !acquired {
-						err := s.requeueTaskOnWait(task, gopherTaskWait)
-						keepDeleteBarrier = err == nil
-						return err
-					}
-					// A parent writer may have completed since the first lookup.
-					referenced, err := s.isPathReferencedByOtherModels(parentDir, nil, nil)
-					if err != nil {
-						s.logger.Warnf("Cannot check references for parent model artifact directory %s: %v", parentDir, err)
-						break
-					}
-					if referenced {
-						break
-					}
-					if !s.isRemoveParentArtifactDirectory(ctx, false, parentName, parentDir) {
-						break
-					}
-					// check whether the parent directory still has other directory points to it using symbolic link
-					isParentHasSymbolicLinkPointedTo, symbolicLinkSearchErr := utils.HasSymlinkPointingToDir(s.modelRootDir, parentDir)
-					if symbolicLinkSearchErr != nil {
-						s.logger.Infof("fails to search for the SymbolicLink pointing to parent Dir %s: %v. will regard the parent is still being pointed conservatively", parentDir, symbolicLinkSearchErr)
-						isParentHasSymbolicLinkPointedTo = true
-					}
-					s.logger.Infof("parent %s:%s has other directory points to: %v", parentName, parentDir, isParentHasSymbolicLinkPointedTo)
-					if !isParentHasSymbolicLinkPointedTo {
-						err = s.deleteModel(parentDir, nil)
-						if err != nil {
-							s.logger.Errorf("fail to delete parent model artifact directory %s: %s", parentName, parentDir)
-						}
-						s.logger.Infof("Successfully delete parent model artifact directory %s: %s", parentName, parentDir)
-					}
-				} else {
-					s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
-				}
-			case storage.StorageTypeLocal:
-				s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)
-				// For local storage, we should NOT delete the actual files
-				// Just update the node labels and ConfigMap to reflect removal
-			case storage.StorageTypePVC:
-				s.logger.Infof("Skipping deletion for PVC storage model %s (handled by BaseModel controller)", modelInfo)
-				// PVC storage is handled entirely by the BaseModel controller
-				// Model agent doesn't delete PVC volumes
-			default:
-				s.logger.Warnf("Unsupported storage type %s for deletion of model %s", storageType, modelInfo)
+			if waiting {
+				err = s.requeueTaskOnWait(task, gopherTaskWait)
+				keepDeleteBarrier = err == nil
 			}
+			return err
 		}
 
-		// Both paths withdrew Ready before file cleanup. Remove the child entry
+		// Shared cleanup withdrew Ready before touching files. Remove the child entry
 		// only after cleanup succeeds, serialized with readiness publication.
 		s.configMapMutex.Lock()
 		err = ctx.Err()
@@ -951,6 +834,202 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 	}
 
 	return nil
+}
+
+// processDirectModelDelete retains the cleanup receipt until both file removal
+// and its final ConfigMap write succeed. Non-file backends keep their no-op policy.
+func (s *Gopher) processDirectModelDelete(ctx context.Context, task *GopherTask, kind storage.StorageType) (bool, error) {
+	if isDirectFileStorageType(kind) {
+		spec := taskModelSpec(task)
+		acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&spec, s.modelRootDir))
+		if err != nil {
+			return false, err
+		}
+		if !acquired {
+			return true, nil
+		}
+		if s.isTaskModelReplaced(task) {
+			return false, nil
+		}
+	}
+	var pending *DirectPendingDeletion
+	err := func() error {
+		s.configMapMutex.Lock()
+		defer s.configMapMutex.Unlock()
+		validateUID := func() error {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if s.isTaskModelReplaced(task) {
+				return fmt.Errorf("deletion model UID changed")
+			}
+			if s.omeClient != nil {
+				current, err := liveArtifactModel(ctx, s.omeClient, task)
+				if apierrors.IsNotFound(err) {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if getModelUID(current) != getModelUID(task) {
+					return fmt.Errorf("deletion model UID changed")
+				}
+				if pending != nil {
+					return s.validateDirectDeletion(current, *pending)
+				}
+			}
+			return nil
+		}
+		if err := validateUID(); err != nil {
+			return err
+		}
+		var err error
+		pending, err = s.rememberDirectDeletion(ctx, task)
+		if err != nil {
+			return err
+		}
+		if pending == nil && isDirectFileStorageType(kind) {
+			if err := s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
+				BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel, ModelStatus: ModelStatusUpdating,
+			}); err != nil {
+				return err
+			}
+		}
+		return s.nodeLabelReconciler.ReconcileNodeLabels(&NodeLabelOp{
+			BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel,
+			ModelStateOnNode: Deleted, requireNodeCAS: isDirectFileStorageType(kind) || s.omeClient != nil, validateReady: validateUID,
+		})
+	}()
+	if err != nil {
+		return false, err
+	}
+	if pending == nil || pending.Phase == directFilesPending {
+		waiting, err := s.cleanupModelFilesForDelete(ctx, task, kind)
+		if waiting || err != nil {
+			return waiting, err
+		}
+		if pending != nil {
+			if err := s.updateDirectDeletionRecord(ctx, task, pending, false); err != nil {
+				return false, err
+			}
+			pending.Phase = directStatusPending
+		}
+	}
+	s.configMapMutex.Lock()
+	defer s.configMapMutex.Unlock()
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	if pending == nil {
+		return false, s.configMapReconciler.DeleteModelFromConfigMap(ctx, task.BaseModel, task.ClusterBaseModel)
+	}
+	if err := s.updateDirectDeletionRecord(ctx, task, pending, true); err != nil {
+		return false, err
+	}
+	if isModelResourceDeleting(task.BaseModel, task.ClusterBaseModel) {
+		s.configMapReconciler.invalidateModelUIDAndEvictCache(getModelID(task.BaseModel, task.ClusterBaseModel), pending.ModelUID)
+	}
+	return false, nil
+}
+
+// Keep the existing reference and reservation policy for Direct file removal.
+func (s *Gopher) cleanupModelFilesForDelete(ctx context.Context, task *GopherTask, storageType storage.StorageType) (bool, error) {
+	baseModelSpec := taskModelSpec(task)
+	modelInfo := getModelInfoForLogging(task)
+	// Shared handling can fall back to the Direct deletion path.
+	var err error
+	switch storageType {
+	case storage.StorageTypeOCI, storage.StorageTypeModelPack:
+		s.logger.Infof("Starting deletion for model %s", modelInfo)
+		destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+		// check if it needs to skip artifact deletion
+		isSkippingDeletion, _, _, _ := s.isSkippingArtifactDeletion(ctx, task, destPath, false)
+		if !isSkippingDeletion {
+			err = s.deleteModel(destPath, task)
+			if err != nil {
+				s.logger.Errorf("Failed to delete model %s: %v", modelInfo, err)
+				return false, err
+			}
+			if task.BaseModel != nil {
+				s.logger.Infof("Successfully deleted the BaseModel %s in namespace %s", task.BaseModel.Name, task.BaseModel.Namespace)
+			} else {
+				s.logger.Infof("Successfully deleted the ClusterBaseModel %s", task.ClusterBaseModel.Name)
+			}
+		}
+	case storage.StorageTypeVendor:
+		s.logger.Infof("Skipping deletion for model %s", modelInfo)
+	case storage.StorageTypeHuggingFace:
+		s.logger.Infof("Removing Hugging Face model %s", modelInfo)
+		if !s.isModelRemovalConfirmed(task) {
+			s.logger.Warnf("Keeping files of Hugging Face model %s because it is not being deleted and was not moved off this node", modelInfo)
+			break
+		}
+		// Use getDestPath to get the same path used during download
+		destPath := getDestPath(&baseModelSpec, s.modelRootDir)
+
+		// check if it needs to skip artifact deletion
+		isSkippingDeletion, isRemoveParent, parentName, parentDir := s.isSkippingArtifactDeletion(ctx, task, destPath, true)
+
+		if !isSkippingDeletion {
+			err = s.deleteModel(destPath, task)
+			if err != nil {
+				s.logger.Errorf("Failed to delete Hugging Face model %s: %v", modelInfo, err)
+				return false, err
+			}
+			s.logger.Infof("Successfully deleted Hugging Face model %s", modelInfo)
+		} else {
+			s.logger.Infof("model %s artifact deletion will be skipped", modelInfo)
+		}
+		if isRemoveParent && parentName != "" && parentDir != "" {
+			acquired, err := s.tryLockDirectModelPath(ctx, parentDir)
+			if err != nil {
+				return false, err
+			}
+			if !acquired {
+				return true, nil
+			}
+			// A parent writer may have completed since the first lookup.
+			referenced, err := s.isPathReferencedByOtherModels(parentDir, nil, nil)
+			if err != nil {
+				s.logger.Warnf("Cannot check references for parent model artifact directory %s: %v", parentDir, err)
+				break
+			}
+			if referenced {
+				break
+			}
+			if !s.isRemoveParentArtifactDirectory(ctx, false, parentName, parentDir) {
+				break
+			}
+			// check whether the parent directory still has other directory points to it using symbolic link
+			isParentHasSymbolicLinkPointedTo, symbolicLinkSearchErr := utils.HasSymlinkPointingToDir(s.modelRootDir, parentDir)
+			if symbolicLinkSearchErr != nil {
+				s.logger.Infof("fails to search for the SymbolicLink pointing to parent Dir %s: %v. will regard the parent is still being pointed conservatively", parentDir, symbolicLinkSearchErr)
+				isParentHasSymbolicLinkPointedTo = true
+			}
+			s.logger.Infof("parent %s:%s has other directory points to: %v", parentName, parentDir, isParentHasSymbolicLinkPointedTo)
+			if !isParentHasSymbolicLinkPointedTo {
+				err = s.deleteModel(parentDir, nil)
+				if err != nil {
+					s.logger.Errorf("Failed to delete parent model artifact directory %s: %v", parentDir, err)
+					return false, err
+				}
+				s.logger.Infof("Successfully delete parent model artifact directory %s: %s", parentName, parentDir)
+			}
+		} else {
+			s.logger.Infof("no need to delete parent model artifact directory %s: %s", parentName, parentDir)
+		}
+	case storage.StorageTypeLocal:
+		s.logger.Infof("Skipping deletion for local storage model %s (local files should not be deleted)", modelInfo)
+		// For local storage, we should NOT delete the actual files
+		// Just update the node labels and ConfigMap to reflect removal
+	case storage.StorageTypePVC:
+		s.logger.Infof("Skipping deletion for PVC storage model %s (handled by BaseModel controller)", modelInfo)
+		// PVC storage is handled entirely by the BaseModel controller
+		// Model agent doesn't delete PVC volumes
+	default:
+		s.logger.Warnf("Unsupported storage type %s for deletion of model %s", storageType, modelInfo)
+	}
+	return false, nil
 }
 
 func (s *Gopher) demoteToNormalPriority(task *GopherTask) {
@@ -2101,4 +2180,15 @@ func (s *Gopher) isRemoveParentArtifactDirectory(ctx context.Context, hasChildre
 	}
 	s.logger.Infof("parent entry %s:%s exists on node configmap: %v", parentName, parentDir, exists)
 	return !exists
+}
+
+// Receipt admission and source execution retain the same HF failure metrics.
+func (s *Gopher) recordDirectHfDownloadFailure(ctx context.Context, task *GopherTask, err error) {
+	modelType, namespace, name := GetModelTypeNamespaceAndName(task)
+	if strings.Contains(err.Error(), "429") || strings.Contains(strings.ToLower(err.Error()), "rate limit") {
+		s.logger.Warnf("Rate limited while downloading Hugging Face model %s: %v", getModelInfoForLogging(task), err)
+		s.metrics.RecordRateLimit(modelType, namespace, name, 30*time.Second)
+	}
+	s.metrics.RecordFailedDownload(modelType, namespace, name, "download_error")
+	s.markModelOnNodeFailed(ctx, task)
 }

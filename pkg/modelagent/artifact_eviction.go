@@ -284,7 +284,7 @@ func (s *Gopher) processArtifactEviction(ctx context.Context, task *GopherTask) 
 	key := getModelID(task.BaseModel, task.ClusterBaseModel)
 	cm, err := s.configMapReconciler.getConfigMapForRecovery(ctx)
 	if apierrors.IsNotFound(err) {
-		cm, err = s.configMapReconciler.getConfigMapForHfArtifactCleanup(ctx)
+		cm, err = s.configMapReconciler.getConfigMapForArtifactCleanup(ctx)
 	}
 	if err != nil {
 		return false, err
