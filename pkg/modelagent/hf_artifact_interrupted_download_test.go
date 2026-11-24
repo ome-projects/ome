@@ -83,6 +83,7 @@ func TestHfArtifactInterruptedDownloadDeleteUsesOriginalIdentity(t *testing.T) {
 			s.routeArtifactTaskLocked(task)
 			s.artifactRouting.mutex.Unlock()
 			for attempt := 0; attempt < 2; attempt++ {
+				enableTestSharedDeletion(t, s)
 				handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 				require.NoError(t, err)
 				require.True(t, handled)
@@ -116,12 +117,14 @@ func TestHfArtifactInterruptedDownloadDeleteRetriesParentRemoval(t *testing.T) {
 		return false, nil, nil
 	})
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.True(t, handled)
 	require.True(t, waiting)
 	require.NoDirExists(t, input.Parent.LocalPath)
 	fail = false
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.True(t, handled)
@@ -431,6 +434,7 @@ func TestHfArtifactStartupCleanupDoesNotReplayLaterAdds(t *testing.T) {
 		t.Fatal("startup cleanup was not queued")
 	}
 	ctx := context.Background()
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(ctx, cleanup)
 	require.NoError(t, err)
 	require.True(t, handled)
@@ -730,6 +734,7 @@ func TestHfArtifactCancelledChildDeleteWaitsForSiblingDownload(t *testing.T) {
 	}()
 	<-started
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	assert.NoError(t, err)
 	assert.True(t, handled)
@@ -737,6 +742,7 @@ func TestHfArtifactCancelledChildDeleteWaitsForSiblingDownload(t *testing.T) {
 	assert.FileExists(t, filepath.Join(other.Parent.LocalPath, "config.json"))
 	close(release)
 	require.NoError(t, <-done)
+	enableTestSharedDeletion(t, s)
 	_, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -800,6 +806,7 @@ func TestHfArtifactInterruptedDownloadProtectsConsumers(t *testing.T) {
 				task.BaseModel.Labels = map[string]string{constants.ReserveModelArtifact: "true"}
 			}
 			task.TaskType, task.SharedArtifact = Delete, true
+			enableTestSharedDeletion(t, s)
 			handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 			require.NoError(t, err)
 			require.True(t, handled)
@@ -813,6 +820,7 @@ func TestHfArtifactInterruptedDownloadProtectsConsumers(t *testing.T) {
 				task.BaseModel = task.BaseModel.DeepCopy()
 				task.BaseModel.Name, task.BaseModel.UID = "other", other.ChildModelUID
 				task.BaseModel.Spec.Storage.Path = &other.ChildModelPath
+				enableTestSharedDeletion(t, s)
 				_, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 				require.NoError(t, err)
 				require.False(t, waiting)
@@ -851,12 +859,14 @@ func TestHfArtifactInterruptedDownloadWaitsForActiveOwner(t *testing.T) {
 		t.Fatal("download did not start")
 	}
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.True(t, waiting)
 	assert.FileExists(t, filepath.Join(input.Parent.LocalPath, "config.json"))
 	close(release)
 	require.ErrorIs(t, <-finished, context.Canceled)
+	enableTestSharedDeletion(t, s)
 	_, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -1009,10 +1019,12 @@ func TestHfArtifactInterruptedDownloadUIDReplacement(t *testing.T) {
 	require.NoError(t, indexer.Add(replacement))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	_, _, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.Error(t, err)
 	require.DirExists(t, input.Parent.LocalPath)
 	task.BaseModel = replacement
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -1026,6 +1038,7 @@ func TestHfArtifactInterruptedDownloadSurvivesConfigMapLoss(t *testing.T) {
 	require.NoError(t, c.kubeClient.CoreV1().ConfigMaps(c.namespace).Delete(context.Background(), c.nodeName, metav1.DeleteOptions{}))
 	c.reconcileConfigMaps()
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -1065,6 +1078,7 @@ func TestHfArtifactInterruptedDownloadDeleteBeforeConfigMapRecovery(t *testing.T
 				})
 			}
 			task.TaskType, task.SharedArtifact, task.NodeIneligible = Delete, true, true
+			enableTestSharedDeletion(t, s)
 			require.NoError(t, s.processTask(task))
 			require.True(t, dropped)
 			require.NoDirExists(t, input.Parent.LocalPath)
@@ -1101,6 +1115,7 @@ func TestHfArtifactInterruptedDownloadDeleteRetriesConfigMapRecovery(t *testing.
 				return true, nil, errors.New("recovery response unavailable")
 			})
 			task.TaskType, task.SharedArtifact, task.NodeIneligible = Delete, true, true
+			enableTestSharedDeletion(t, s)
 			require.NoError(t, s.processTask(task))
 			require.True(t, injected)
 			require.FileExists(t, filepath.Join(input.Parent.LocalPath, "config.json"))
@@ -1114,6 +1129,7 @@ func TestHfArtifactInterruptedDownloadDeleteRetriesConfigMapRecovery(t *testing.
 			case <-time.After(time.Second):
 				t.Fatal("failed ConfigMap recovery must requeue Delete")
 			}
+			enableTestSharedDeletion(t, s)
 			require.NoError(t, s.processTask(task))
 			require.NoDirExists(t, input.Parent.LocalPath)
 			c.reconcileConfigMaps()
@@ -1155,6 +1171,7 @@ func TestHfArtifactInterruptedDownloadIntentPrecedesFiles(t *testing.T) {
 			require.NoDirExists(t, input.Parent.LocalPath)
 			if committed {
 				task.TaskType, task.SharedArtifact = Delete, true
+				enableTestSharedDeletion(t, s)
 				_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 				require.NoError(t, err)
 				require.False(t, waiting)
@@ -1192,6 +1209,7 @@ func TestHfArtifactInterruptedDownloadCleanupUncertainWrites(t *testing.T) {
 					return true, nil, errors.New("cleanup response unavailable")
 				})
 				task.TaskType, task.SharedArtifact = Delete, true
+				enableTestSharedDeletion(t, s)
 				_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 				require.NoError(t, err)
 				require.True(t, injected)
@@ -1205,6 +1223,7 @@ func TestHfArtifactInterruptedDownloadCleanupUncertainWrites(t *testing.T) {
 				s = &Gopher{configMapReconciler: NewConfigMapReconciler(s.configMapReconciler.nodeName,
 					s.configMapReconciler.namespace, client, s.logger), modelRootDir: s.modelRootDir,
 					logger: s.logger, baseModelLister: s.baseModelLister, clusterBaseModelLister: s.clusterBaseModelLister}
+				enableTestSharedDeletion(t, s)
 				_, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 				require.NoError(t, err)
 				require.False(t, waiting)
@@ -1247,6 +1266,7 @@ func TestHfArtifactInterruptedDownloadFailedPublicationRecovers(t *testing.T) {
 		s.configMapReconciler.namespace, client, s.logger), modelRootDir: s.modelRootDir,
 		logger: s.logger, baseModelLister: s.baseModelLister, clusterBaseModelLister: s.clusterBaseModelLister}
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -1361,6 +1381,7 @@ func TestHfArtifactPendingDownloadHandoffRechecksUIDAfterConflict(t *testing.T) 
 		}
 		return false, nil, nil
 	})
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
 	require.NoError(t, err)
 	require.True(t, conflicted)
@@ -1385,6 +1406,7 @@ func TestHfArtifactPendingDownloadCleanupAdoptsCurrentUID(t *testing.T) {
 	require.NoError(t, indexer.Add(task.BaseModel))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	task.TaskType, task.SharedArtifact = Delete, true
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	assert.True(t, handled)

@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -596,7 +597,93 @@ func (s *Gopher) processSharedHfArtifactDelete(ctx context.Context, task *Gopher
 		// final removal, even if its response was lost with the receipt.
 		return true, false, nil
 	}
+	// Withdraw this child's availability before the existing file cleanup.
+	// Keep references and receipts intact so interrupted work remains resumable.
 	handler := s.sharedHfArtifactHandler()
+	c := s.configMapReconciler
+	validateUID := func() error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if uid == "" || s.isTaskModelReplaced(task) {
+			return fmt.Errorf("Shared deletion model UID changed")
+		}
+		if s.omeClient != nil {
+			current, err := liveArtifactModel(ctx, s.omeClient, task)
+			if apierrors.IsNotFound(err) {
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if getModelUID(current) != string(uid) {
+				return fmt.Errorf("Shared deletion model UID changed")
+			}
+		}
+		return nil
+	}
+	unlockParent := func() {}
+	hasSharedState := false
+	err = c.mutateConfigMapWithRetry(ctx, func(cm *corev1.ConfigMap) (bool, error) {
+		// A conflict retries against fresh state and must reacquire its parent.
+		unlockParent()
+		unlockParent = func() {}
+		hasSharedState = false
+		if _, exists := cm.Data[key]; !exists {
+			return false, nil
+		}
+		child, err := existingModelEntry(cm.Data, key)
+		if err != nil {
+			return false, err
+		}
+		if child.HfArtifactKey == "" && child.HfArtifactPendingDeletion == nil && child.HfArtifactPendingDownload == nil {
+			return false, nil
+		}
+		if err := validateUID(); err != nil {
+			return false, err
+		}
+		if child.ModelUID != "" && child.ModelUID != uid && child.HfArtifactPendingDeletion == nil && child.HfArtifactPendingDownload == nil {
+			return false, fmt.Errorf("Shared deletion belongs to another model UID")
+		}
+		parent, found, err := parentForChildEntry(cm.Data, key, child)
+		if err != nil {
+			return false, err
+		}
+		if !found && child.HfArtifactPendingDownload != nil {
+			parent = child.HfArtifactPendingDownload.deletionReceipt().parentForChild(key)
+			found = true
+		}
+		if found {
+			input := s.hfArtifactInputForChild(task, parent)
+			// Repair holds this same lock while capturing and restoring labels.
+			// TryLock does not block while the ConfigMap mutation mutex is held.
+			unlock, acquired, err := handler.tryParentFileOperation(parent, input.ModelStoreRoot)
+			if err != nil {
+				return false, err
+			}
+			if !acquired {
+				return false, fmt.Errorf("Shared parent %s has an active operation", parent.Key)
+			}
+			unlockParent = unlock
+		}
+		hasSharedState = true
+		child.Status = ModelStatusUpdating
+		return writeModelEntry(cm.Data, key, child)
+	})
+	if err == nil && hasSharedState {
+		if s.nodeLabelReconciler == nil {
+			err = fmt.Errorf("Node label reconciler is required for Shared deletion")
+		} else {
+			err = s.nodeLabelReconciler.ReconcileNodeLabels(&NodeLabelOp{
+				BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel,
+				ModelStateOnNode: Deleted, requireNodeCAS: true, validateReady: validateUID,
+			})
+		}
+	}
+	unlockParent()
+	if err != nil {
+		return true, true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(key, err))
+	}
 	if handled, waiting, err := s.reconcileHfArtifactCleanup(ctx, task, nil, true); handled || err != nil {
 		return true, waiting, err
 	}

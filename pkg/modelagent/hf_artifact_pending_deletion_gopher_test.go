@@ -41,6 +41,7 @@ func TestGopherHfArtifactDeleteRetainsReceiptUntilModelRemoval(t *testing.T) {
 			require.NoError(t, os.Mkdir(replacementPath, 0o755))
 			task.BaseModel.Spec.Storage.Path = &replacementPath
 			for attempt := 0; attempt < 2; attempt++ {
+				enableTestSharedDeletion(t, s)
 				handled, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
 				require.NoError(t, err)
 				require.True(t, handled, "completed shared deletion must never fall through to legacy cleanup")
@@ -286,6 +287,7 @@ func TestGopherHfArtifactDeleteAllowsCurrentUIDHandoff(t *testing.T) {
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	require.Equal(t, input.ChildModelUID, s.configMapReconciler.modelCache[input.ChildModelKey].ModelUID)
 
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
 	require.NoError(t, err)
 	require.True(t, handled)
@@ -333,6 +335,7 @@ func TestHfArtifactDeleteSamePathDeletingChildren(t *testing.T) {
 			}
 			// Keep both deleting CRs in the informer throughout both cleanups.
 			for _, task := range []*GopherTask{secondTask, firstTask} {
+				enableTestSharedDeletion(t, s)
 				_, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
 				require.NoError(t, err)
 				require.False(t, waiting)
@@ -663,6 +666,7 @@ func TestHfArtifactPendingDeletionDoesNotRecoverReplacementParent(t *testing.T) 
 	require.NoError(t, err)
 
 	task.TaskType = Delete
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
 	require.NoError(t, err)
 	require.True(t, handled)
@@ -767,4 +771,192 @@ func TestHfArtifactPendingDeletionHandoffRequiresReceiptAndListerUID(t *testing.
 			}
 		})
 	}
+}
+
+func TestSharedDeleteWithdrawsReadyBeforeFiles(t *testing.T) {
+	for _, stage := range []string{"new deletion", "old Ready receipt", "files already removed"} {
+		t.Run(stage, func(t *testing.T) {
+			interrupted := stage != "new deletion"
+			filesGone := stage == "files already removed"
+			s, task, input := newTestHfArtifactGopher(t)
+			ctx := context.Background()
+			h := s.sharedHfArtifactHandler()
+			require.NoError(t, runTestHfArtifactDownload(h, input))
+			require.NoError(t, s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{BaseModel: task.BaseModel, ModelStatus: ModelStatusReady}))
+			task.TaskType = Delete
+			c := s.configMapReconciler
+			client := c.kubeClient.(*fake.Clientset)
+			label, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+			require.NoError(t, err)
+			_, err = client.CoreV1().Nodes().Create(ctx, &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: c.nodeName, Labels: map[string]string{label: string(Ready)}}}, metav1.CreateOptions{})
+			require.NoError(t, err)
+			s.nodeLabelReconciler = NewNodeLabelReconciler(c.nodeName, client, 1, s.logger)
+			if interrupted {
+				parent, found, err := h.repository.GetParentForChild(ctx, input.ChildModelKey)
+				require.NoError(t, err)
+				require.True(t, found)
+				_, err = h.repository.removeModelReference(ctx, parent, input.ChildModelKey, input.ChildModelUID, input.ChildModelPath, true)
+				require.NoError(t, err)
+			}
+			if filesGone {
+				require.NoError(t, h.files.RemoveChildSymlink(input.ChildModelPath, input.Parent.LocalPath))
+				require.NoError(t, h.files.RemoveParentDirectory(input.Parent.LocalPath))
+			}
+			attempts := 0
+			client.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+				attempts++
+				object, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), c.namespace, c.nodeName)
+				require.NoError(t, err)
+				child, err := existingModelEntry(object.(*corev1.ConfigMap).Data, input.ChildModelKey)
+				require.NoError(t, err)
+				assert.Equal(t, ModelStatusUpdating, child.Status)
+				if !filesGone {
+					assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+					assert.DirExists(t, input.Parent.LocalPath)
+				}
+				return true, nil, errors.New("node API unavailable")
+			})
+			_, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
+			require.NoError(t, err)
+			require.True(t, waiting)
+			require.Equal(t, 1, attempts)
+			if !filesGone {
+				assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+			}
+			// Recreate the agent's state, leaving only persisted references or receipt.
+			s = &Gopher{configMapReconciler: NewConfigMapReconciler(c.nodeName, c.namespace, client, s.logger),
+				modelRootDir: s.modelRootDir, logger: s.logger, gopherChan: make(chan *GopherTask, 10),
+				baseModelLister: s.baseModelLister, clusterBaseModelLister: s.clusterBaseModelLister,
+				nodeLabelReconciler: NewNodeLabelReconciler(c.nodeName, client, 1, s.logger)}
+			client.ReactionChain = client.ReactionChain[1:]
+			handled, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
+			require.NoError(t, err)
+			require.True(t, handled)
+			require.False(t, waiting)
+			node, err := client.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
+			require.NoError(t, err)
+			assert.NotContains(t, node.Labels, label)
+			assertChildPathMissing(t, input.ChildModelPath)
+			assert.NoDirExists(t, input.Parent.LocalPath)
+		})
+	}
+}
+
+// Only deletion tests need a live Node and label reconciler. Leave the common
+// download fixture unchanged so unrelated tests keep their existing setup.
+func enableTestSharedDeletion(t *testing.T, s *Gopher) {
+	t.Helper()
+	c := s.configMapReconciler
+	_, err := c.kubeClient.CoreV1().Nodes().Get(context.Background(), c.nodeName, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		_, err = c.kubeClient.CoreV1().Nodes().Create(context.Background(), &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: c.nodeName}}, metav1.CreateOptions{})
+	}
+	require.NoError(t, err)
+	if s.nodeLabelReconciler == nil {
+		s.nodeLabelReconciler = NewNodeLabelReconciler(c.nodeName, c.kubeClient, 1, s.logger)
+	}
+}
+
+func TestSharedDeleteRechecksUIDBeforeNodeRetry(t *testing.T) {
+	s, task, input := newSharedRestoreFixture(t)
+	ctx := context.Background()
+	require.NoError(t, runTestHfArtifactDownload(s.sharedHfArtifactHandler(), input))
+	task.TaskType = Delete
+	client := s.configMapReconciler.kubeClient.(*fake.Clientset)
+	s.nodeLabelReconciler = NewNodeLabelReconciler(s.configMapReconciler.nodeName, client, 2, s.logger)
+	reads, patches := 0, 0
+	client.PrependReactor("get", "nodes", func(ktesting.Action) (bool, runtime.Object, error) { reads++; return false, nil, nil })
+	client.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		patches++
+		replacement := task.BaseModel.DeepCopy()
+		replacement.UID = "replacement-uid"
+		_, err := s.omeClient.OmeV1beta1().BaseModels(replacement.Namespace).Update(ctx, replacement, metav1.UpdateOptions{})
+		require.NoError(t, err)
+		return true, nil, errors.New("Node changed before patch")
+	})
+	_, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
+	require.ErrorContains(t, err, "model UID changed")
+	require.True(t, waiting)
+	require.GreaterOrEqual(t, reads, 2)
+	require.Equal(t, 1, patches)
+	assertChildSymlinkTarget(t, input.ChildModelPath, input.Parent.LocalPath)
+	label, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+	require.NoError(t, err)
+	node, err := client.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, string(Ready), node.Labels[label])
+}
+
+func TestSharedDeleteFinalizesWithoutAnotherNodeRead(t *testing.T) {
+	s, task, input := newSharedRestoreFixture(t)
+	ctx := context.Background()
+	require.NoError(t, runTestHfArtifactDownload(s.sharedHfArtifactHandler(), input))
+	task.TaskType, task.SharedArtifact = Delete, true
+	now := metav1.Now()
+	task.BaseModel.DeletionTimestamp = &now
+	_, err := s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	client := s.configMapReconciler.kubeClient.(*fake.Clientset)
+	client.PrependReactor("get", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+		if _, err := os.Lstat(input.Parent.LocalPath); os.IsNotExist(err) {
+			return true, nil, errors.New("Node API unavailable after file cleanup")
+		}
+		return false, nil, nil
+	})
+	require.NoError(t, s.processTask(task))
+	assertChildPathMissing(t, input.ChildModelPath)
+	cm, err := s.configMapReconciler.getConfigMap(ctx)
+	require.NoError(t, err)
+	assert.NotContains(t, cm.Data, input.ChildModelKey)
+}
+
+func TestSharedDeleteWaitsForParentBeforeWithdrawingReady(t *testing.T) {
+	s, task, input := newSharedRestoreFixture(t)
+	ctx := context.Background()
+	s.samePathWaitTimeout = time.Minute
+	task.SamePathWaitStartedAt = time.Time{}
+	h := s.sharedHfArtifactHandler()
+	require.NoError(t, runTestHfArtifactDownload(h, input))
+	delete(task.BaseModel.Annotations, testRestoreAnnotation)
+	_, err := s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+	require.NoError(t, err)
+	require.NoError(t, s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{BaseModel: task.BaseModel, ModelStatus: ModelStatusReady}))
+	task.TaskType, task.NodeIneligible = Delete, true
+	// A sibling repair holds this lock through status capture and Ready publication.
+	unlock, acquired, err := h.tryParentFileOperation(input.Parent, input.ModelStoreRoot)
+	require.NoError(t, err)
+	require.True(t, acquired)
+	defer func() { unlock() }()
+	_, waiting, err := s.processSharedHfArtifactDelete(ctx, task)
+	require.NoError(t, err)
+	require.True(t, waiting)
+	cm, err := s.configMapReconciler.getConfigMap(ctx)
+	require.NoError(t, err)
+	child, err := existingModelEntry(cm.Data, input.ChildModelKey)
+	require.NoError(t, err)
+	assert.Equal(t, ModelStatusReady, child.Status)
+	label, err := getModelLabelKey(&NodeLabelOp{BaseModel: task.BaseModel})
+	require.NoError(t, err)
+	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.Equal(t, string(Ready), node.Labels[label])
+	unlock()
+	unlock = func() {}
+	// A ConfigMap conflict must release the previous attempt's parent lock.
+	conflict := true
+	s.kubeClient.(*fake.Clientset).PrependReactor("update", "configmaps", func(ktesting.Action) (bool, runtime.Object, error) {
+		if !conflict {
+			return false, nil, nil
+		}
+		conflict = false
+		return true, nil, apierrors.NewConflict(corev1.Resource("configmaps"), s.configMapReconciler.nodeName, errors.New("changed"))
+	})
+	_, waiting, err = s.processSharedHfArtifactDelete(ctx, task)
+	require.NoError(t, err)
+	require.False(t, waiting)
+	require.False(t, conflict)
+	assertChildPathMissing(t, input.ChildModelPath)
+	node, err = s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	require.NoError(t, err)
+	assert.NotContains(t, node.Labels, label)
 }

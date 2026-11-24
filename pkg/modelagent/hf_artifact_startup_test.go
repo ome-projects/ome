@@ -96,6 +96,7 @@ func TestGopherHfArtifactReservedDeleteFinishesPendingParent(t *testing.T) {
 			}
 			task.TaskType = Delete
 			task.BaseModel.Labels = map[string]string{constants.ReserveModelArtifact: "true"}
+			enableTestSharedDeletion(t, s)
 			handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 			require.NoError(t, err)
 			assert.True(t, handled)

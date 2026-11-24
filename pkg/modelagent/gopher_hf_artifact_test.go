@@ -37,6 +37,7 @@ func TestGopherHfArtifactCustomRootPreservesReservedChild(t *testing.T) {
 	require.NoError(t, runTestHfArtifactDownload(handler, second))
 	task.TaskType = Delete
 	task.BaseModel.Labels = map[string]string{constants.ReserveModelArtifact: "true"}
+	enableTestSharedDeletion(t, s)
 	_, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -45,6 +46,7 @@ func TestGopherHfArtifactCustomRootPreservesReservedChild(t *testing.T) {
 	task.BaseModel.UID = second.ChildModelUID
 	task.BaseModel.Labels = nil
 	task.BaseModel.Spec.Storage.Path = &second.ChildModelPath
+	enableTestSharedDeletion(t, s)
 	_, waiting, err = s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	require.False(t, waiting)
@@ -203,6 +205,7 @@ func TestGopherHfArtifactPendingDeletePreservesLocalConsumer(t *testing.T) {
 	require.NoError(t, indexer.Add(consumer))
 	s.baseModelLister = modelslister.NewBaseModelLister(indexer)
 	task.TaskType = Delete
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	assert.True(t, handled, "completed shared cleanup must not fall through to legacy deletion")
@@ -404,6 +407,7 @@ func TestGopherHfArtifactDeleteUsesStoredReferenceAfterGateRemoval(t *testing.T)
 	task.TaskType = Delete
 	task.BaseModel.Annotations = nil
 	task.BaseModel.Spec.Storage.DownloadPolicy = nil
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	assert.True(t, handled)
@@ -471,6 +475,7 @@ func TestGopherHfArtifactReserveLabelPreservesFilesWithoutReference(t *testing.T
 	require.NoError(t, runTestHfArtifactDownload(handler, input))
 	task.TaskType = Delete
 	task.BaseModel.Labels = map[string]string{constants.ReserveModelArtifact: "true"}
+	enableTestSharedDeletion(t, s)
 	handled, waiting, err := s.processSharedHfArtifactDelete(context.Background(), task)
 	require.NoError(t, err)
 	assert.True(t, handled)

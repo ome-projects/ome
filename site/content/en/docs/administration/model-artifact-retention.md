@@ -37,24 +37,36 @@ Each node's agent removes its local copy of a model in two situations:
   remain eligible keep their copy untouched.
 
 Note that editing placement is therefore not just additive: narrowing a
-`nodeSelector` reclaims disk on the nodes it excludes.
+`nodeSelector` reclaims disk on the nodes it excludes. Services must be moved
+or stopped before narrowing placement; the model agent does not manage serving
+Pod lifecycles.
 
-## What deletion removes
+## Deletion order
 
-For each affected node, the agent:
+Deletion removes the node-local files, the model's Node readiness label, and
+its entry in the per-node status ConfigMap. Retention rules can preserve files;
+successful cleanup still removes the readiness label and status entry.
 
-1. Deletes the model directory — `spec.storage.path`, or
-   `<models-root>/<storageUri>` (models root defaults to `/mnt/models`) when
-   `path` is unset — unless one of the checks below skips it.
-2. Removes the model's readiness label from the node
-   (`models.ome.io/clusterbasemodel.<name>` or
-   `models.ome.io/<namespace>.basemodel.<name>`).
-3. Removes the model's entry from the per-node status ConfigMap (named after
-   the node, in the agent's namespace, default `ome`).
+For both Shared artifacts and Direct local copies, the agent:
 
-Steps 2 and 3 always happen, even when the files themselves are preserved:
-after removal the node no longer advertises the model, regardless of what is
-left on disk.
+1. Marks the model entry `Updating` in the ConfigMap. Shared references and
+   pending deletion records are retained for restart recovery.
+2. Removes the model's Node readiness label. If either step fails, files are
+   left untouched.
+3. Cleans up the local files, subject to the safety and retention checks below.
+   For Shared artifacts, the child symlink is removed first, then the parent
+   cache is cleaned up only when no other consumers require it. Direct copies
+   use an independent directory: `spec.storage.path`, or
+   `<models-root>/<storageUri>` when `path` is unset (models root defaults to
+   `/mnt/models`).
+4. Removes the model's ConfigMap entry after cleanup succeeds.
+
+Older Shared pending deletion records with a `Ready` child status follow the
+same order.
+
+The readiness label is `models.ome.io/clusterbasemodel.<name>` or
+`models.ome.io/<namespace>.basemodel.<name>`. The status ConfigMap is named after
+the node, in the agent's namespace (default `ome`).
 
 ## Storage backends the agent never deletes
 

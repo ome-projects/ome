@@ -772,7 +772,7 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 		}
 	case Delete:
 		// Now proceed with deletion
-		handled, waiting, sharedErr := s.processSharedHfArtifactDelete(ctx, task)
+		sharedDeletionHandled, waiting, sharedErr := s.processSharedHfArtifactDelete(ctx, task)
 		if sharedErr != nil {
 			return sharedErr
 		}
@@ -780,7 +780,7 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 			keepDeleteBarrier = true
 			return nil
 		}
-		if !handled {
+		if !sharedDeletionHandled {
 			// Shared handling can fall back to the Direct deletion path.
 			if isDirectFileStorageType(storageType) {
 				acquired, err := s.tryLockDirectModelPath(ctx, getDestPath(&baseModelSpec, s.modelRootDir))
@@ -795,6 +795,50 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 				if s.isTaskModelReplaced(task) {
 					return nil
 				}
+			}
+			// Keep the child entry until file cleanup succeeds. Ready withdrawal
+			// and status publication use the same mutex as download completion.
+			err = func() error {
+				s.configMapMutex.Lock()
+				defer s.configMapMutex.Unlock()
+				validateUID := func() error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if s.isTaskModelReplaced(task) {
+						return fmt.Errorf("deletion model UID changed")
+					}
+					if s.omeClient != nil {
+						current, err := liveArtifactModel(ctx, s.omeClient, task)
+						if apierrors.IsNotFound(err) {
+							return nil
+						}
+						if err != nil {
+							return err
+						}
+						if getModelUID(current) != getModelUID(task) {
+							return fmt.Errorf("deletion model UID changed")
+						}
+					}
+					return nil
+				}
+				if err := validateUID(); err != nil {
+					return err
+				}
+				if isDirectFileStorageType(storageType) {
+					if err := s.configMapReconciler.ReconcileModelStatus(ctx, &ConfigMapStatusOp{
+						BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel, ModelStatus: ModelStatusUpdating,
+					}); err != nil {
+						return err
+					}
+				}
+				return s.nodeLabelReconciler.ReconcileNodeLabels(&NodeLabelOp{
+					BaseModel: task.BaseModel, ClusterBaseModel: task.ClusterBaseModel,
+					ModelStateOnNode: Deleted, requireNodeCAS: isDirectFileStorageType(storageType) || s.omeClient != nil, validateReady: validateUID,
+				})
+			}()
+			if err != nil {
+				return err
 			}
 			switch storageType {
 			case storage.StorageTypeOCI, storage.StorageTypeModelPack:
@@ -890,14 +934,15 @@ func (s *Gopher) processTaskAttemptWithSourceAdapters(task *GopherTask, allowFal
 			}
 		}
 
-		// Mark the model as deleted in the node labels and remove from ConfigMap
-		nodeLabelOp := &NodeLabelOp{
-			ModelStateOnNode: Deleted,
-			BaseModel:        task.BaseModel,
-			ClusterBaseModel: task.ClusterBaseModel,
+		// Both paths withdrew Ready before file cleanup. Remove the child entry
+		// only after cleanup succeeds, serialized with readiness publication.
+		s.configMapMutex.Lock()
+		err = ctx.Err()
+		if err == nil {
+			err = s.configMapReconciler.DeleteModelFromConfigMap(ctx, task.BaseModel, task.ClusterBaseModel)
 		}
+		s.configMapMutex.Unlock()
 
-		err = s.safeNodeLabelReconciliation(ctx, nodeLabelOp)
 		if err != nil {
 			s.logger.Errorf("Failed to mark model %s as deleted: %v", modelInfo, err)
 			return err

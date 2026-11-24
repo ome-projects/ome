@@ -34,6 +34,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
+	omefake "sigs.k8s.io/ome/pkg/client/clientset/versioned/fake"
 	omev1beta1lister "sigs.k8s.io/ome/pkg/client/listers/ome/v1beta1"
 	"sigs.k8s.io/ome/pkg/constants"
 	"sigs.k8s.io/ome/pkg/ociobjectstore"
@@ -2568,6 +2569,149 @@ func writeSelectiveDeletionFile(t *testing.T, path string) {
 	t.Helper()
 	require.NoError(t, os.MkdirAll(filepath.Dir(path), 0o755))
 	require.NoError(t, os.WriteFile(path, []byte(path), 0o600))
+}
+
+func TestDirectDeleteWithdrawsReadyBeforeFiles(t *testing.T) {
+	for _, uri := range []string{"hf://openai/gpt-oss-20b", "oci://n/ns/b/models/o/model", "modelpack://registry.example.com/org/model:tag"} {
+		for _, failure := range []string{"none", "status update", "node read", "label patch", "final status removal"} {
+			t.Run(uri+"/"+failure, func(t *testing.T) {
+				g, task := newSelectiveDeletionGopher(t, uri)
+				ctx := context.Background()
+				c := g.configMapReconciler
+				client := c.kubeClient.(*k8sfake.Clientset)
+				path := *task.ClusterBaseModel.Spec.Storage.Path
+				weights := filepath.Join(path, "weights")
+				writeSelectiveDeletionFile(t, weights)
+				key := getModelID(nil, task.ClusterBaseModel)
+				label, err := getModelLabelKey(&NodeLabelOp{ClusterBaseModel: task.ClusterBaseModel})
+				require.NoError(t, err)
+				patches := 0
+				client.PrependReactor("patch", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+					patches++
+					assert.FileExists(t, weights)
+					object, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), c.namespace, c.nodeName)
+					require.NoError(t, err)
+					child, err := existingModelEntry(object.(*corev1.ConfigMap).Data, key)
+					require.NoError(t, err)
+					assert.Equal(t, ModelStatusUpdating, child.Status)
+					if failure == "label patch" {
+						return true, nil, errors.New("label patch failed")
+					}
+					return false, nil, nil
+				})
+				client.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+					if failure == "node read" {
+						return true, nil, apierrors.NewNotFound(schema.GroupResource{Resource: "nodes"}, c.nodeName)
+					}
+					// Finalization must not depend on another Node API read.
+					if _, err := os.Stat(weights); os.IsNotExist(err) {
+						return true, nil, errors.New("Node API unavailable after cleanup")
+					}
+					return false, nil, nil
+				})
+				client.PrependReactor("update", "configmaps", func(action k8stesting.Action) (bool, runtime.Object, error) {
+					cm := action.(k8stesting.UpdateAction).GetObject().(*corev1.ConfigMap)
+					_, exists := cm.Data[key]
+					if failure == "status update" && exists || failure == "final status removal" && !exists {
+						return true, nil, errors.New("status write failed")
+					}
+					return false, nil, nil
+				})
+				err = g.processTask(task)
+				if failure == "none" {
+					require.NoError(t, err)
+					assert.NoFileExists(t, weights)
+					cm, err := c.getConfigMap(ctx)
+					require.NoError(t, err)
+					assert.NotContains(t, cm.Data, key)
+				} else {
+					require.Error(t, err)
+					if failure == "final status removal" {
+						assert.NoFileExists(t, weights)
+						// Retry with the same agent, including its deletion UID fence.
+						client.ReactionChain = client.ReactionChain[3:]
+						retry := *task
+						retry.Sequence = 0
+						require.NoError(t, g.processTask(&retry))
+						cm, err := c.getConfigMap(ctx)
+						require.NoError(t, err)
+						assert.NotContains(t, cm.Data, key)
+					} else {
+						assert.FileExists(t, weights)
+					}
+				}
+				if failure == "status update" || failure == "node read" {
+					assert.Zero(t, patches)
+				} else {
+					assert.Positive(t, patches)
+				}
+				object, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("nodes"), "", c.nodeName)
+				require.NoError(t, err)
+				if failure != "none" && failure != "final status removal" {
+					assert.Equal(t, string(Ready), object.(*corev1.Node).Labels[label])
+				} else {
+					assert.NotContains(t, object.(*corev1.Node).Labels, label)
+				}
+			})
+		}
+	}
+}
+
+func TestNonFileDeleteStillCleansStatusWhenNodeIsGone(t *testing.T) {
+	for _, uri := range []string{"local://model", "pvc://volume/model", "vendor://model"} {
+		t.Run(uri, func(t *testing.T) {
+			g, task := newSelectiveDeletionGopher(t, uri)
+			ctx := context.Background()
+			c := g.configMapReconciler
+			client := c.kubeClient.(*k8sfake.Clientset)
+			weights := filepath.Join(*task.ClusterBaseModel.Spec.Storage.Path, "weights")
+			writeSelectiveDeletionFile(t, weights)
+			require.NoError(t, client.CoreV1().Nodes().Delete(ctx, c.nodeName, metav1.DeleteOptions{}))
+			require.NoError(t, g.processTask(task))
+			assert.FileExists(t, weights)
+			cm, err := c.getConfigMap(ctx)
+			require.NoError(t, err)
+			assert.NotContains(t, cm.Data, getModelID(nil, task.ClusterBaseModel))
+		})
+	}
+}
+
+func TestModelDeleteRechecksUIDBeforeNodeRetry(t *testing.T) {
+	for _, uri := range []string{"oci://n/ns/b/models/o/model", "local://model", "pvc://volume/model", "vendor://model"} {
+		t.Run(uri, func(t *testing.T) {
+			g, task := newSelectiveDeletionGopher(t, uri)
+			ctx := context.Background()
+			g.omeClient = omefake.NewSimpleClientset(task.ClusterBaseModel.DeepCopy())
+			c := g.configMapReconciler
+			client := c.kubeClient.(*k8sfake.Clientset)
+			g.nodeLabelReconciler = NewNodeLabelReconciler(c.nodeName, client, 2, g.logger)
+			weights := filepath.Join(*task.ClusterBaseModel.Spec.Storage.Path, "weights")
+			writeSelectiveDeletionFile(t, weights)
+			reads, patches := 0, 0
+			client.PrependReactor("get", "nodes", func(k8stesting.Action) (bool, runtime.Object, error) {
+				reads++
+				return false, nil, nil
+			})
+			client.PrependReactor("patch", "nodes", func(action k8stesting.Action) (bool, runtime.Object, error) {
+				patches++
+				assert.Contains(t, string(action.(k8stesting.PatchAction).GetPatch()), "/metadata/resourceVersion")
+				replacement := task.ClusterBaseModel.DeepCopy()
+				replacement.UID = "replacement-uid"
+				_, err := g.omeClient.OmeV1beta1().ClusterBaseModels().Update(ctx, replacement, metav1.UpdateOptions{})
+				require.NoError(t, err)
+				return true, nil, errors.New("Node changed before patch")
+			})
+			require.ErrorContains(t, g.processTask(task), "model UID changed")
+			assert.GreaterOrEqual(t, reads, 2)
+			assert.Equal(t, 1, patches)
+			assert.FileExists(t, weights)
+			node, err := client.CoreV1().Nodes().Get(ctx, c.nodeName, metav1.GetOptions{})
+			require.NoError(t, err)
+			label, err := getModelLabelKey(&NodeLabelOp{ClusterBaseModel: task.ClusterBaseModel})
+			require.NoError(t, err)
+			assert.Equal(t, string(Ready), node.Labels[label])
+		})
+	}
 }
 
 func TestModelDeletionPreservesReferencedDescendants(t *testing.T) {

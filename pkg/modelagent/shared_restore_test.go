@@ -361,6 +361,8 @@ func TestSharedRestoreDeletePreservesReplacementReady(t *testing.T) {
 	replacement.UID = "replacement"
 	_, err = s.omeClient.OmeV1beta1().BaseModels(replacement.Namespace).Update(ctx, replacement, metav1.UpdateOptions{})
 	require.NoError(t, err)
+	// Publish readiness for the replacement after the old deletion withdrew it.
+	require.NoError(t, s.nodeLabelReconciler.ReconcileNodeLabels(&NodeLabelOp{BaseModel: replacement, ModelStateOnNode: Ready, requireNodeCAS: true}))
 	require.NoError(t, s.safeNodeLabelReconciliation(ctx, &NodeLabelOp{BaseModel: task.BaseModel, ModelStateOnNode: Deleted}))
 	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
 	require.NoError(t, err)
