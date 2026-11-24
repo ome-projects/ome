@@ -235,7 +235,8 @@ metadata:
     ome.io/artifact-residency: Evicted
 ```
 
-The value is case-sensitive. Each agent withdraws that model's readiness,
+The value is case-sensitive. Each agent on a node matching the model's placement
+withdraws that model's readiness,
 releases its Shared reference, and removes unreferenced local files. The model
 resource and remote source remain. Its entry in the per-node status ConfigMap
 reports `Evicted` with `modelUID` after cleanup finishes. Shared children,
@@ -283,6 +284,16 @@ Ready label. The ConfigMap report acknowledges the request; an older Ready
 label alone is not acknowledgement of a new request. Each
 node reports independently; replaced models, replaced Nodes, or changed
 requests cannot complete an older attempt.
+
+At startup and every ConfigMap reconciliation interval (five minutes by default),
+the agent retries missing current-request reports or the model Ready label through the
+same validation path. This covers publication failures, exhausted retries,
+restart, and sibling repair. Completed reports with the Ready label do not queue
+work; periodic retries coalesce with pending work and preserve explicit download
+or override requests. Recovery still requires the Node instance observed at
+startup and never adopts an ordinary directory whose ownership record is absent.
+An explicitly recorded failure for the same model UID and request ID is not
+retried periodically; after addressing the cause, submit a new request ID.
 
 ## When the agent falls back to a per-model copy
 
