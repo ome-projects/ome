@@ -468,7 +468,7 @@ func (p *replicaPass) run(ctx context.Context) (result ctrl.Result, err error) {
 		p.ensureSpecRevision,
 		p.resolveRollbackTarget,
 		p.wireCoordinationGates,
-		p.readRevisionWidths,
+		p.readRevisionContracts,
 		p.buildPlan,
 		p.clearIdleScaleDownGauges,
 		p.openNodeReading,
@@ -746,21 +746,27 @@ func (p *replicaPass) wireCoordinationGates(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-// readRevisionWidths reads the worker width recorded by every revision the
-// rows reference and by the roll target. Each Instance renders the width its
+// readRevisionContracts reads the worker width and topology key recorded by
+// every revision the rows reference. Each Instance renders the contract its
 // own revision recorded, so the plan needs them all.
-func (p *replicaPass) readRevisionWidths(ctx context.Context) (bool, error) {
+func (p *replicaPass) readRevisionContracts(ctx context.Context) (bool, error) {
 	rollTargetName := ""
 	if p.rollTarget != nil {
 		rollTargetName = p.rollTarget.Name
 	}
-	widths, err := revision.WorkerSizesByRevision(ctx, p.reconciler.Client, p.ir.Namespace,
-		revision.ReferencedRevisionNames(p.input.ObservedState.InstanceStatuses, rollTargetName))
+	names := revision.ReferencedRevisionNames(p.input.ObservedState.InstanceStatuses, rollTargetName)
+	widths, err := revision.WorkerSizesByRevision(ctx, p.reconciler.Client, p.ir.Namespace, names)
 	if err != nil {
 		return false, fmt.Errorf("InferenceReplica reconciler: read revision widths (ir=%s/%s): %w",
 			p.ir.Namespace, p.ir.Name, err)
 	}
+	topologyKeys, err := revision.TopologyKeysByRevision(ctx, p.reconciler.Client, p.ir.Namespace, names)
+	if err != nil {
+		return false, fmt.Errorf("InferenceReplica reconciler: read revision topology keys (ir=%s/%s): %w",
+			p.ir.Namespace, p.ir.Name, err)
+	}
 	p.input.ObservedState.WorkerSizeByRevision = widths
+	p.input.ObservedState.TopologyKeyByRevision = topologyKeys
 	return true, nil
 }
 

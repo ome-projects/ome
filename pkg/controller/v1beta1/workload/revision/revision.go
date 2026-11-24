@@ -958,7 +958,7 @@ func RowRevisions(instances []workload.InstanceStatus) iter.Seq2[string, string]
 // ReferencedRevisionNames returns, sorted, every revision name the rows
 // record a pod set under: the revision each runs, converges to, or its
 // attempt pinned. except is left out; the roll target renders the desired
-// width and needs no lookup.
+// template and needs no lookup.
 func ReferencedRevisionNames(statuses []workload.InstanceStatus, except string) []string {
 	seen := map[string]struct{}{}
 	add := func(name string) {
@@ -1000,6 +1000,42 @@ func WorkerSizesByRevision(ctx context.Context, reads client.Reader, namespace s
 		}
 		if size, ok := WorkerSizeFromRevision(cr); ok {
 			out[name] = size
+		}
+	}
+	if len(out) == 0 {
+		return nil, nil
+	}
+	return out, nil
+}
+
+// TopologyKeysByRevision reads the topology contract of every named
+// multi-pod ControllerRevision. Presence with an empty value means the
+// revision explicitly recorded no topology. Missing, empty, and single-pod
+// revisions are left out, so their callers retain the desired-key fallback
+// and the fail-closed behavior for an unavailable revision record.
+func TopologyKeysByRevision(ctx context.Context, reads client.Reader, namespace string, names []string) (map[string]string, error) {
+	if reads == nil || len(names) == 0 {
+		return nil, nil
+	}
+	out := map[string]string{}
+	for _, name := range names {
+		cr := &appsv1.ControllerRevision{}
+		if err := reads.Get(ctx, client.ObjectKey{Namespace: namespace, Name: name}, cr); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, fmt.Errorf("read revision %s/%s: %w", namespace, name, err)
+		}
+		payload, err := PayloadFromControllerRevision(cr)
+		if err != nil {
+			return nil, fmt.Errorf("read revision %s/%s topology: %w", namespace, name, err)
+		}
+		if payload == nil || payload.WorkerPodSpec == nil {
+			continue
+		}
+		out[name] = ""
+		if payload.TopologyKey != nil {
+			out[name] = *payload.TopologyKey
 		}
 	}
 	if len(out) == 0 {

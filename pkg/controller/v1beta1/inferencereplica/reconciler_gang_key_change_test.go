@@ -29,11 +29,9 @@ const (
 	gangKeyAfter  = "topology.example.com/row"
 )
 
-// readyGangOnKey is a Ready one-worker gang on the revision rev, built as
-// the engine builds one: the pods carry the group label, the worker carries
-// the generated term that names its leader on key, and the group records
-// key.
-func readyGangOnKey(ir *v1beta1.InferenceReplica, rev, key string) []client.Object {
+// readyGangWithoutKey is a Ready one-worker gang on rev whose pods carry no
+// generated topology term and whose PodGroup records no topology annotation.
+func readyGangWithoutKey(ir *v1beta1.InferenceReplica, rev string) []client.Object {
 	objs := seedReadyGang(ir, rev, 1)
 	groupName := query.PodGroupName(ir.Spec.ParentRef.Name, workloadtypes.ComponentEngine, 0)
 	for _, obj := range objs {
@@ -42,6 +40,23 @@ func readyGangOnKey(ir *v1beta1.InferenceReplica, rev, key string) []client.Obje
 			continue
 		}
 		pod.Labels[query.LabelPodGroup] = groupName
+	}
+	group := ownedPodGroupForIR(ir, groupName, 0)
+	group.Spec.MinMember = 2
+	return append(objs, group)
+}
+
+// readyGangOnKey is a Ready one-worker gang on the revision rev, built as
+// the engine builds one: the pods carry the group label, the worker carries
+// the generated term that names its leader on key, and the group records
+// key.
+func readyGangOnKey(ir *v1beta1.InferenceReplica, rev, key string) []client.Object {
+	objs := readyGangWithoutKey(ir, rev)
+	for _, obj := range objs {
+		pod, ok := obj.(*corev1.Pod)
+		if !ok {
+			continue
+		}
 		if pod.Labels[query.LabelRunner] != workloadtypes.RunnerWorker {
 			continue
 		}
@@ -57,10 +72,9 @@ func readyGangOnKey(ir *v1beta1.InferenceReplica, rev, key string) []client.Obje
 			}},
 		}}
 	}
-	group := ownedPodGroupForIR(ir, groupName, 0)
+	group := objs[len(objs)-1].(*schedulingv1alpha1.PodGroup)
 	group.Annotations = map[string]string{query.AnnotationTopologyKey: key}
-	group.Spec.MinMember = 2
-	return append(objs, group)
+	return objs
 }
 
 // gangGroupKey is the topology key the gang's PodGroup records.
@@ -202,6 +216,37 @@ func TestReconcile_GangKeyChangeRebuildsOnTheNewKeyFromOnePodList(t *testing.T) 
 	}
 
 	// The cache has caught up: the gang is built on the new key.
+	r.Client = base
+	for pass := 0; pass < 4 && len(listPods(t, base, ir.Namespace)) < 2; pass++ {
+		r.Expectations = workloadtypes.NewExpectations()
+		if _, err := r.Reconcile(ctx, req); err != nil {
+			t.Fatalf("rebuild pass %d: %v", pass, err)
+		}
+	}
+	requireGangOnKey(t, base, ir, after, gangKeyAfter)
+}
+
+// Enabling topology on a live topology-free revision must not require its
+// pods to prove the new key. The old gang stays unannotated while it drains;
+// its replacement is rendered and admitted on the new key.
+func TestReconcile_GangKeyAddedToUnkeyedRevision(t *testing.T) {
+	ir := gangWidthIR("llama-engine", "prod", 1, v1beta1.UpdateStrategyRecreatePod)
+	oldRevision := revisionWithoutWidthFor(t, ir)
+	before := oldRevision.Name
+	objs := append(readyGangWithoutKey(ir, before), oldRevision)
+	ir.Spec.TopologyKey = ptr.To(gangKeyAfter)
+	ir.Generation++
+	after := targetRevisionNameFor(t, ir)
+	if after == before {
+		t.Fatalf("premise: adding a key must cut a new revision; both resolve to %s", before)
+	}
+	r, base := newReconciler(t, append([]client.Object{ir}, objs...)...)
+	r.GangSchedulingAvailable = true
+	req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(ir)}
+	ctx := context.Background()
+
+	deleteOldGang(t, r, base, ir)
+
 	r.Client = base
 	for pass := 0; pass < 4 && len(listPods(t, base, ir.Namespace)) < 2; pass++ {
 		r.Expectations = workloadtypes.NewExpectations()

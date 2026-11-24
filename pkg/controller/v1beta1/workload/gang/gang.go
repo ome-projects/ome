@@ -295,8 +295,9 @@ func (w *gangWrite) write(ctx context.Context) (string, error) {
 // topologyFromPods is the key the gang keeps when no PodGroup is written:
 // the one its live pods already carry, or the plan's when it has none.
 func (w *gangWrite) topologyFromPods() (string, error) {
-	return podgroup.EffectiveTopologyKeyForPods(w.plan.TopologyKeyForInstance(w.inst.Index), w.input.Key.OwnerName,
-		w.plan.Component, w.inst.Index, w.pods)
+	_, recorded := w.plan.InstanceTopologyKeys[w.inst.Index]
+	return podgroup.EffectiveTopologyKeyForPodsWithRecord(w.plan.TopologyKeyForInstanceAndPods(w.inst.Index, len(w.pods)),
+		w.input.Key.OwnerName, w.plan.Component, w.inst.Index, w.pods, recorded)
 }
 
 // EnsurePodGroupsWithState drives the per-Instance PodGroup lifecycle for
@@ -625,7 +626,7 @@ func (p *podGroupPass) decidedOnCachedPods(ctx context.Context, available bool) 
 func (p *podGroupPass) gangDecidedOnCache(ctx context.Context, inst *workload.InstancePlan, available bool) bool {
 	write := p.writeOf(inst)
 	complete := len(write.pods) >= int(inst.TotalPods())
-	planKey := p.plan.TopologyKeyForInstance(inst.Index)
+	planKey := p.plan.TopologyKeyForInstanceAndPods(inst.Index, len(write.pods))
 	if !available {
 		key, proven, err := podgroup.TopologyKeyProvenByPods(p.input.Key.OwnerName, p.plan.Component, inst.Index, write.pods)
 		if err != nil {
