@@ -62,6 +62,24 @@ func TestHfSnapshotValidationDigestsAndReadOnlyCorruption(t *testing.T) {
 	assert.FileExists(t, filepath.Join(root, "empty"))
 }
 
+// Removal uses the inspected paths rather than scanning again after authorization.
+func TestRemoveHfSnapshotFilesUsesInspectedPaths(t *testing.T) {
+	root := t.TempDir()
+	manifest := testHfSnapshotManifest(map[string]string{"invalid": "expected", "valid": "healthy"})
+	require.NoError(t, os.WriteFile(filepath.Join(root, "invalid"), []byte("corrupt"), 0o600))
+	require.NoError(t, os.WriteFile(filepath.Join(root, "valid"), []byte("healthy"), 0o600))
+	invalid, err := manifest.invalidFiles(context.Background(), root)
+	require.NoError(t, err)
+	require.Equal(t, []string{"invalid"}, invalid)
+	// A later change cannot expand the previously inspected removal set.
+	require.NoError(t, os.WriteFile(filepath.Join(root, "valid"), []byte("changed"), 0o600))
+	require.NoError(t, removeHfSnapshotFiles(context.Background(), root, invalid))
+	require.NoFileExists(t, filepath.Join(root, "invalid"))
+	data, err := os.ReadFile(filepath.Join(root, "valid"))
+	require.NoError(t, err)
+	require.Equal(t, "changed", string(data))
+}
+
 func TestHfSnapshotValidationRejectsUnsafeManifest(t *testing.T) {
 	for _, name := range []string{"", "/absolute", "../escape", "a/../escape", "a//b", "a/./b", "a\\b", "a\x00b", constants.ModelArtifactsDirectory + "/weights"} {
 		t.Run(fmt.Sprintf("%q", name), func(t *testing.T) {

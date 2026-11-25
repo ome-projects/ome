@@ -3,17 +3,18 @@ package modelagent
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"testing"
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes/fake"
 	ktesting "k8s.io/client-go/testing"
-	"os"
-	"path/filepath"
 	"sigs.k8s.io/ome/pkg/modelparser"
 	"sigs.k8s.io/ome/pkg/xet"
-	"testing"
-	"time"
 
 	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"

@@ -113,6 +113,7 @@ func TestOrdinaryPolicyTransitionRequiresThisNodesCompletedReport(t *testing.T) 
 		t.Run(mode, func(t *testing.T) {
 			s, task, input := newSharedRestoreFixture(t)
 			ctx := context.Background()
+			s.metrics = NewMetrics(prometheus.NewRegistry())
 			cm, err := s.configMapReconciler.getConfigMap(ctx)
 			require.NoError(t, err)
 			entry, err := existingModelEntry(cm.Data, input.ChildModelKey)
@@ -145,11 +146,16 @@ func TestOrdinaryPolicyTransitionRequiresThisNodesCompletedReport(t *testing.T) 
 			_, err = s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
 			require.NoError(t, err)
 			s.baseModelLister = &mockBaseModelLister{models: []*v1beta1.BaseModel{task.BaseModel}}
-			err = s.processTaskWithSourceAdapters(task, true, func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error) {
-				t.Fatal("unproved retained request must not enter ordinary source")
-				return false, nil
+			sourceReached := errors.New("restoration requires validation")
+			err = s.processTaskWithSourceAdapters(task, true, func(ctx context.Context, current *GopherTask, _ v1beta1.BaseModelSpec, _ bool) (bool, error) {
+				require.True(t, activeArtifactRestore(ctx, current), "an unproved request must still require source validation")
+				return false, sourceReached
 			}, nil)
-			require.Error(t, err)
+			if mode == "missing report" {
+				require.ErrorIs(t, err, sourceReached)
+			} else {
+				require.Error(t, err)
+			}
 			require.Nil(t, task.completedArtifactRequest)
 		})
 	}

@@ -236,7 +236,7 @@ func TestSharedRestoreSnapshotRefreshPreservesScoutOverrideClassification(t *tes
 			require.Empty(t, refreshed.HfResolvedRevision, "changed source execution must not inherit an old pinned revision")
 			require.Equal(t, current.BaseModel.Spec.Storage, refreshed.BaseModel.Spec.Storage)
 			if changed == "policy" {
-				require.ErrorContains(t, s.processTask(refreshed), "eligible Shared source")
+				require.True(t, isDirectHfRestoreEligible(refreshed, taskModelSpec(refreshed).Storage), "Direct HF policy remains eligible for restoration")
 			}
 		})
 	}
@@ -257,5 +257,5 @@ func TestSharedRestoreRefreshedIneligibleSourceStopsBeforeFiles(t *testing.T) {
 	require.ErrorContains(t, s.processTaskWithSourceAdapters(refreshed, true, func(context.Context, *GopherTask, v1beta1.BaseModelSpec, bool) (bool, error) {
 		t.Fatal("active restore with an ineligible source cannot touch files")
 		return false, nil
-	}, nil), "eligible Shared source")
+	}, nil), "eligible HF or Shared source")
 }
