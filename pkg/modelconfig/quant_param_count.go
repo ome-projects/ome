@@ -141,7 +141,7 @@ var excludeGlobCache sync.Map
 //
 //	NVFP4 / MXFP4 / FP4 in U8/I8 → 2
 //	INT4_* / W4A* in I32 → 8, in I16 → 4, in U8/I8 → 2
-//	INT8_GPTQ in I32 → 4, in I16 → 2
+//	INT8_GPTQ / INT8_AWQ in I32 → 4, in I16 → 2
 //	FP8 → 1   (already 8 bits, no packing)
 //	other → 1
 func QuantPackingFactor(quantAlgo, dtype string) int64 {
@@ -153,7 +153,7 @@ func QuantPackingFactor(quantAlgo, dtype string) int64 {
 	}
 
 	switch {
-	case algo == "int8_gptq":
+	case algo == "int8_gptq" || algo == "int8_awq":
 		switch dt {
 		case "I32", "U32", "INT32", "UINT32":
 			return 4

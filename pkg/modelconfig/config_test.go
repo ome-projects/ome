@@ -16,8 +16,10 @@ func TestGenericModelWeightSize(t *testing.T) {
 	}{
 		{"unquantized", nil, 26},
 		{"FP8", &QuantizationConfig{QuantMethod: "fbgemm_fp8"}, 13},
+		{"block-scaled FP8", &QuantizationConfig{QuantMethod: "modelopt", QuantAlgo: "FP8_BLOCK_SCALES"}, 13},
 		{"INT4", &QuantizationConfig{QuantMethod: "gptq", Bits: 4}, 7},
 		{"8-bit GPTQ", &QuantizationConfig{QuantMethod: "gptq", Bits: 8}, 13},
+		{"8-bit AWQ", &QuantizationConfig{QuantMethod: "awq", Bits: 8}, 13},
 		{"unspecified bit width", &QuantizationConfig{QuantMethod: "gptq"}, 26},
 		{"container only", &QuantizationConfig{QuantMethod: "compressed-tensors"}, 26},
 		{"unknown algorithm", &QuantizationConfig{QuantMethod: "future-format"}, 26},
@@ -43,6 +45,7 @@ func TestGenericModelWeightSizeFromPackedWeights(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "model.safetensors"), header, 0o600))
 	for quantJSON, wantParams := range map[string]int64{
 		`{"quant_method":"awq","bits":4}`:  32,
+		`{"quant_method":"awq","bits":8}`:  16,
 		`{"quant_method":"gptq","bits":8}`: 16,
 	} {
 		model, err := ParseModelConfig(ModelConfigInput{
