@@ -89,6 +89,43 @@ func TestMerge_NamedListPerKeyMergesEnvVars(t *testing.T) {
 	g.Expect(envByName).To(gomega.HaveKeyWithValue("FROM_CHILD", "yes"))
 }
 
+func TestMerge_EnvVarSourceChildReplacesParent(t *testing.T) {
+	configMapSource := &corev1.EnvVarSource{ConfigMapKeyRef: &corev1.ConfigMapKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "settings"}, Key: "level"}}
+	secretSource := &corev1.EnvVarSource{SecretKeyRef: &corev1.SecretKeySelector{
+		LocalObjectReference: corev1.LocalObjectReference{Name: "credentials"}, Key: "token"}}
+
+	tests := []struct {
+		name   string
+		parent corev1.EnvVar
+		child  corev1.EnvVar
+	}{
+		{"literal replaced by source", corev1.EnvVar{Name: "X", Value: "parent"}, corev1.EnvVar{Name: "X", ValueFrom: configMapSource}},
+		{"source replaced by literal", corev1.EnvVar{Name: "X", ValueFrom: configMapSource}, corev1.EnvVar{Name: "X", Value: "child"}},
+		{"source replaced by other source", corev1.EnvVar{Name: "X", ValueFrom: configMapSource}, corev1.EnvVar{Name: "X", ValueFrom: secretSource}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := gomega.NewWithT(t)
+			spec := func(env corev1.EnvVar) *v1beta1.ServingRuntimeSpec {
+				return &v1beta1.ServingRuntimeSpec{
+					ServingRuntimePodSpec: v1beta1.ServingRuntimePodSpec{
+						Containers: []corev1.Container{{Name: "ome-container", Env: []corev1.EnvVar{env}}},
+					},
+					EngineConfig: &v1beta1.EngineSpec{
+						Runner: &v1beta1.RunnerSpec{Container: corev1.Container{Name: "ome-container", Env: []corev1.EnvVar{env}}},
+					},
+				}
+			}
+
+			got, err := Merge(spec(tt.parent), spec(tt.child))
+			g.Expect(err).NotTo(gomega.HaveOccurred())
+			g.Expect(got.Containers[0].Env).To(gomega.Equal([]corev1.EnvVar{tt.child}))
+			g.Expect(got.EngineConfig.Runner.Env).To(gomega.Equal([]corev1.EnvVar{tt.child}))
+		})
+	}
+}
+
 func TestMerge_PlainListChildReplaces(t *testing.T) {
 	g := gomega.NewWithT(t)
 	// Command is a plain list — child replaces parent entirely.
