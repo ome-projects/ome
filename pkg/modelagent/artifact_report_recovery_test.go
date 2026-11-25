@@ -392,7 +392,13 @@ func TestArtifactReportRecoveryCoalescesActiveAndDelayedTasks(t *testing.T) {
 					return true, s.requeueHfArtifactTask(task, newHfArtifactRetryResult(input.Parent.Key, errors.New("publication unavailable")))
 				}, nil)
 			}()
-			<-started
+			select {
+			case <-started:
+			case err := <-done:
+				t.Fatalf("worker exited before signaling startup: %v", err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("worker did not signal startup before timeout")
+			}
 			for i := 0; i < 3; i++ {
 				require.NoError(t, s.recoverArtifactReports(ctx))
 				require.Zero(t, s.taskQueue.len())

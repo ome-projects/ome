@@ -225,9 +225,10 @@ removed but ConfigMap cleanup was interrupted. A new download waits for that
 deletion to finish. Other abandoned download or repair locks are released for
 retry; a matching ready marker completes the pending Ready update instead.
 
-## Evicting a Shared artifact while keeping the model
+## Evicting Direct or Shared artifacts while keeping the model
 
-For a model with a recorded Shared relationship on the node, set:
+For a model with a recorded Shared relationship or a Direct Hugging Face/OCI
+copy on the node, set:
 
 ```yaml
 metadata:
@@ -237,22 +238,42 @@ metadata:
 
 The value is case-sensitive. Each agent on a node matching the model's placement
 withdraws that model's readiness,
-releases its Shared reference, and removes unreferenced local files. The model
+releases any Shared reference, and removes eligible local files. The model
 resource and remote source remain. Its entry in the per-node status ConfigMap
 reports `Evicted` with `modelUID` after cleanup finishes. Shared children,
 ordinary models borrowing the paths, and pending cleanups can keep files
 resident; `Evicted` acknowledges release of this model's ownership, not that
 every shared byte was removed.
 
-Eviction requires persisted Shared ownership. Missing or unsupported ownership
-fails explicitly and preserves files. Failed readiness withdrawal or ownership
-lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
+Direct eviction cleans the model's independent directory under the configured
+model store root. It requires recorded ownership and refuses paths referenced
+by another model, symlink destinations, and reserved artifact directories.
+Local, PVC, and vendor storage are not supported. The source and Model CR remain;
+the node entry reports `Evicted` after cleanup succeeds.
+
+Direct cleanup persists its model UID and target path before deleting files.
+A later task for that model resumes an unfinished receipt before new file work.
+After restart, it resumes when the CR still requests eviction and the node is
+eligible, when an eligible download is queued, or when a Delete task arrives;
+ineligible models without a new task are not replayed automatically.
+
+Shared eviction follows the persisted relationship, independently of download policy.
+When no artifact ownership is recorded and the destination is absent, the agent
+can acknowledge `Evicted` without deleting files. Otherwise, missing or unsupported
+ownership fails explicitly and preserves any existing unrecorded directory.
+Failed readiness withdrawal or ownership lookups also block cleanup. Interrupted cleanup resumes at its recorded paths;
 do not edit cleanup records or delete lock files. Existing downloads cannot
 publish this model as Ready while `Evicted` remains requested.
 
-Before requesting eviction, ensure no other Model CR uses the same target
-`storage.path`. Different model paths may still share an artifact parent; eviction
-releases only this model's reference and retains files needed by other references.
+### Out of scope
+
+Direct and Shared eviction, and Shared rehydration, do not support:
+
+- Changing an existing Model CR's `storage.path` as part of eviction or rehydration.
+- Evicting a model while another Model CR uses the same target `storage.path`.
+
+Different model paths may still share an artifact parent; eviction releases only
+this model's reference and retains files needed by other references.
 
 Choose eviction only after deciding that serving workloads no longer require
 this model. The agent checks local file ownership, not Pods or serving demand.
