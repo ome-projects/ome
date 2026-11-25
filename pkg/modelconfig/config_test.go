@@ -4,7 +4,59 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 )
+
+func TestGenericModelWeightSize(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		quant *QuantizationConfig
+		bytes int64
+	}{
+		{"unquantized", nil, 26},
+		{"FP8", &QuantizationConfig{QuantMethod: "fbgemm_fp8"}, 13},
+		{"block-scaled FP8", &QuantizationConfig{QuantMethod: "modelopt", QuantAlgo: "FP8_BLOCK_SCALES"}, 13},
+		{"INT4", &QuantizationConfig{QuantMethod: "gptq", Bits: 4}, 7},
+		{"8-bit GPTQ", &QuantizationConfig{QuantMethod: "gptq", Bits: 8}, 13},
+		{"8-bit AWQ", &QuantizationConfig{QuantMethod: "awq", Bits: 8}, 13},
+		{"unspecified bit width", &QuantizationConfig{QuantMethod: "gptq"}, 26},
+		{"container only", &QuantizationConfig{QuantMethod: "compressed-tensors"}, 26},
+		{"unknown algorithm", &QuantizationConfig{QuantMethod: "future-format"}, 26},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			model := GenericModelConfig{
+				BaseModelConfig:    BaseModelConfig{TorchDtype: "bfloat16"},
+				HiddenSize:         1,
+				NumHiddenLayers:    1,
+				VocabSize:          1, // 12 layer parameters and one embedding.
+				QuantizationConfig: tc.quant,
+			}
+			require.Equal(t, tc.bytes, model.GetModelSizeBytes())
+		})
+	}
+}
+
+func TestGenericModelWeightSizeFromPackedWeights(t *testing.T) {
+	dir := t.TempDir()
+	header := safetensorsHeaderForTest(t, map[string]map[string]any{
+		"proj.qweight": {"shape": []int64{4}, "dtype": "I32", "data_offsets": []int64{0, 16}},
+	})
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "model.safetensors"), header, 0o600))
+	for quantJSON, wantParams := range map[string]int64{
+		`{"quant_method":"awq","bits":4}`:  32,
+		`{"quant_method":"awq","bits":8}`:  16,
+		`{"quant_method":"gptq","bits":8}`: 16,
+	} {
+		model, err := ParseModelConfig(ModelConfigInput{
+			Path: filepath.Join(dir, "config.json"),
+			Data: []byte(`{"model_type":"llama","dtype":"bfloat16","quantization_config":` + quantJSON + `}`),
+		})
+		require.NoError(t, err)
+		require.Equal(t, wantParams, model.GetParameterCount(), quantJSON)
+		require.Equal(t, int64(16), model.GetModelSizeBytes(), quantJSON)
+	}
+}
 
 func TestParseModelConfigFromBytes(t *testing.T) {
 	configPath := filepath.Join("testdata", "tiny-random-PhiModel", "config.json")
@@ -432,10 +484,7 @@ func TestGenericContextLengthCascade(t *testing.T) {
 	}
 }
 
-// TestGenericNestedDtypeRescue covers nested text_config.dtype being
-// promoted to top-level TorchDtype when no top-level torch_dtype is
-// present (qwen3_5 family stores dtype under text_config.dtype).
-func TestGenericNestedDtypeRescue(t *testing.T) {
+func TestGenericDtypePrecedence(t *testing.T) {
 	cases := []struct {
 		name string
 		json string
@@ -443,8 +492,18 @@ func TestGenericNestedDtypeRescue(t *testing.T) {
 	}{
 		{
 			name: "top-level torch_dtype wins",
-			json: `{"model_type":"unknown","torch_dtype":"bfloat16","text_config":{"dtype":"float16"}}`,
+			json: `{"model_type":"unknown","torch_dtype":"bfloat16","dtype":"float32","text_config":{"dtype":"float16"}}`,
 			want: "bfloat16",
+		},
+		{
+			name: "empty torch_dtype uses dtype before nested torch_dtype",
+			json: `{"model_type":"unknown","torch_dtype":"","dtype":"bfloat16","text_config":{"torch_dtype":"float16"}}`,
+			want: "bfloat16",
+		},
+		{
+			name: "non-string dtype still allows nested fallback",
+			json: `{"model_type":"unknown","dtype":{"text":"float32"},"text_config":{"dtype":"float16"}}`,
+			want: "float16",
 		},
 		{
 			name: "rescues nested text_config.dtype",

@@ -152,8 +152,8 @@ func (p *ModelConfigParser) ParseModelConfigFromFiles(ctx context.Context, files
 	return p.finishParse(hfModel, quantConfig, parameterCount, baseModel, clusterBaseModel), nil
 }
 
-// resolveQuantConfig picks the one quantization config that both the
-// parameter count and spec.Quantization read, so the two never disagree: the
+// resolveQuantConfig selects the quantization config used for the parameter
+// count, weight size estimate, and spec.Quantization. It prefers the
 // standalone hf_quant_config.json (ModelOpt) when present, else the
 // config's embedded quantization_config block (mxfp4, fbgemm_fp8, fp8,
 // gptq, awq), else nil.
@@ -165,9 +165,8 @@ func resolveQuantConfig(standalone *modelconfig.HFQuantConfig, hfModel modelconf
 }
 
 // quantAwareParameterCount counts the safetensors beside configPath with
-// the quantization config applied; the config's own count under-counts
-// packed-quant models and over-counts excluded modules. Nil when there is
-// no quantization config or the files cannot be counted.
+// the resolved quantization config, including any standalone override.
+// It returns nil when there is no quantization config or counting fails.
 func (p *ModelConfigParser) quantAwareParameterCount(configPath string, quantConfig *modelconfig.HFQuantConfig) *int64 {
 	if quantConfig == nil || configPath == "" {
 		return nil
@@ -186,7 +185,7 @@ func (p *ModelConfigParser) quantAwareParameterCount(configPath string, quantCon
 // the model the caller passed. A non-nil parameterCount replaces the
 // config's own count.
 func (p *ModelConfigParser) finishParse(hfModel modelconfig.HuggingFaceModel, quantConfig *modelconfig.HFQuantConfig, parameterCount *int64, baseModel *v1beta1.BaseModel, clusterBaseModel *v1beta1.ClusterBaseModel) *ModelMetadata {
-	metadata := p.extractModelMetadata(hfModel, parameterCount)
+	metadata := p.extractModelMetadata(hfModel, quantConfig, parameterCount)
 	applyQuantizationFromConfig(&metadata, quantConfig, p.logger)
 	p.updateParsedModelMetadata(baseModel, clusterBaseModel, metadata)
 	return &metadata
@@ -437,17 +436,19 @@ func (p *ModelConfigParser) loadHFQuantConfig(modelDir string) *modelconfig.HFQu
 }
 
 // extractModelMetadata reads the metadata of a parsed config. A non-nil
-// parameterCountOverride replaces the config's own count and sizes the
-// model from it. Quantization is left to applyQuantizationFromConfig.
-func (p *ModelConfigParser) extractModelMetadata(hfModel modelconfig.HuggingFaceModel, parameterCountOverride *int64) ModelMetadata {
+// parameterCountOverride replaces the config's own count for the weight
+// size estimate. The resolved quantConfig supplies the weight precision.
+func (p *ModelConfigParser) extractModelMetadata(hfModel modelconfig.HuggingFaceModel, quantConfig *modelconfig.HFQuantConfig, parameterCountOverride *int64) ModelMetadata {
 	var diffusionModel *modelconfig.DiffusionPipelineSpec
 	if dm, ok := hfModel.(modelconfig.HuggingFaceDiffusionModel); ok {
 		diffusionModel = dm.GetDiffusionModel()
 	}
 
-	parameterCount := hfModel.GetParameterCount()
+	var parameterCount int64
 	if parameterCountOverride != nil {
 		parameterCount = *parameterCountOverride
+	} else {
+		parameterCount = hfModel.GetParameterCount()
 	}
 
 	metadata := ModelMetadata{
@@ -459,11 +460,7 @@ func (p *ModelConfigParser) extractModelMetadata(hfModel modelconfig.HuggingFace
 	}
 	p.populateFormatAndFramework(&metadata, hfModel, diffusionModel)
 
-	modelSizeBytes := hfModel.GetModelSizeBytes()
-	if parameterCountOverride != nil {
-		modelSizeBytes = modelconfig.EstimateModelSizeBytes(parameterCount, hfModel.GetTorchDtype())
-	}
-
+	modelSizeBytes := modelconfig.EstimateModelSizeBytesWithQuantConfig(parameterCount, hfModel.GetTorchDtype(), quantConfig)
 	configJSON, err := marshalModelConfiguration(hfModel, parameterCount, modelSizeBytes)
 	if err != nil {
 		p.logger.Warnw("marshal model configuration failed", "error", err)

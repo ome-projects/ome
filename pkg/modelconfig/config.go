@@ -54,7 +54,7 @@ type GenericModelConfig struct {
 // fall back to architecture-based estimation (MoE-aware).
 func (c *GenericModelConfig) GetParameterCount() int64 {
 	if c.ConfigPath != "" {
-		count, err := FindAndParseSafetensors(c.ConfigPath)
+		count, err := FindAndParseSafetensorsWithQuantConfig(c.ConfigPath, c.GetHFQuantConfig())
 		if err == nil && count > 0 {
 			return count
 		}
@@ -165,6 +165,9 @@ func probeNestedConfig(data []byte, config *GenericModelConfig) {
 		return
 	}
 	config.soundConfig = raw["sound_config"]
+	if config.TorchDtype == "" {
+		config.TorchDtype = parseJSONStringField(raw, "dtype")
+	}
 
 	for _, key := range nestedLLMConfigKeys {
 		sub, ok := raw[key]
@@ -332,11 +335,7 @@ func (c *GenericModelConfig) GetCapabilities() []Capability {
 }
 
 func (c *GenericModelConfig) GetModelSizeBytes() int64 {
-	paramCount := c.GetParameterCount()
-	if paramCount == 0 {
-		return 0
-	}
-	return EstimateModelSizeBytes(paramCount, c.TorchDtype)
+	return EstimateModelSizeBytesWithQuantConfig(c.GetParameterCount(), c.TorchDtype, c.GetHFQuantConfig())
 }
 
 // parseGenericModelConfig dispatches between transformer config.json

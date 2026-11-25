@@ -227,10 +227,11 @@ func TestExtractModelMetadataFromHF(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			metadata := parser.extractModelMetadata(tc.mockModel, nil)
+			quantConfig := syntheticQuantConfig(tc.mockModel.quantizationType)
+			metadata := parser.extractModelMetadata(tc.mockModel, quantConfig, nil)
 			// extractModelMetadata leaves Quantization to
 			// applyQuantizationFromConfig, as the parse entry points do.
-			applyQuantizationFromConfig(&metadata, syntheticQuantConfig(tc.mockModel.quantizationType), parser.logger)
+			applyQuantizationFromConfig(&metadata, quantConfig, parser.logger)
 
 			if !tc.expectedMetadata(metadata) {
 				t.Errorf("Metadata does not match expected values for test case %s", tc.name)
@@ -556,6 +557,34 @@ func safetensorsHeaderBytesForTest(t *testing.T, tensors map[string]map[string]a
 	return out
 }
 
+func TestParseModelConfigFP8WeightSize(t *testing.T) {
+	parser := NewModelConfigParser(zap.NewNop().Sugar())
+	files := []ModelConfigFileInput{
+		{Path: DefaultConfigFileName, Data: []byte(`{
+			"model_type":"glm_moe_dsa", "dtype":"bfloat16",
+			"quantization_config":{"quant_method":"fp8"}
+		}`)},
+		{Path: "model.safetensors", Data: safetensorsHeaderBytesForTest(t, map[string]map[string]any{
+			"proj.weight": {"shape": []int64{32, 64}, "dtype": "F8_E4M3", "data_offsets": []int64{0, 2048}},
+		})},
+	}
+	dir := t.TempDir()
+	for _, file := range files {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, file.Path), file.Data, 0o600))
+	}
+	fromDir, err := parser.ParseModelConfig(dir, nil, nil)
+	require.NoError(t, err)
+	fromFiles, err := parser.ParseModelConfigFromFiles(context.Background(), files, nil, nil)
+	require.NoError(t, err)
+	for _, metadata := range []*ModelMetadata{fromDir, fromFiles} {
+		var snapshot modelConfigurationSnapshot
+		require.NoError(t, json.Unmarshal(metadata.ModelConfiguration, &snapshot))
+		assert.Equal(t, "bfloat16", snapshot.TorchDtype)
+		assert.Equal(t, int64(2048), snapshot.ModelSizeBytes)
+		assert.Equal(t, v1beta1.ModelQuantizationFP8, metadata.Quantization)
+	}
+}
+
 func TestParseModelConfigFromFiles_QuantAwareSafetensorsCount(t *testing.T) {
 	// End-to-end through ParseModelConfigFromFiles: config.json (no
 	// quantization_config) + hf_quant_config.json (NVFP4) + a synthetic
@@ -686,6 +715,7 @@ func TestParseModelConfigFromFiles_StandaloneHFQuantConfigWinsOverEmbedded(t *te
 		"model_type":"llama",
 		"architectures":["LlamaForCausalLM"],
 		"max_position_embeddings":4096,
+		"hidden_size":2, "num_hidden_layers":1,
 		"quantization_config":{"quant_method":"fp8"}
 	}`)
 	hfQuantJSON := []byte(`{"quant_method":"modelopt","quantization":{"quant_algo":"NVFP4"}}`)
@@ -700,6 +730,9 @@ func TestParseModelConfigFromFiles_StandaloneHFQuantConfigWinsOverEmbedded(t *te
 	if assert.NotNil(t, metadata) {
 		assert.Equal(t, v1beta1.ModelQuantizationNVFP4, metadata.Quantization,
 			"standalone hf_quant_config.json must win — same source as parameter counting, no spec/count divergence")
+		var snapshot modelConfigurationSnapshot
+		require.NoError(t, json.Unmarshal(metadata.ModelConfiguration, &snapshot))
+		assert.Equal(t, int64(24), snapshot.ModelSizeBytes) // 48 architecture-estimated parameters at 4 bits.
 	}
 }
 

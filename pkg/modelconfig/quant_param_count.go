@@ -39,7 +39,7 @@ func IsScaleTensor(tensorName string) bool {
 
 // Notably NOT in this set: "qweight" (AWQ/GPTQ packed weight — IS a
 // real parameter, just stored in I32-packed form; counted via
-// QuantPackingFactor with factor=8 for I32). New entries should be
+// QuantPackingFactor). New entries should be
 // driven by real fixtures in testdata/quant/.
 var scaleExactBasenames = map[string]struct{}{
 	"weight_scale":            {},
@@ -141,6 +141,7 @@ var excludeGlobCache sync.Map
 //
 //	NVFP4 / MXFP4 / FP4 in U8/I8 → 2
 //	INT4_* / W4A* in I32 → 8, in I16 → 4, in U8/I8 → 2
+//	INT8_GPTQ / INT8_AWQ in I32 → 4, in I16 → 2
 //	FP8 → 1   (already 8 bits, no packing)
 //	other → 1
 func QuantPackingFactor(quantAlgo, dtype string) int64 {
@@ -152,6 +153,13 @@ func QuantPackingFactor(quantAlgo, dtype string) int64 {
 	}
 
 	switch {
+	case algo == "int8_gptq" || algo == "int8_awq":
+		switch dt {
+		case "I32", "U32", "INT32", "UINT32":
+			return 4
+		case "I16", "U16", "INT16", "UINT16":
+			return 2
+		}
 	case algo == "nvfp4" || algo == "mxfp4" || algo == "fp4":
 		switch dt {
 		case "U8", "I8", "UINT8", "INT8":
