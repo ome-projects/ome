@@ -17,6 +17,7 @@ func TestGenericModelWeightSize(t *testing.T) {
 		{"unquantized", nil, 26},
 		{"FP8", &QuantizationConfig{QuantMethod: "fbgemm_fp8"}, 13},
 		{"INT4", &QuantizationConfig{QuantMethod: "gptq", Bits: 4}, 7},
+		{"8-bit GPTQ", &QuantizationConfig{QuantMethod: "gptq", Bits: 8}, 13},
 		{"unspecified bit width", &QuantizationConfig{QuantMethod: "gptq"}, 26},
 		{"container only", &QuantizationConfig{QuantMethod: "compressed-tensors"}, 26},
 		{"unknown algorithm", &QuantizationConfig{QuantMethod: "future-format"}, 26},
@@ -40,13 +41,18 @@ func TestGenericModelWeightSizeFromPackedWeights(t *testing.T) {
 		"proj.qweight": {"shape": []int64{4}, "dtype": "I32", "data_offsets": []int64{0, 16}},
 	})
 	require.NoError(t, os.WriteFile(filepath.Join(dir, "model.safetensors"), header, 0o600))
-	model, err := ParseModelConfig(ModelConfigInput{
-		Path: filepath.Join(dir, "config.json"),
-		Data: []byte(`{"model_type":"llama","dtype":"bfloat16","quantization_config":{"quant_method":"awq","bits":4}}`),
-	})
-	require.NoError(t, err)
-	require.Equal(t, int64(32), model.GetParameterCount())
-	require.Equal(t, int64(16), model.GetModelSizeBytes())
+	for quantJSON, wantParams := range map[string]int64{
+		`{"quant_method":"awq","bits":4}`:  32,
+		`{"quant_method":"gptq","bits":8}`: 16,
+	} {
+		model, err := ParseModelConfig(ModelConfigInput{
+			Path: filepath.Join(dir, "config.json"),
+			Data: []byte(`{"model_type":"llama","dtype":"bfloat16","quantization_config":` + quantJSON + `}`),
+		})
+		require.NoError(t, err)
+		require.Equal(t, wantParams, model.GetParameterCount(), quantJSON)
+		require.Equal(t, int64(16), model.GetModelSizeBytes(), quantJSON)
+	}
 }
 
 func TestParseModelConfigFromBytes(t *testing.T) {

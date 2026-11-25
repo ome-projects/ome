@@ -268,7 +268,7 @@ func EstimateModelSizeBytes(paramCount int64, dtype string) int64 {
 func EstimateModelSizeBytesWithQuantConfig(paramCount int64, dtype string, quant *HFQuantConfig) int64 {
 	if quant != nil {
 		switch strings.ToLower(strings.TrimSpace(quant.Quantization.QuantAlgo)) {
-		case "fp8", "fbgemm_fp8", "fp8_per_tensor", "fp8_e4m3", "fp8-e4m3", "int8", "int8_sq":
+		case "fp8", "fbgemm_fp8", "fp8_per_tensor", "fp8_e4m3", "fp8-e4m3", "int8", "int8_sq", "int8_gptq":
 			return paramCount
 		case "fp4", "mxfp4", "nvfp4", "int4", "int4_awq", "int4_gptq", "gptq_int4", "w4a8_awq", "w4a16_awq":
 			return paramCount/2 + paramCount%2
