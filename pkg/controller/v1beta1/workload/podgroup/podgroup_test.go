@@ -560,7 +560,7 @@ func TestReconcileDesiredTopologyWithLivePods_MissingGroupAmbiguousAffinityFails
 
 	err := reconcileDesiredTopologyWithLivePods(
 		desired, &schedulingv1alpha1.PodGroup{}, false,
-		"llama", workload.ComponentEngine, 0, pods)
+		"llama", workload.ComponentEngine, 0, pods, false)
 	if err == nil {
 		t.Fatal("ambiguous live topology with nonempty desired key must fail closed")
 	}
@@ -587,7 +587,7 @@ func TestReconcileDesiredTopologyWithLivePods_DoesNotPromoteUserAffinity(t *test
 
 	err := reconcileDesiredTopologyWithLivePods(
 		desired, &schedulingv1alpha1.PodGroup{}, false,
-		"llama", workload.ComponentEngine, 0, pods)
+		"llama", workload.ComponentEngine, 0, pods, false)
 	if err == nil {
 		t.Fatal("unrelated user affinity must not prove the gang topology")
 	}

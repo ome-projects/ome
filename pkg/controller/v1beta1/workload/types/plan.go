@@ -107,8 +107,11 @@ type ComponentPlan struct {
 	TopologyKey string
 
 	// InstanceTopologyKeys holds a temporary per-Instance override while live
-	// pods still carry affinity rendered from an older revision. Missing pods in
-	// that active gang must use the same immutable topology contract; fresh
+	// pods still carry affinity rendered from an older revision. BuildPlan
+	// fills it from the key each Instance's revision recorded, where an
+	// empty value is an explicit topology-free contract; the PodGroup pass
+	// then replaces it with each gang's effective key. Missing pods in that
+	// active gang must use the same immutable topology contract; fresh
 	// Instances and surge indices fall back to TopologyKey.
 	InstanceTopologyKeys map[int32]string
 
@@ -218,6 +221,16 @@ func (p ComponentPlan) TopologyKeyForInstance(index int32) string {
 		return key
 	}
 	return p.TopologyKey
+}
+
+// TopologyKeyForInstanceAndPods returns the Component's desired key for an
+// empty gang. Once any member is live, the Instance's revision or live
+// override holds the immutable contract those members were rendered under.
+func (p ComponentPlan) TopologyKeyForInstanceAndPods(index int32, podCount int) string {
+	if podCount == 0 {
+		return p.TopologyKey
+	}
+	return p.TopologyKeyForInstance(index)
 }
 
 // InstanceAt returns the planned Instance with Index idx, or nil when the

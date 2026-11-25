@@ -467,6 +467,72 @@ func TestEnsurePodGroups_LeaderOnlyTrustsExistingPodGroupTopology(t *testing.T) 
 	}
 }
 
+// A revision-recorded topology answers the contract even when only the
+// leader remains. Once the gang is empty, the Component's desired key takes
+// over so the replacement does not inherit the old revision's contract.
+func TestEnsurePodGroups_RevisionTopologyWithoutWorkerProof(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		recorded string
+	}{
+		{name: "unkeyed revision", recorded: ""},
+		{name: "keyed revision", recorded: "topology.example.com/old"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const desired = "topology.example.com/new"
+			owner := newOwner("prod", "llama")
+			pgName := query.PodGroupName("llama", workloadtypes.ComponentEngine, 0)
+			existing := &schedulingv1alpha1.PodGroup{
+				ObjectMeta: metav1.ObjectMeta{Name: pgName, Namespace: "prod"},
+				Spec:       schedulingv1alpha1.PodGroupSpec{MinMember: 2},
+			}
+			leader := topologyLeaderPod("prod", "llama", workloadtypes.ComponentEngine, 0, pgName)
+			c := newGangClient(t, owner, existing, leader)
+			input, _ := inputWithConditionStore(owner, true, 1, true, "")
+			plan := planFor(workloadtypes.ComponentEngine, []int32{0}, true, 1, 5*time.Minute)
+			plan.TopologyKey = desired
+			plan.InstanceTopologyKeys = map[int32]string{0: tc.recorded}
+			ctx := context.Background()
+
+			effective, err := EnsurePodGroupsWithState(ctx, workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
+			if err != nil {
+				t.Fatalf("EnsurePodGroupsWithState with revision-recorded topology: %v", err)
+			}
+			if got := effective[0]; got != tc.recorded {
+				t.Fatalf("live effective topology: got %q want %q", got, tc.recorded)
+			}
+			got := &schedulingv1alpha1.PodGroup{}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(existing), got); err != nil {
+				t.Fatalf("get live PodGroup: %v", err)
+			}
+			if tc.recorded == "" {
+				if _, found := got.Annotations[query.AnnotationTopologyKey]; found {
+					t.Fatalf("unkeyed live gang gained a topology annotation: %#v", got.Annotations)
+				}
+			} else if got := got.Annotations[query.AnnotationTopologyKey]; got != tc.recorded {
+				t.Fatalf("live PodGroup topology: got %q want %q", got, tc.recorded)
+			}
+
+			if err := c.Delete(ctx, leader); err != nil {
+				t.Fatalf("delete old leader: %v", err)
+			}
+			effective, err = EnsurePodGroupsWithState(ctx, workloadtypes.Deps{Client: c}, input, plan, PodGroupReconcileState{})
+			if err != nil {
+				t.Fatalf("EnsurePodGroupsWithState with empty gang: %v", err)
+			}
+			if got := effective[0]; got != desired {
+				t.Fatalf("empty effective topology: got %q want %q", got, desired)
+			}
+			if err := c.Get(ctx, client.ObjectKeyFromObject(existing), got); err != nil {
+				t.Fatalf("get empty PodGroup: %v", err)
+			}
+			if got := got.Annotations[query.AnnotationTopologyKey]; got != desired {
+				t.Fatalf("empty PodGroup topology: got %q want %q", got, desired)
+			}
+		})
+	}
+}
+
 func TestEnsurePodGroups_CRDMissingPreservesLiveTopology(t *testing.T) {
 	owner := newOwner("prod", "llama")
 	const oldTopology = "topology.example.com/live-old"

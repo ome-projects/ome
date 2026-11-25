@@ -1547,6 +1547,43 @@ func TestBuildPlan_InstanceKeepsTheWidthOfItsOwnRevision(t *testing.T) {
 	}
 }
 
+// A revision's topology is authoritative for the Instances rendering it.
+// In particular, an empty value is an explicit topology-free contract, not
+// an unknown revision that should fall back to the new desired key.
+func TestBuildPlan_InstanceKeepsTopologyOfItsOwnRevision(t *testing.T) {
+	desired := multiPodDesired(3, 1, types.Lifecycle{})
+	desired.TopologyKey = "topology.example.com/new"
+	observed := types.WorkloadObservedState{
+		InstanceStatuses: []types.InstanceStatus{
+			{Index: 0, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "svc-engine-unkeyed", PodCount: 2, ServingPodCount: 2},
+			{Index: 1, Incarnation: 1, Phase: types.InstancePhaseReady, RunningRevision: "svc-engine-keyed", PodCount: 2, ServingPodCount: 2},
+		},
+		TopologyKeyByRevision: map[string]string{
+			"svc-engine-unkeyed": "",
+			"svc-engine-keyed":   "topology.example.com/old",
+		},
+	}
+	plan, err := BuildPlan(types.ComponentEngine, desired, observed)
+	if err != nil {
+		t.Fatalf("BuildPlan: %v", err)
+	}
+	if key, found := plan.InstanceTopologyKeys[0]; !found || key != "" {
+		t.Errorf("unkeyed revision override: got %q found=%t, want an explicit empty key", key, found)
+	}
+	if got := plan.TopologyKeyForInstance(0); got != "" {
+		t.Errorf("unkeyed revision topology: got %q want empty", got)
+	}
+	if got := plan.TopologyKeyForInstance(1); got != "topology.example.com/old" {
+		t.Errorf("keyed revision topology: got %q want the old key", got)
+	}
+	if _, found := plan.InstanceTopologyKeys[2]; found {
+		t.Error("a fresh Instance must not inherit another revision's override")
+	}
+	if got := plan.TopologyKeyForInstance(2); got != desired.TopologyKey {
+		t.Errorf("fresh Instance topology: got %q want %q", got, desired.TopologyKey)
+	}
+}
+
 // TestBuildPlan_MigrationSurgeRendersTheSourceWidth pins that a migration's
 // surge marker, which records no revision of its own, renders its source's:
 // the surge is the source gang moved, at the width the source runs.

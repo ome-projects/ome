@@ -159,6 +159,13 @@ type WorkloadObservedState struct {
 	// and renders the desired one.
 	WorkerSizeByRevision map[string]int32
 
+	// TopologyKeyByRevision is the topology key each referenced multi-pod
+	// revision recorded, projected per reconcile from ControllerRevisions.
+	// Presence with an empty value is an explicit topology-free contract.
+	// Absence means no usable topology record, so the Instance falls back to
+	// the desired key and keeps the live-proof fail-closed protections.
+	TopologyKeyByRevision map[string]string
+
 	// rowIndex is where each row sits in InstanceStatuses, built by IndexRows
 	// at the start of a pass and shared by every copy of the state made after
 	// it. nil until then, and a lookup without one scans the slice.

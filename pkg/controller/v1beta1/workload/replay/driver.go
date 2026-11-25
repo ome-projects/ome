@@ -1125,12 +1125,16 @@ func (d *driver) runTick(ctx context.Context, tick Tick) error {
 		RetryBlocks:      d.store.RetryBlocks(),
 		Migrations:       append([]types.MigrationRecord(nil), d.migrations...),
 	}
-	// As the adapter does: each Instance renders the width its own revision
-	// recorded, read from the revisions the rows reference beside the target.
-	observed.WorkerSizeByRevision, err = revision.WorkerSizesByRevision(ctx, d.cli, d.opts.Namespace,
-		revision.ReferencedRevisionNames(observed.InstanceStatuses, target.Name))
+	// As the adapter does: each Instance renders the width and topology its
+	// own revision recorded, read beside the target from the rows' revisions.
+	names := revision.ReferencedRevisionNames(observed.InstanceStatuses, target.Name)
+	observed.WorkerSizeByRevision, err = revision.WorkerSizesByRevision(ctx, d.cli, d.opts.Namespace, names)
 	if err != nil {
 		return fmt.Errorf("replay: read revision widths: %w", err)
+	}
+	observed.TopologyKeyByRevision, err = revision.TopologyKeysByRevision(ctx, d.cli, d.opts.Namespace, names)
+	if err != nil {
+		return fmt.Errorf("replay: read revision topology keys: %w", err)
 	}
 	if observed.CordonedInstances, err = d.cordonedInstances(ctx, desired, observed); err != nil {
 		return err

@@ -43,19 +43,29 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 	instances := make([]types.InstancePlan, len(indices))
 	runners := runnersForInstance(desired.MultiPod, workerSize)
 	layout := types.ComponentPlan{Runners: runners, WorkerSizeByRevision: observed.WorkerSizeByRevision}
+	var instanceTopologyKeys map[int32]string
 	for i, idx := range indices {
 		// An Instance renders the width its own revision recorded, so a gang
 		// settled on an older revision keeps its layout until the roll takes it,
 		// and a new Instance the width of the revision it is built on.
+		rev := renderedRevision(desired, &observed, idx)
 		instances[i] = types.InstancePlan{
 			Index:       idx,
 			Incarnation: incarnationForIndex(&observed, idx),
-			Runners:     layout.RunnersFor(types.InstancePlan{Runners: runners}, renderedRevision(desired, &observed, idx)),
+			Runners:     layout.RunnersFor(types.InstancePlan{Runners: runners}, rev),
 			// Relocation-directive memory: the adapter projects the
 			// per-instance node-exclusion list from the audit ledger;
 			// Render turns it into a required NotIn hostname term so
 			// the rebuild lands off the recorded suspect node(s).
 			ExcludedNodes: append([]types.NodeExclusion(nil), observed.ExcludedNodesByInstance[idx]...),
+		}
+		if key, recorded := observed.TopologyKeyByRevision[rev]; recorded {
+			if instanceTopologyKeys == nil {
+				instanceTopologyKeys = make(map[int32]string)
+			}
+			// Presence, including an explicitly empty key, distinguishes a
+			// revision-recorded contract from an unavailable revision record.
+			instanceTopologyKeys[idx] = key
 		}
 	}
 
@@ -78,6 +88,7 @@ func BuildPlan(component types.ComponentType, desired types.WorkloadDesiredSpec,
 		Paused:               desired.Paused,
 		PauseFreeze:          desired.PauseFreeze,
 		TopologyKey:          desired.TopologyKey,
+		InstanceTopologyKeys: instanceTopologyKeys,
 		TopologySpread:       desired.TopologySpread,
 		TopologySpreadKey:    desired.TopologySpreadKey,
 		PairingProtocol:      desired.PairingProtocol,

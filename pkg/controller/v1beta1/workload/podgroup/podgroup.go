@@ -224,7 +224,7 @@ func GroupSettled(
 	index := indexText(inst.Index)
 	return labelsSettled(existing.Labels, ownerName, plan.Component, &index) &&
 		controllerReferenceSettled(existing.OwnerReferences, owner, ownerGVK) &&
-		topologySettled(existing, plan.TopologyKeyForInstance(inst.Index), ownerName, plan.Component, &index, pods)
+		topologySettled(existing, plan.TopologyKeyForInstanceAndPods(inst.Index, len(pods)), ownerName, plan.Component, &index, pods)
 }
 
 // timeoutSettled reports whether a group's timeout is the one the grace
@@ -455,8 +455,14 @@ func DesiredPodGroup(
 			return nil, err
 		}
 	}
-	if len(pods) > 0 {
-		if err := reconcileDesiredTopologyWithLivePods(desired, existing, found, ownerName, plan.Component, inst.Index, pods); err != nil {
+	if len(pods) == 0 {
+		// An empty gang starts the desired contract. A revision override held
+		// only while its immutable members were live must not pin this key.
+		setTopologyKeyAnnotation(desired, plan.TopologyKey, plan.TopologyKey != "")
+	} else {
+		_, recorded := plan.InstanceTopologyKeys[inst.Index]
+		if err := reconcileDesiredTopologyWithLivePods(desired, existing, found, ownerName,
+			plan.Component, inst.Index, pods, recorded); err != nil {
 			return nil, fmt.Errorf("EnsurePodGroup: reconcile live topology: %w", err)
 		}
 	}
@@ -529,10 +535,18 @@ func IsNotFound(err error) bool {
 // EffectiveTopologyKeyForPods returns the topology contract that is safe for
 // an Instance when no PodGroup exists to retain prior controller state. Empty
 // pods use the current desired key. Once any immutable pod is live, only an
-// exact controller-generated worker-to-leader term proves the active key. If
-// desired topology is nonempty and no key can be proven, return an error so
-// callers hold pod creation instead of silently rendering a split gang.
+// exact controller-generated worker-to-leader term or a revision-recorded
+// per-Instance contract proves the active key. Without either, a nonempty
+// desired key fails closed instead of silently rendering a split gang.
 func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) (string, error) {
+	return EffectiveTopologyKeyForPodsWithRecord(desiredKey, ownerName, component, instanceIdx, pods, false)
+}
+
+// EffectiveTopologyKeyForPodsWithRecord is EffectiveTopologyKeyForPods with
+// topologyRecorded reporting whether desiredKey came from the Instance's
+// revision or another already-established per-Instance contract. Live proof
+// still wins, and conflicting generated terms still fail closed.
+func EffectiveTopologyKeyForPodsWithRecord(desiredKey, ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod, topologyRecorded bool) (string, error) {
 	if len(pods) == 0 {
 		return desiredKey, nil
 	}
@@ -542,6 +556,9 @@ func EffectiveTopologyKeyForPods(desiredKey, ownerName string, component workloa
 	}
 	if ok {
 		return key, nil
+	}
+	if topologyRecorded {
+		return desiredKey, nil
 	}
 	if desiredKey != "" {
 		return "", fmt.Errorf("cannot prove active topology for %s instance %d from %d live pod(s)", component, instanceIdx, len(pods))
@@ -601,7 +618,9 @@ func leaderIndexSelected(selector *metav1.LabelSelector, ownerName string, compo
 // worker-to-leader term or the existing controller-owned PodGroup annotation is
 // trusted. Arbitrary user affinity may express a different relationship and
 // must never be promoted into the gang scheduler's topology contract.
-func reconcileDesiredTopologyWithLivePods(desired, existing *schedulingv1alpha1.PodGroup, existingFound bool, ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod) error {
+// topologyRecorded says the desired per-Instance key came from its revision
+// or an already-established live contract rather than only the Component spec.
+func reconcileDesiredTopologyWithLivePods(desired, existing *schedulingv1alpha1.PodGroup, existingFound bool, ownerName string, component workload.ComponentType, instanceIdx int32, pods []*corev1.Pod, topologyRecorded bool) error {
 	key, ok, err := TopologyKeyProvenByPods(ownerName, component, instanceIdx, pods)
 	if err != nil {
 		return err
@@ -618,7 +637,10 @@ func reconcileDesiredTopologyWithLivePods(desired, existing *schedulingv1alpha1.
 		}
 	}
 	if desired.Annotations[query.AnnotationTopologyKey] != "" {
-		return fmt.Errorf("cannot prove active topology for %s instance %d from %d live pod(s) and no PodGroup annotation", component, instanceIdx, len(pods))
+		if !topologyRecorded {
+			return fmt.Errorf("cannot prove active topology for %s instance %d from %d live pod(s) and no PodGroup annotation", component, instanceIdx, len(pods))
+		}
+		return nil
 	}
 	// Topology was intentionally left unset. Preserve that non-topology behavior
 	// even when live pods carry unrelated user affinity.
