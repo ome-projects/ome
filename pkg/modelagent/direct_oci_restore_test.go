@@ -681,3 +681,150 @@ func TestDirectOCIRestoreAdmitsOrdinarySource(t *testing.T) {
 	})
 	require.ErrorContains(t, err, expected.Error())
 }
+
+func TestDirectOCIRestoreAfterEvictionWithUnattachedCopy(t *testing.T) {
+	for _, scenario := range []string{"queued", "queued Updating", "during listing", "cluster copy", "recorded Ready", "Ready during withdrawal", "stale UID", "pending Direct cleanup", "pending Shared download", "different source", "different policy", "different format", "different model metadata", "different selector", "recorded config", "pending Shared cleanup", "local borrower", "deleting", "evicting", "missing UID", "unrecorded link", "retained corrupt files"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, task, store := newDirectOCIRestoreFixture(t)
+			ctx := context.Background()
+			path := *task.BaseModel.Spec.Storage.Path
+			eviction := task.BaseModel.DeepCopy()
+			eviction.Annotations[artifactResidencyAnnotation] = "Evicted"
+			_, err := s.omeClient.OmeV1beta1().BaseModels(eviction.Namespace).Update(ctx, eviction, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, s.processTask(&GopherTask{TaskType: Evict, BaseModel: eviction}))
+			require.NoDirExists(t, path)
+			_, err = s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			copy := task.BaseModel.DeepCopy()
+			copy.Namespace, copy.UID, copy.Annotations = "another-team", "copy-uid", nil
+			switch scenario {
+			case "different source":
+				copy.Spec.Storage.StorageUri = ptr("oci://n/ns/b/bucket/o/other")
+			case "different policy":
+				copy.Spec.Storage.DownloadPolicy = ptr(v1beta1.ReuseIfExists)
+			case "different format":
+				copy.Spec.ModelFormat.Name = "other"
+			case "different model metadata":
+				copy.Spec.AdditionalMetadata = map[string]string{"type": "other"}
+			case "different selector":
+				copy.Spec.Storage.NodeSelector = map[string]string{"pool": "other"}
+			case "local borrower":
+				copy.Spec.Storage.StorageUri, copy.Spec.Storage.Path = ptr("local://"+path), nil
+			case "deleting":
+				now := metav1.Now()
+				copy.DeletionTimestamp = &now
+			case "evicting":
+				copy.Annotations = map[string]string{artifactResidencyAnnotation: "Evicted"}
+			case "missing UID":
+				copy.UID = ""
+			case "unrecorded link":
+				require.NoError(t, os.Symlink(path, filepath.Join(s.modelRootDir, "unrecorded")))
+			case "retained corrupt files":
+				require.NoError(t, os.MkdirAll(path, 0o755))
+				require.NoError(t, os.WriteFile(filepath.Join(path, "weights"), []byte("wrong"), 0o600))
+			}
+			createCopy := func() {
+				if scenario == "cluster copy" {
+					cluster := &v1beta1.ClusterBaseModel{ObjectMeta: copy.ObjectMeta, Spec: copy.Spec}
+					cluster.Namespace = ""
+					_, err := s.omeClient.OmeV1beta1().ClusterBaseModels().Create(ctx, cluster, metav1.CreateOptions{})
+					require.NoError(t, err)
+					return
+				}
+				_, err := s.omeClient.OmeV1beta1().BaseModels(copy.Namespace).Create(ctx, copy, metav1.CreateOptions{})
+				require.NoError(t, err)
+			}
+			if scenario == "during listing" {
+				list := store.list
+				store.list = func(uri ociobjectstore.ObjectURI) ([]objectstorage.ObjectSummary, error) {
+					require.NoError(t, os.MkdirAll(path, 0o755))
+					createCopy()
+					return list(uri)
+				}
+			} else {
+				createCopy()
+			}
+			if scenario == "queued Updating" || scenario == "recorded Ready" || scenario == "stale UID" || scenario == "recorded config" || strings.HasPrefix(scenario, "pending") {
+				entry := ModelEntry{Name: copy.Name, ModelUID: copy.UID, Status: ModelStatusUpdating}
+				switch scenario {
+				case "recorded Ready":
+					entry.Status = ModelStatusReady
+				case "stale UID":
+					entry.ModelUID = "old-copy"
+				case "recorded config":
+					entry.Config = &ModelConfig{}
+				case "pending Shared cleanup":
+					entry.HfArtifactPendingDeletion = &HfArtifactPendingDeletion{}
+				case "pending Direct cleanup":
+					entry.DirectArtifactPendingDeletion = &DirectArtifactPendingDeletion{ModelUID: copy.UID, Path: path}
+				case "pending Shared download":
+					entry.HfArtifactPendingDownload = &HfArtifactPendingDownload{}
+				}
+				require.NoError(t, s.configMapReconciler.mutateConfigMapWithRetry(ctx, func(cm *corev1.ConfigMap) (bool, error) {
+					return writeModelEntry(cm.Data, getModelID(copy, nil), entry)
+				}))
+			}
+			injected := false
+			if scenario == "Ready during withdrawal" {
+				client := s.kubeClient.(*fake.Clientset)
+				client.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+					injected = true
+					object, err := client.Tracker().Get(corev1.SchemeGroupVersion.WithResource("configmaps"), s.configMapReconciler.namespace, s.configMapReconciler.nodeName)
+					require.NoError(t, err)
+					cm := object.(*corev1.ConfigMap)
+					_, err = writeModelEntry(cm.Data, getModelID(copy, nil), ModelEntry{Name: copy.Name, ModelUID: copy.UID, Status: ModelStatusReady})
+					require.NoError(t, err)
+					require.NoError(t, client.Tracker().Update(corev1.SchemeGroupVersion.WithResource("configmaps"), cm, cm.Namespace))
+					return false, nil, nil
+				})
+			}
+			err = runDirectOCIRestore(s, task, store)
+			if scenario == "Ready during withdrawal" {
+				require.True(t, injected)
+			}
+			if scenario == "queued" || scenario == "queued Updating" || scenario == "during listing" || scenario == "cluster copy" || scenario == "different format" || scenario == "different model metadata" {
+				require.NoError(t, err)
+				require.Equal(t, 1, store.downloads)
+				b, err := os.ReadFile(filepath.Join(path, "weights"))
+				require.NoError(t, err)
+				require.Equal(t, "model", string(b))
+				cm, err := s.configMapReconciler.getConfigMap(ctx)
+				require.NoError(t, err)
+				entry, err := existingModelEntry(cm.Data, getModelID(task.BaseModel, nil))
+				require.NoError(t, err)
+				require.Equal(t, ModelStatusReady, entry.Status)
+				require.Equal(t, "request-1", entry.ArtifactRehydrationID)
+			} else {
+				require.Error(t, err)
+				require.Zero(t, store.downloads)
+				if scenario == "retained corrupt files" {
+					b, err := os.ReadFile(filepath.Join(path, "weights"))
+					require.NoError(t, err)
+					require.Equal(t, "wrong", string(b))
+				} else {
+					require.NoDirExists(t, path)
+				}
+			}
+		})
+	}
+}
+
+func TestDirectRestoreConsumesFreshDownloadProof(t *testing.T) {
+	s, task, _ := newDirectOCIRestoreFixture(t)
+	path, err := s.directEvictionPath(*task.BaseModel.Spec.Storage.Path)
+	require.NoError(t, err)
+	require.NoError(t, os.RemoveAll(path))
+	copy := task.BaseModel.DeepCopy()
+	copy.Namespace, copy.UID, copy.Annotations = "another-team", "copy-uid", nil
+	_, err = s.omeClient.OmeV1beta1().BaseModels(copy.Namespace).Create(context.Background(), copy, metav1.CreateOptions{})
+	require.NoError(t, err)
+	ctx := s.artifactRestoreContext(context.Background(), task)
+	guard, _ := ctx.Value(artifactRestoreGuardKey{}).(*artifactRestoreGuard)
+	require.NotNil(t, guard)
+	require.NoError(t, s.prepareDirectRestore(ctx, task, path, false))
+	require.True(t, guard.freshDirectDownload)
+	require.NoError(t, s.prepareDirectRestore(ctx, task, path, true))
+	require.False(t, guard.freshDirectDownload)
+	require.Error(t, s.checkDirectEvictionUsers(ctx, getModelID(task.BaseModel, nil), path))
+}

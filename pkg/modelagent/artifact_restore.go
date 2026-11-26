@@ -84,6 +84,8 @@ type artifactRestoreGuard struct {
 	reporting bool // Publication failures must remain eligible for report recovery.
 	// Valid only while the initial-download handler retains both file locks.
 	freshSharedDownload bool
+	// The Direct destination was absent before inspection under the path lock.
+	freshDirectDownload bool
 }
 type artifactRestoreGuardKey struct{}
 
