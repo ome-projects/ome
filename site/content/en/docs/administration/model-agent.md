@@ -8,6 +8,16 @@ description: >
 
 The Model Agent is the core component responsible for downloading, managing, and distributing models across your OME cluster. This guide provides comprehensive information for cluster administrators who need to configure, monitor, and troubleshoot the Model Agent in production environments.
 
+## Model artifact management
+
+The agent downloads files into Direct model directories or, for eligible
+snapshots, Shared storage. It also handles reuse, deletion and
+retention, manual eviction, and rehydration. See
+[Model Artifact Management](/ome/docs/administration/model-artifact-management/)
+for storage policies, complete procedures, and per-node completion reports.
+This administration guide focuses on running, configuring, and troubleshooting
+the agent.
+
 ## Architecture Overview
 
 ### DaemonSet Deployment
