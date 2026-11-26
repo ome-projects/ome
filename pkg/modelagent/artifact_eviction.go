@@ -590,11 +590,16 @@ func (s *Gopher) artifactPathUsers(ctx context.Context, childKey, childPath, mod
 	parentPath, parentPathErr := hfArtifactPathInRoot(input.Parent.LocalPath, input.ModelStoreRoot, root)
 	freshDownload := parentPathErr == nil && repair && guard != nil && guard.freshSharedDownload &&
 		getModelID(guard.task.BaseModel, guard.task.ClusterBaseModel) == input.ChildModelKey && target == parentPath
+	freshDirectDownload := sharedParent == nil && guard != nil && guard.freshDirectDownload &&
+		getModelID(guard.task.BaseModel, guard.task.ClusterBaseModel) == childKey && target == childPath
 	for key, model := range models {
 		if key == input.ChildModelKey || repairChildren[key] {
 			continue
 		}
 		if freshDownload && s.isUnattachedSharedCopy(model, guard.task, input, cm.Data) {
+			continue
+		}
+		if freshDirectDownload && s.isUnattachedDirectCopy(model, guard.task, cm.Data) {
 			continue
 		}
 		if used, err := modelUses(taskModelSpec(model)); used || err != nil {

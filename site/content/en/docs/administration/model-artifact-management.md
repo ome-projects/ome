@@ -463,6 +463,10 @@ Shared restoration can reattach an existing Ready parent without rechecking
 its content solely for the new request. Damaged parents use the coordinated
 repair flow. Files used by another model are protected from unsafe replacement.
 
+When a Direct restore starts with no local directory, queued models with identical
+`spec.storage` do not block the download. Recorded users, pending
+cleanup, and existing directories still receive the usual ownership checks.
+
 ### Direct Hugging Face restoration
 
 Direct HF restoration requires a nonempty `storage.path` under the agent's model

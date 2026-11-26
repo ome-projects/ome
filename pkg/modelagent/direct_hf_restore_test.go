@@ -700,3 +700,38 @@ func TestDirectHfRestoreCancellationRetainsWriterLock(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, string(Ready), node.Labels[key])
 }
+
+func TestDirectHfRestoreAfterEvictionWithUnattachedCopy(t *testing.T) {
+	for _, scenario := range []string{"queued", "queued Updating", "different format"} {
+		t.Run(scenario, func(t *testing.T) {
+			s, task, source, downloads := newDirectHfRestoreFixture(t)
+			ctx := context.Background()
+			path := *task.BaseModel.Spec.Storage.Path
+			eviction := task.BaseModel.DeepCopy()
+			eviction.Annotations[artifactResidencyAnnotation] = "Evicted"
+			_, err := s.omeClient.OmeV1beta1().BaseModels(eviction.Namespace).Update(ctx, eviction, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			require.NoError(t, s.processTask(&GopherTask{TaskType: Evict, BaseModel: eviction}))
+			require.NoDirExists(t, path)
+			_, err = s.omeClient.OmeV1beta1().BaseModels(task.BaseModel.Namespace).Update(ctx, task.BaseModel, metav1.UpdateOptions{})
+			require.NoError(t, err)
+			copy := task.BaseModel.DeepCopy()
+			copy.Namespace, copy.UID, copy.Annotations = "another-team", "copy-uid", nil
+			if scenario == "different format" {
+				copy.Spec.ModelFormat.Name = "other"
+			}
+			_, err = s.omeClient.OmeV1beta1().BaseModels(copy.Namespace).Create(ctx, copy, metav1.CreateOptions{})
+			require.NoError(t, err)
+			if scenario == "queued Updating" {
+				require.NoError(t, s.configMapReconciler.mutateConfigMapWithRetry(ctx, func(cm *corev1.ConfigMap) (bool, error) {
+					return writeModelEntry(cm.Data, getModelID(copy, nil), ModelEntry{Name: copy.Name, ModelUID: copy.UID, Status: ModelStatusUpdating})
+				}))
+			}
+			require.NoError(t, runDirectHfRestore(s, task, source))
+			require.Equal(t, 1, *downloads)
+			b, err := os.ReadFile(filepath.Join(path, "weights"))
+			require.NoError(t, err)
+			require.Equal(t, "model", string(b))
+		})
+	}
+}
