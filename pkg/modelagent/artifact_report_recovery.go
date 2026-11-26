@@ -44,7 +44,7 @@ func (s *Gopher) recoverArtifactReports(ctx context.Context) error {
 		if !s.artifactReportNeedsRecovery(task, cm, node) {
 			continue
 		}
-		if err := s.validateArtifactDownload(ctx, task); err != nil {
+		if err := s.validateArtifactDownloadOnNode(ctx, task, true, node); err != nil {
 			if ctx.Err() == nil {
 				s.logger.Debugw("Skipping artifact report recovery after validation failed", "model", getModelInfoForLogging(task), "error", err)
 			}
@@ -57,15 +57,15 @@ func (s *Gopher) recoverArtifactReports(ctx context.Context) error {
 }
 
 func (s *Gopher) artifactReportRecoveryNeeded(ctx context.Context, task *GopherTask) (bool, error) {
-	if err := s.validateArtifactDownload(ctx, task); err != nil {
+	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	if err := s.validateArtifactDownloadOnNode(ctx, task, true, node); err != nil {
 		return false, err
 	}
 	cm, err := s.configMapReconciler.getConfigMap(ctx)
 	if err != nil && !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	if err != nil {
 		return false, err
 	}
 	return s.artifactReportNeedsRecovery(task, cm, node), nil

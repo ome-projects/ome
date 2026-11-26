@@ -74,6 +74,11 @@ func (s *Gopher) validateArtifactDownload(ctx context.Context, task *GopherTask)
 // Cleanup may precede the verified receipt handoff from an old cache owner.
 // All live request checks still apply; ordinary progress also requires the UID fence.
 func (s *Gopher) validateArtifactDownloadWithUIDFence(ctx context.Context, task *GopherTask, requireUIDFence bool) error {
+	return s.validateArtifactDownloadOnNode(ctx, task, requireUIDFence, nil)
+}
+
+// Reuse a Node already read by this operation; independent checks fetch their own.
+func (s *Gopher) validateArtifactDownloadOnNode(ctx context.Context, task *GopherTask, requireUIDFence bool, node *corev1.Node) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -103,9 +108,11 @@ func (s *Gopher) validateArtifactDownloadWithUIDFence(ctx context.Context, task 
 	if s.kubeClient == nil {
 		return fmt.Errorf("Kubernetes client is required for artifact restoration")
 	}
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	if err != nil {
-		return err
+	if node == nil {
+		node, err = s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
 	}
 	if node.DeletionTimestamp != nil || !(&Scout{nodeInfo: node, logger: s.logger}).shouldDownloadModel(taskModelSpec(current).Storage) {
 		return fmt.Errorf("artifact restoration Node eligibility changed")
@@ -221,6 +228,10 @@ func validateArtifactCleanup(ctx context.Context) error {
 }
 
 func (g *artifactCleanupGuard) validate(ctx context.Context) error {
+	return g.validateOnNode(ctx, nil)
+}
+
+func (g *artifactCleanupGuard) validateOnNode(ctx context.Context, node *corev1.Node) error {
 	s, task := g.gopher, g.task
 	if err := ctx.Err(); err != nil {
 		return err
@@ -245,7 +256,7 @@ func (g *artifactCleanupGuard) validate(ctx context.Context) error {
 		return fmt.Errorf("eviction model UID is superseded in node state")
 	}
 	if task.TaskType == Download || task.TaskType == DownloadOverride {
-		if err := s.validateArtifactDownload(ctx, task); err != nil {
+		if err := s.validateArtifactDownloadOnNode(ctx, task, true, node); err != nil {
 			return err
 		}
 	}
@@ -262,9 +273,11 @@ func (g *artifactCleanupGuard) validate(ctx context.Context) error {
 	if s.kubeClient == nil {
 		return fmt.Errorf("Kubernetes client is required for eviction")
 	}
-	node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
-	if err != nil {
-		return err
+	if node == nil {
+		node, err = s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
+		if err != nil {
+			return err
+		}
 	}
 	if node.DeletionTimestamp != nil {
 		return fmt.Errorf("eviction Node is deleting")
@@ -277,6 +290,9 @@ func (g *artifactCleanupGuard) validate(ctx context.Context) error {
 
 func (g *artifactCleanupGuard) withdrawReady(ctx context.Context) error {
 	s := g.gopher
+	if s.kubeClient == nil {
+		return fmt.Errorf("Kubernetes client is required for eviction")
+	}
 	s.configMapMutex.Lock()
 	defer s.configMapMutex.Unlock()
 	key, err := getModelLabelKey(&NodeLabelOp{BaseModel: g.task.BaseModel, ClusterBaseModel: g.task.ClusterBaseModel})
@@ -284,11 +300,11 @@ func (g *artifactCleanupGuard) withdrawReady(ctx context.Context) error {
 		return err
 	}
 	err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		if err := g.validate(ctx); err != nil {
-			return err
-		}
 		node, err := s.kubeClient.CoreV1().Nodes().Get(ctx, s.configMapReconciler.nodeName, metav1.GetOptions{})
 		if err != nil {
+			return err
+		}
+		if err := g.validateOnNode(ctx, node); err != nil {
 			return err
 		}
 		if _, present := node.Labels[key]; !present {

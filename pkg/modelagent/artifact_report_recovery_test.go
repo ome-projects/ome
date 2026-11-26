@@ -3,6 +3,7 @@ package modelagent
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -623,4 +624,42 @@ func TestArtifactReportRecoveryAfterStaleCleanupEnqueue(t *testing.T) {
 			popArtifactRecovery(t, s)
 		})
 	}
+}
+
+func TestArtifactReportChecksReadNodeOnce(t *testing.T) {
+	for _, batch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batch=%v", batch), func(t *testing.T) {
+			s, task, _ := newArtifactReportRecoveryFixture(t)
+			gets := 0
+			s.kubeClient.(*fake.Clientset).PrependReactor("get", "nodes", func(ktesting.Action) (bool, runtime.Object, error) {
+				gets++
+				return false, nil, nil
+			})
+			if batch {
+				other := task.BaseModel.DeepCopy()
+				other.Name, other.UID = "other", "other-uid"
+				_, err := s.omeClient.OmeV1beta1().BaseModels(other.Namespace).Create(context.Background(), other, metav1.CreateOptions{})
+				require.NoError(t, err)
+				require.NoError(t, s.recoverArtifactReports(context.Background()))
+				require.Equal(t, 2, s.taskQueue.len())
+			} else {
+				needed, err := s.artifactReportRecoveryNeeded(context.Background(), task)
+				require.NoError(t, err)
+				require.True(t, needed)
+			}
+			require.Equal(t, 1, gets, "reuse Node within the report check")
+		})
+	}
+}
+
+func TestArtifactWithdrawalReadsNodeOnce(t *testing.T) {
+	s, task, _ := newSharedEvictionFixture(t)
+	gets, patches := 0, 0
+	client := s.kubeClient.(*fake.Clientset)
+	client.PrependReactor("get", "nodes", func(ktesting.Action) (bool, runtime.Object, error) { gets++; return false, nil, nil })
+	client.PrependReactor("patch", "nodes", func(ktesting.Action) (bool, runtime.Object, error) { patches++; return false, nil, nil })
+	guard := &artifactCleanupGuard{gopher: s, task: task}
+	require.NoError(t, guard.withdrawReady(context.Background()))
+	require.Equal(t, 1, gets)
+	require.Equal(t, 1, patches)
 }
