@@ -57,6 +57,7 @@ func downloadSnapshotWithTimeouts(
 	opts hfDownloadOptions,
 	logger logging.Interface,
 ) (string, error) {
+	start := time.Now()
 	ctx := context.Background()
 	cancel := func() {}
 	if opts.DownloadTimeout > 0 {
@@ -71,51 +72,58 @@ func downloadSnapshotWithTimeouts(
 	var closeStaleOnce sync.Once
 	var lastProgress hfDownloadProgressSnapshot
 	var lastProgressMu sync.Mutex
+	var totalBytes uint64
+	var progressSeen bool
+	var lastProgressAt time.Time
 	progressHandlerInstalled := false
 	downloadFinished := false
 
-	if opts.StaleProgressTimeout > 0 {
-		if opts.ProgressCallbackThrottleTime <= 0 {
-			opts.ProgressCallbackThrottleTime = 250 * time.Millisecond
+	if opts.ProgressCallbackThrottleTime <= 0 {
+		opts.ProgressCallbackThrottleTime = 250 * time.Millisecond
+	}
+	if err := hubClient.SetProgressHandler(func(update xet.ProgressUpdate) {
+		current := hfDownloadProgressSnapshot{
+			completedBytes:            update.CompletedBytes,
+			completedFiles:            update.CompletedFiles,
+			currentFileCompletedBytes: update.CurrentFileCompletedBytes,
 		}
-		if err := hubClient.SetProgressHandler(func(update xet.ProgressUpdate) {
-			current := hfDownloadProgressSnapshot{
-				completedBytes:            update.CompletedBytes,
-				completedFiles:            update.CompletedFiles,
-				currentFileCompletedBytes: update.CurrentFileCompletedBytes,
-			}
-			lastProgressMu.Lock()
-			defer lastProgressMu.Unlock()
-			if current == lastProgress {
+		lastProgressMu.Lock()
+		defer lastProgressMu.Unlock()
+		progressSeen = true
+		totalBytes = update.TotalBytes
+		if current.completedBytes > lastProgress.completedBytes ||
+			current.completedFiles > lastProgress.completedFiles {
+			lastProgressAt = time.Now()
+		}
+		if current == lastProgress {
+			return
+		}
+		lastProgress = current
+		select {
+		case progressed <- struct{}{}:
+		default:
+		}
+	}, opts.ProgressCallbackThrottleTime); err != nil {
+		logger.Warnf("Unable to install HuggingFace/Xet progress watchdog: %v", err)
+	} else {
+		progressHandlerInstalled = true
+		// Only disable the progress handler once the download goroutine has
+		// actually returned (downloadFinished). On the timeout/cancellation path
+		// the goroutine is still running inside DownloadSnapshotWithContext and the
+		// native side may invoke the progress callback concurrently; disabling it
+		// here would race with that in-flight callback. The handler is left in place
+		// and torn down when the process exits shortly after the non-zero return.
+		defer func() {
+			if !downloadFinished {
 				return
 			}
-			lastProgress = current
-			select {
-			case progressed <- struct{}{}:
-			default:
+			if err := hubClient.DisableProgress(); err != nil {
+				logger.Warnf("Unable to disable HuggingFace/Xet progress watchdog: %v", err)
 			}
-		}, opts.ProgressCallbackThrottleTime); err != nil {
-			logger.Warnf("Unable to install HuggingFace/Xet progress watchdog: %v", err)
-		} else {
-			progressHandlerInstalled = true
-			// Only disable the progress handler once the download goroutine has
-			// actually returned (downloadFinished). On the timeout/cancellation path
-			// the goroutine is still running inside DownloadSnapshotWithContext and the
-			// native side may invoke the progress callback concurrently; disabling it
-			// here would race with that in-flight callback. The handler is left in place
-			// and torn down when the process exits shortly after the non-zero return.
-			defer func() {
-				if !downloadFinished {
-					return
-				}
-				if err := hubClient.DisableProgress(); err != nil {
-					logger.Warnf("Unable to disable HuggingFace/Xet progress watchdog: %v", err)
-				}
-			}()
-		}
+		}()
 	}
 
-	if progressHandlerInstalled {
+	if progressHandlerInstalled && opts.StaleProgressTimeout > 0 {
 		staleCtx, staleCancel := context.WithCancel(ctx)
 		ctx = staleCtx
 		defer staleCancel()
@@ -144,7 +152,6 @@ func downloadSnapshotWithTimeouts(
 		}()
 	}
 
-	start := time.Now()
 	logger.Infof("Starting HuggingFace/Xet snapshot download for repo %s revision %s with timeout %v and stale-progress timeout %v",
 		req.RepoID, req.Revision, opts.DownloadTimeout, opts.StaleProgressTimeout)
 
@@ -154,27 +161,58 @@ func downloadSnapshotWithTimeouts(
 		resultCh <- hfSnapshotDownloadResult{path: path, err: err}
 	}()
 
-	select {
-	case result := <-resultCh:
-		downloadFinished = true
-		duration := time.Since(start)
-		if result.err != nil {
+	// A timer, rather than callback-driven logging, also reports quiet periods.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	lastLogAt := start
+	var lastLoggedBytes uint64
+	for {
+		select {
+		case <-ticker.C:
+			now := time.Now()
+			lastProgressMu.Lock()
+			snapshot, total, seen, observedAt := lastProgress, totalBytes, progressSeen, lastProgressAt
+			lastProgressMu.Unlock()
+			if !seen {
+				logger.Infof("HuggingFace/Xet download progress: unavailable (no progress updates received); elapsed=%s", now.Sub(start).Round(time.Second))
+			} else {
+				totalLabel := "unavailable"
+				if total > 0 {
+					totalLabel = fmt.Sprint(total)
+				}
+				ageLabel := "unavailable"
+				if !observedAt.IsZero() {
+					ageLabel = now.Sub(observedAt).Round(time.Second).String()
+				}
+				var rate float64
+				if snapshot.completedBytes >= lastLoggedBytes {
+					rate = float64(snapshot.completedBytes-lastLoggedBytes) / now.Sub(lastLogAt).Seconds()
+				}
+				logger.Infof("HuggingFace/Xet download progress: downloaded_bytes=%d total_bytes=%s rate_bytes_per_second=%.2f last_progress_age=%s completed_files=%d",
+					snapshot.completedBytes, totalLabel, rate, ageLabel, snapshot.completedFiles)
+			}
+			lastLogAt, lastLoggedBytes = now, snapshot.completedBytes
+		case result := <-resultCh:
+			downloadFinished = true
+			duration := time.Since(start)
+			if result.err != nil {
+				if isStaleProgressTimeout(staleTimedOut) {
+					return "", fmt.Errorf("HuggingFace/Xet snapshot download made no bytes/files progress for %s after %s: %w", opts.StaleProgressTimeout, duration, result.err)
+				}
+				if ctx.Err() == context.DeadlineExceeded {
+					return "", fmt.Errorf("HuggingFace/Xet snapshot download exceeded timeout %s after %s: %w", opts.DownloadTimeout, duration, result.err)
+				}
+				return "", result.err
+			}
+			logger.Infof("HuggingFace/Xet snapshot download completed in %v", duration)
+			return result.path, nil
+		case <-ctx.Done():
+			duration := time.Since(start)
 			if isStaleProgressTimeout(staleTimedOut) {
-				return "", fmt.Errorf("HuggingFace/Xet snapshot download made no bytes/files progress for %s after %s: %w", opts.StaleProgressTimeout, duration, result.err)
+				return "", fmt.Errorf("HuggingFace/Xet snapshot download made no bytes/files progress for %s after %s", opts.StaleProgressTimeout, duration)
 			}
-			if ctx.Err() == context.DeadlineExceeded {
-				return "", fmt.Errorf("HuggingFace/Xet snapshot download exceeded timeout %s after %s: %w", opts.DownloadTimeout, duration, result.err)
-			}
-			return "", result.err
+			return "", fmt.Errorf("HuggingFace/Xet snapshot download exceeded timeout %s after %s", opts.DownloadTimeout, duration)
 		}
-		logger.Infof("HuggingFace/Xet snapshot download completed in %v", duration)
-		return result.path, nil
-	case <-ctx.Done():
-		duration := time.Since(start)
-		if isStaleProgressTimeout(staleTimedOut) {
-			return "", fmt.Errorf("HuggingFace/Xet snapshot download made no bytes/files progress for %s after %s", opts.StaleProgressTimeout, duration)
-		}
-		return "", fmt.Errorf("HuggingFace/Xet snapshot download exceeded timeout %s after %s", opts.DownloadTimeout, duration)
 	}
 }
 
