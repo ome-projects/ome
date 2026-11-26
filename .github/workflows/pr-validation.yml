@@ -53,7 +53,7 @@ jobs:
           python-version: '3.x'
 
       - name: Setup Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: 'latest'
 
