@@ -120,6 +120,41 @@ func TestInferenceServiceValidator_ValidateCreate(t *testing.T) {
 	}
 }
 
+func TestKVCachePoolBinding(t *testing.T) {
+	scheme := runtime.NewScheme()
+	assert.NoError(t, v1beta1.AddToScheme(scheme))
+	cl := fake.NewClientBuilder().WithScheme(scheme).Build()
+	validator := &InferenceServiceValidator{Client: cl, RuntimeSelector: runtimeselector.New(cl)}
+	service := &v1beta1.InferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-isvc", Namespace: "default"},
+		Spec:       v1beta1.InferenceServiceSpec{Runtime: &v1beta1.ServingRuntimeRef{Name: "test-runtime"}},
+	}
+	bound := service.DeepCopy()
+	bound.Spec.KVCachePool = &v1beta1.KVCachePoolRef{Name: "shared"}
+	bound.Spec.DeploymentMode = ptr.To(constants.OMENative)
+
+	_, err := validator.ValidateCreate(t.Context(), bound)
+	assert.ErrorContains(t, err, "spec.kvCachePool")
+	_, err = validator.ValidateUpdate(t.Context(), service, bound)
+	assert.ErrorContains(t, err, "spec.kvCachePool")
+	_, err = validator.ValidateUpdate(t.Context(), bound, service)
+	assert.NoError(t, err)
+	bound.Spec.DeploymentMode = ptr.To(constants.RawDeployment)
+	_, err = validator.ValidateCreate(t.Context(), bound)
+	assert.NoError(t, err)
+	_, err = validator.ValidateUpdate(t.Context(), service, bound)
+	assert.NoError(t, err)
+	pool := &v1beta1.KVCachePool{ObjectMeta: metav1.ObjectMeta{Name: "shared", Namespace: service.Namespace, Finalizers: []string{"ome.io/kvcachepool-protection"}}}
+	assert.NoError(t, cl.Create(t.Context(), pool))
+	assert.NoError(t, cl.Delete(t.Context(), pool))
+	_, err = validator.ValidateCreate(t.Context(), bound)
+	assert.ErrorContains(t, err, "terminating pool")
+	_, err = validator.ValidateUpdate(t.Context(), service, bound)
+	assert.ErrorContains(t, err, "terminating pool")
+	_, err = validator.ValidateUpdate(t.Context(), bound, service)
+	assert.NoError(t, err)
+}
+
 func TestInferenceServiceValidator_ValidateUpdate(t *testing.T) {
 	tests := []struct {
 		name    string

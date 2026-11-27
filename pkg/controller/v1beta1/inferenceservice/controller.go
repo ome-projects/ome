@@ -552,8 +552,14 @@ func (p *servicePass) finishDeletion(ctx context.Context) (bool, error) {
 // no backend: whatever a backend projected before is removed and the status
 // reports the virtual endpoint.
 func (p *servicePass) serveVirtualDeployment(ctx context.Context) (bool, error) {
+	if p.isvc.Spec.KVCachePool == nil && p.isvc.Status.GetCondition(v1beta1.KVCacheConfigured) != nil {
+		p.isvc.Status.RemoveCondition(v1beta1.KVCacheConfigured)
+	}
 	if p.deploymentMode != constants.VirtualDeployment {
 		return true, nil
+	}
+	if p.isvc.Spec.KVCachePool != nil {
+		return p.holdCacheBinding(fmt.Errorf("a virtual service has no engine to bind to KVCachePool"))
 	}
 	return p.end(p.reconciler.handleVirtualDeployment(ctx, p.isvc))
 }
@@ -748,6 +754,15 @@ func (p *servicePass) prepareComponentSpecs(context.Context) (bool, error) {
 		p.reconciler.Log.Error(err, "Failed to determine deployment modes", "Name", p.isvc.Name)
 		p.reconciler.Recorder.Event(p.isvc, v1.EventTypeWarning, "DeploymentModeError", err.Error())
 		return false, err
+	}
+	if p.isvc.Spec.KVCachePool != nil {
+		if p.resolved.Specs.Engine == nil || p.resolved.Specs.Decoder != nil || p.resolved.Specs.Encoder != nil || p.resolved.Modes[v1beta1.EngineComponent] != constants.RawDeployment {
+			return p.holdCacheBinding(fmt.Errorf("KVCachePool requires a single-pod RawDeployment engine without a separate decoder or encoder"))
+		}
+		// Refresh a bound engine when the provider changes its connection.
+		if p.requeueNoLaterThan == 0 || p.requeueNoLaterThan > 30*time.Second {
+			p.requeueNoLaterThan = 30 * time.Second
+		}
 	}
 	return true, nil
 }
@@ -1027,6 +1042,10 @@ func (p *servicePass) runComponentReconcilers(ctx context.Context) (bool, error)
 	for _, reconciler := range p.reconcilers {
 		result, err := reconciler.Reconcile(ctx, p.isvc)
 		if err != nil {
+			var binding *render.CacheBindingError
+			if errors.As(err, &binding) {
+				return p.holdCacheBinding(binding)
+			}
 			if shutdownCutShort(ctx, err) {
 				p.log.V(1).Info("Component reconcile stopped by the manager's shutdown",
 					"component", fmt.Sprintf("%T", reconciler), "error", err)
@@ -1044,6 +1063,16 @@ func (p *servicePass) runComponentReconcilers(ctx context.Context) (bool, error)
 		p.pendingRequeue = SoonestRequeue(p.pendingRequeue, result)
 	}
 	return true, nil
+}
+
+func (p *servicePass) holdCacheBinding(err error) (bool, error) {
+	p.isvc.Status.SetCondition(v1beta1.KVCacheConfigured, &knapis.Condition{
+		Type: v1beta1.KVCacheConfigured, Status: v1.ConditionFalse, Reason: "KVCacheBindingPending", Message: err.Error(),
+	})
+	if err := p.reconciler.updateStatus(p.isvc, p.deploymentMode, p.base, groupEntriesFromCache); err != nil {
+		return false, err
+	}
+	return p.end(ctrl.Result{RequeueAfter: 30 * time.Second}, nil)
 }
 
 // removeReplacedBackendObjects removes the objects of a backend a Component

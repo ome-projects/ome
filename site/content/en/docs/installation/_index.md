@@ -53,6 +53,9 @@ The following components are optional and only required for specific features:
 !!! warning
     **Important**: If you plan to use the `MultiNode` deployment mode, you MUST install LeaderWorkerSet (LWS) BEFORE installing OME. The controller may panic if the CRD is not available when needed.
 
+OME deploys LMCache node-local servers when a platform administrator creates a
+`KVCachePool` selecting NVIDIA GPU nodes. See the [NodeLocal pool and vLLM example](https://github.com/ome-projects/ome/tree/main/config/samples/kvcachepool) for the RuntimeClass and host IPC prerequisites.
+
 ### 1. Install Cert Manager (Required)
 
 **Required**

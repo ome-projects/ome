@@ -1,0 +1,12 @@
+apiVersion: ome.io/v1beta1
+kind: BaseModel
+metadata:
+  name: qwen2-5-0-5b
+spec:
+  modelArchitecture: Qwen2ForCausalLM
+  modelFormat:
+    name: safetensors
+    version: "1.0.0"
+  storage:
+    storageUri: hf://Qwen/Qwen2.5-0.5B
+    path: /raid/models/qwen/qwen2-5-0-5b

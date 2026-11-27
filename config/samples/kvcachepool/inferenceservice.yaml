@@ -1,0 +1,17 @@
+apiVersion: ome.io/v1beta1
+kind: InferenceService
+metadata:
+  name: qwen-cache
+spec:
+  deploymentMode: RawDeployment
+  model:
+    kind: BaseModel
+    name: qwen2-5-0-5b
+  runtime:
+    kind: ServingRuntime
+    name: vllm-lmcache-mp
+  kvCachePool:
+    name: lmcache-node-local
+  engine:
+    minReplicas: 1
+    maxReplicas: 1
