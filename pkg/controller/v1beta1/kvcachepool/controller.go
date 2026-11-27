@@ -12,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -111,7 +112,7 @@ func (r *Reconciler) reconcileServers(ctx context.Context, pool *ome.KVCachePool
 			return false, "Provisioning", fmt.Sprintf("Waiting for %s to finish deleting", obj.GetName()), nil
 		default:
 			desired.SetResourceVersion(obj.GetResourceVersion())
-			err = r.Patch(ctx, desired, client.Apply, client.FieldOwner("ome-kvcachepool"), client.ForceOwnership)
+			err = r.applyChild(ctx, desired)
 		}
 		if err != nil {
 			return false, "ResourceError", err.Error(), err
@@ -125,4 +126,18 @@ func (r *Reconciler) reconcileServers(ctx context.Context, pool *ome.KVCachePool
 	}
 	pool.Status.Connection = &ome.KVCachePoolConnectionStatus{ConfigMapRef: corev1.LocalObjectReference{Name: cm.Name}}
 	return true, "ServersReady", fmt.Sprintf("%d node-local servers ready", count), nil
+}
+
+// applyChild submits only the fields from the pool's desired manifest. Copy
+// the server response back so readiness uses the applied DaemonSet generation
+// and status, including on the reconcile that changes the Pod template.
+func (r *Reconciler) applyChild(ctx context.Context, desired client.Object) error {
+	intent := &unstructured.Unstructured{}
+	if err := r.Scheme().Convert(desired, intent, nil); err != nil {
+		return err
+	}
+	if err := r.Apply(ctx, client.ApplyConfigurationFromUnstructured(intent), client.FieldOwner("ome-kvcachepool"), client.ForceOwnership); err != nil {
+		return err
+	}
+	return r.Scheme().Convert(intent, desired, nil)
 }

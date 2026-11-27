@@ -95,7 +95,16 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 	// envtest has no scheduler or DaemonSet controller. Drive the observed rollout, including a stale revision.
 	ds.Status = appsv1.DaemonSetStatus{ObservedGeneration: ds.Generation, DesiredNumberScheduled: 2, NumberReady: 2, NumberAvailable: 2, UpdatedNumberScheduled: 1}
 	require.NoError(t, cl.Status().Update(ctx, ds))
+	// An independent writer changes a pool-owned key and adds its own key.
+	// Reconcile must reclaim the first without removing the second.
+	before := cm.DeepCopy()
+	cm.Data[kvcache.ConnectionKey] = "stale"
+	cm.Data["independent-key"] = "keep"
+	require.NoError(t, cl.Patch(ctx, cm, client.MergeFrom(before), client.FieldOwner("test-writer")))
 	reconcile()
+	require.NoError(t, cl.Get(ctx, cmKey, cm))
+	require.Equal(t, raw, cm.Data[kvcache.ConnectionKey])
+	require.Equal(t, "keep", cm.Data["independent-key"])
 	read()
 	require.False(t, meta.IsStatusConditionTrue(pool.Status.Conditions, "Ready"))
 	require.Nil(t, pool.Status.Connection)
