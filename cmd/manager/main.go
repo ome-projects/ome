@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/crdskew"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/irstatus/schemapreflight"
+	"sigs.k8s.io/ome/pkg/controller/v1beta1/kvcachepool"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/managercache"
 	"sigs.k8s.io/ome/pkg/controller/v1beta1/obsmetrics"
 	rolloutpolicycontroller "sigs.k8s.io/ome/pkg/controller/v1beta1/rolloutpolicy"
@@ -445,6 +446,7 @@ func (s *startup) run() bool {
 		s.loadTPUSliceConfig,
 		s.startEventBroadcaster,
 		s.setupInferenceServiceController,
+		s.setupKVCachePoolController,
 		s.followCRDSchemaChanges,
 		s.addControllerIdentityCheck,
 		s.setupPolicyStatusControllers,
@@ -890,6 +892,24 @@ func (s *startup) loadTPUSliceConfig() bool {
 // cluster.
 func (s *startup) startEventBroadcaster() bool {
 	s.eventBroadcaster = s.newRecordingBroadcaster()
+	return true
+}
+
+// setupKVCachePoolController leaves existing installations usable while their
+// OME CRDs are upgraded.
+func (s *startup) setupKVCachePoolController() bool {
+	if s.isControlPlane {
+		return true
+	}
+	found, err := utils.IsCrdAvailable(s.cfg, v1beta1.SchemeGroupVersion.String(), "KVCachePool")
+	if err != nil {
+		return stop(err, "Failed to discover KVCachePool")
+	}
+	if found {
+		if err := kvcachepool.SetupWithManager(s.mgr); err != nil {
+			return stop(err, "Failed to create KVCachePool controller")
+		}
+	}
 	return true
 }
 

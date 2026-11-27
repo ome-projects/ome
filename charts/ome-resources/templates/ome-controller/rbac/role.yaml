@@ -91,6 +91,23 @@ rules:
   - update
   - watch
 - apiGroups:
+  - apps
+  resources:
+  - daemonsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - list
+- apiGroups:
   - authentication.k8s.io
   resources:
   - selfsubjectreviews
@@ -308,6 +325,7 @@ rules:
   - acceleratorclasses/finalizers
   - clusterbasemodels/finalizers
   - inferencereplicas/finalizers
+  - kvcachepools/finalizers
   - trafficmaps/finalizers
   verbs:
   - update
@@ -342,6 +360,22 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - ome.io
+  resources:
+  - kvcachepools
+  verbs:
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ome.io
+  resources:
+  - kvcachepools/status
+  verbs:
+  - get
+  - update
 - apiGroups:
   - policy
   resources:
