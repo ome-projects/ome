@@ -21,6 +21,7 @@ func TestCoreCRDKustomizationsAreComplete(t *testing.T) {
 		"ome.io_finetunedweights.yaml",
 		"ome.io_inferencereplicas.yaml",
 		"ome.io_inferenceservices.yaml",
+		"ome.io_kvcachepools.yaml",
 		"ome.io_servingruntimes.yaml",
 		"ome.io_trafficmaps.yaml",
 		"ome.io_workloadclusters.yaml",

@@ -22,7 +22,7 @@ to the pool.
   - [User Stories](#user-stories)
     - [Story 1: Pre-create a Node-local LMCache Pool](#story-1-pre-create-a-node-local-lmcache-pool)
     - [Story 2: Bind an InferenceService to an Existing Pool](#story-2-bind-an-inferenceservice-to-an-existing-pool)
-    - [Story 3: Use a Provider-managed LMCache Pool](#story-3-use-a-provider-managed-lmcache-pool)
+    - [Story 3: Share a Pool Across Services](#story-3-share-a-pool-across-services)
     - [Story 4: Deploy a Mooncake Distributed Store](#story-4-deploy-a-mooncake-distributed-store)
     - [Story 5: Configure Runtime-side Connector Behavior](#story-5-configure-runtime-side-connector-behavior)
   - [Notes/Constraints/Caveats](#notesconstraintscaveats)
@@ -35,7 +35,6 @@ to the pool.
     - [Status](#status)
   - [Example Configuration](#example-configuration)
     - [LMCache NodeLocal Pool](#lmcache-nodelocal-pool)
-    - [LMCache ProviderManaged Pool](#lmcache-providermanaged-pool)
     - [Mooncake DistributedStore Pool](#mooncake-distributedstore-pool)
     - [ServingRuntime with KV Cache Connectors](#servingruntime-with-kv-cache-connectors)
     - [InferenceService Reference](#inferenceservice-reference)
@@ -88,18 +87,9 @@ The `KVCachePool` API is provider-neutral. It separates:
 4. pool workloads, where pod and container configuration lives; and
 5. status connection information consumed by runtime-side connector injection.
 
-The initial alpha supports four `KVCachePool` deployment modes:
-
-1. `RawDeployment`
-2. `NodeLocal`
-3. `DistributedStore`
-4. `ProviderManaged`
-
-`NodeLocal` covers LMCache-style one-cache-server-per-node deployments.
-`DistributedStore` covers coordinated store systems such as Mooncake
-master/store deployments. `ProviderManaged` covers providers that expose their
-own controller and CRD, such as LMCache's `LMCacheEngine`. `External` binding
-to infrastructure that OME does not manage is intentionally deferred.
+The first release supports LMCache `NodeLocal`. OME runs one cache server per
+selected node. `RawDeployment` and `DistributedStore` describe possible future
+pool implementations.
 
 ## Motivation
 
@@ -115,8 +105,7 @@ are often deployed and operated independently from any one inference endpoint:
 
 1. LMCache multiprocess deployments can provide node-local cache services that
    serving pods attach to.
-2. LMCache also provides an operator and `LMCacheEngine` API that can own
-   provider-native resources.
+2. LMCache recommends a DaemonSet for shared node-local multiprocess servers.
 3. Mooncake provides a distributed store model with master and store/client
    roles.
 4. NIXL can appear as a transfer or storage backend below another provider
@@ -156,8 +145,7 @@ namespace.
    `InferenceService`.
 7. Make every runtime automatically use a KV cache pool.
 8. Replace engine-local prefix caching or provider-native local cache features.
-9. Copy provider-native APIs such as LMCache `LMCacheEngineSpec` directly into
-   OME top-level fields.
+9. Expose provider-specific configuration as top-level OME API fields.
 
 ## Proposal
 
@@ -174,7 +162,13 @@ metadata:
 spec:
   provider:
     name: LMCache
+    config:
+      l1CapacityPerNode: 60Gi
   deploymentMode: NodeLocal
+  workloads:
+    - name: server
+      nodeSelector:
+        node-type: gpu
 ```
 
 `InferenceService` references the pool:
@@ -198,8 +192,8 @@ Use `KVCachePool`, not `KVCacheServer`.
 
 `KVCachePool` describes the user-facing resource: a managed pool of distributed
 KV cache capacity and transfer endpoints. `KVCacheServer` sounds like one
-process or one Kubernetes Service, which does not fit node-local deployments,
-distributed stores, or provider-managed CRDs.
+process or one Kubernetes Service. A pool can span nodes or coordinate
+multiple store roles.
 
 Recommended names:
 
@@ -221,28 +215,21 @@ vocabulary. It uses a separate enum from `InferenceService` because the valid
 pool modes differ from serving endpoint modes.
 
 ```go
-// +kubebuilder:validation:Enum=RawDeployment;NodeLocal;DistributedStore;ProviderManaged
+// +kubebuilder:validation:Enum=NodeLocal
 type KVCachePoolDeploymentMode string
 
-const (
-    KVCachePoolRawDeployment    KVCachePoolDeploymentMode = "RawDeployment"
-    KVCachePoolNodeLocal        KVCachePoolDeploymentMode = "NodeLocal"
-    KVCachePoolDistributedStore KVCachePoolDeploymentMode = "DistributedStore"
-    KVCachePoolProviderManaged  KVCachePoolDeploymentMode = "ProviderManaged"
-)
+const KVCachePoolNodeLocal KVCachePoolDeploymentMode = "NodeLocal"
 ```
 
-Mode meanings:
+Current and proposed modes:
 
-- `RawDeployment`: OME directly reconciles simple Kubernetes Deployment-backed
+- `RawDeployment` (proposed): OME directly reconciles simple Kubernetes Deployment-backed
   pool workloads.
 - `NodeLocal`: OME directly reconciles one pool workload per selected node.
   The implementation may use a DaemonSet, but the API names the pool semantics,
   not the Kubernetes object.
-- `DistributedStore`: OME directly reconciles coordinated store roles such as
+- `DistributedStore` (proposed): OME directly reconciles coordinated store roles such as
   master and store/client workloads.
-- `ProviderManaged`: OME owns the `KVCachePool` intent but delegates provider
-  implementation resources to a provider controller or provider CRD.
 
 `External` is deferred until OME defines a clear status, ownership, and
 validation contract for infrastructure it does not manage.
@@ -252,8 +239,8 @@ validation contract for infrastructure it does not manage.
 The API distinguishes provider from backend.
 
 `provider.name` identifies the primary integration layer used by the pool. A
-provider may expose connection metadata, create provider workloads, or translate
-pool intent into a provider-native CR.
+provider integration defines the pool workloads and the connection settings
+that compatible engines consume.
 
 `provider.backends[]` identifies storage or transfer backends used underneath
 the provider. For example, LMCache may be the provider while Mooncake or NIXL
@@ -269,16 +256,13 @@ The API shape is influenced by these provider designs:
 
 1. [LMCache multiprocess deployment](https://docs.lmcache.ai/mp/index.html)
    motivates `NodeLocal` and node-local connection discovery.
-2. [LMCache operator](https://docs.lmcache.ai/mp/operator.html) motivates
-   `ProviderManaged`, where OME reconciles provider-native resources and
-   reflects their connection status.
-3. [LMCache storage backends](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html)
+2. [LMCache storage backends](https://docs.lmcache.ai/kv_cache/storage_backends/mooncake.html)
    motivate separating **provider** from **backend** because LMCache can use
    Mooncake or NIXL beneath the LMCache integration layer.
-4. [Mooncake Store](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html)
+3. [Mooncake Store](https://kvcache-ai.github.io/Mooncake/design/mooncake-store.html)
    motivates `DistributedStore` and named pool workloads such as `master` and
    `store`.
-5. NIXL motivates backend extensibility without assuming every KV cache
+4. NIXL motivates backend extensibility without assuming every KV cache
    capability is a standalone OME-managed server process.
 
 ### User Stories
@@ -298,12 +282,12 @@ not configure provider workloads or connector args on the `InferenceService`.
 The inference controller derives connector injection from the pool status and
 the selected runtime.
 
-#### Story 3: Use a Provider-managed LMCache Pool
+#### Story 3: Share a Pool Across Services
 
-Carol already uses the LMCache operator. She creates a `KVCachePool` with
-`deploymentMode: ProviderManaged`. OME reconciles the provider CR and reflects
-its connection information through `KVCachePool.status`, while provider-owned
-controllers manage the implementation workloads.
+Carol binds two services in one namespace to the same NodeLocal pool. On a
+shared node, the second engine can reuse compatible KV entries written by the
+first. When she deletes the first service, the second keeps using the same
+cache server.
 
 #### Story 4: Deploy a Mooncake Distributed Store
 
@@ -329,8 +313,8 @@ different connector roles, args, and environment variables.
 4. **Engine-agnostic pool:** `KVCachePool` does not mention vLLM, SGLang,
    engine, decoder, or router. Runtime-side integration belongs to
    `ServingRuntime`.
-5. **OME-managed alpha:** Initial deployment modes manage pool infrastructure
-   through OME directly or through provider-managed child resources. Pure
+5. **OME-managed alpha:** OME directly manages the NodeLocal DaemonSet,
+   Service and connection ConfigMap. Pure
    external pools are future work.
 6. **Workloads only:** Pod and container configuration for a pool lives only in
    `spec.workloads[]`.
@@ -367,11 +351,11 @@ different connector roles, args, and environment variables.
   `NodeLocal` rather than `DaemonSet`, and `DistributedStore` rather than
   `StatefulSet`.
 
-**Risk 5: Provider-managed mode hides operational status**
+**Risk 5: Premature deletion interrupts shared consumers**
 
-- *Mitigation:* Normalize connection information and readiness through
-  `KVCachePool.status`, even when provider-owned resources are reconciled by a
-  provider controller.
+- *Mitigation:* Hold the pool finalizer until referring services, their active
+  ReplicaSets and their draining Pods release the pool. Delete pool resources
+  explicitly so foreground cascading deletion also respects this ordering.
 
 ## Design Details
 
@@ -705,95 +689,30 @@ The controller should set the standard `Ready` condition and a
 apiVersion: ome.io/v1beta1
 kind: KVCachePool
 metadata:
-  name: lmcache-node-pool
-  namespace: llm
+  name: lmcache-node-local
 spec:
   provider:
     name: LMCache
-    backends:
-      - name: local-memory
-        type: Local
     config:
-      mode: Multiprocess
-      endpointDiscovery: NodeHostIP
+      l1CapacityPerNode: 60Gi
   deploymentMode: NodeLocal
-  cache:
-    capacity: 60Gi
-    chunkSize: 256
-    evictionPolicy: LRU
   workloads:
     - name: server
-      hostNetwork: true
-      hostIPC: true
+      runner:
+        image: lmcache/standalone:v0.5.1-cu129@sha256:c64d5704427e0c21e8b12d460f01a6cf33971ee2fdee2fbced268e4aa10d7d12
       nodeSelector:
         node-type: gpu
-      volumes:
-        - name: shm
-          hostPath:
-            path: /dev/shm
-      runner:
-        image: lmcache/standalone:nightly
-        command:
-          - /opt/venv/bin/lmcache
-        args:
-          - server
-        ports:
-          - name: transfer
-            containerPort: 6555
-            hostPort: 6555
-          - name: http
-            containerPort: 8080
-            hostPort: 8080
-          - name: metrics
-            containerPort: 9090
-            hostPort: 9090
-        readinessProbe:
-          httpGet:
-            path: /healthcheck
-            port: http
-        resources:
-          requests:
-            cpu: "4"
-            memory: 64Gi
-          limits:
-            cpu: "8"
-            memory: 80Gi
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
 ```
 
-#### LMCache ProviderManaged Pool
-
-```yaml
-apiVersion: ome.io/v1beta1
-kind: KVCachePool
-metadata:
-  name: lmcache-provider-managed
-  namespace: llm
-spec:
-  provider:
-    name: LMCache
-    config:
-      providerResource:
-        apiVersion: cache.lmcache.ai/v1alpha1
-        kind: LMCacheEngine
-  deploymentMode: ProviderManaged
-  cache:
-    capacity: 60Gi
-    evictionPolicy: LRU
-  workloads:
-    - name: server
-      nodeSelector:
-        node-type: gpu
-      runner:
-        image: lmcache/standalone:nightly
-        resources:
-          requests:
-            cpu: "4"
-            memory: 64Gi
-```
-
-The provider adapter translates the generic pool and workload intent into the
-provider-managed resource. `KVCachePool.status.connection` reflects the
-provider-generated connection information.
+A `60Gi` L1 budget applies independently to each selected node. Two ready
+servers supply 120 GiB in aggregate. Engines use the pool's ClusterIP Service
+with `internalTrafficPolicy: Local`; a node without a ready local endpoint
+cannot use a remote server. OME publishes the generated vLLM connection in
+`status.connection.configMapRef`. See the [runnable example](../../config/samples/kvcachepool/).
 
 #### Mooncake DistributedStore Pool
 
@@ -861,39 +780,49 @@ spec:
 apiVersion: ome.io/v1beta1
 kind: ServingRuntime
 metadata:
-  name: vllm-lmcache
-  namespace: llm
+  name: vllm-lmcache-mp
 spec:
   supportedModelFormats:
-    - name: safetensors
-      modelFormat:
-        name: SafeTensors
-      modelFramework:
-        name: Transformers
-      autoSelect: true
-  engineConfig:
-    runner:
-      image: vllm/vllm-openai:latest
-  decoderConfig:
-    runner:
-      image: vllm/vllm-openai:latest
+    - modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      modelArchitecture: Qwen2ForCausalLM
+      autoSelect: false
   kvCacheConnectors:
     - provider: LMCache
-      deploymentModes:
-        - NodeLocal
-        - ProviderManaged
+      deploymentModes: [NodeLocal]
       components:
         engine:
           connectorConfig:
-            connectorClass: LMCacheConnectorV1
-            role: kv_producer
-          runtimeArgsOverride:
-            - --lmcache-log-level
-            - INFO
-        decoder:
-          connectorConfig:
-            connectorClass: LMCacheConnectorV1
-            role: kv_consumer
+            connectorClass: LMCacheMPConnector
+  engineConfig:
+    hostIPC: true
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    runner:
+      name: ome-container
+      image: lmcache/vllm-openai:v0.5.1-cu129
+      command: [vllm, serve]
+      args:
+        - $(MODEL_PATH)
+        - --served-model-name
+        - qwen
+        - --port
+        - "8080"
+        - --max-model-len
+        - "4096"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      ports:
+        - name: http1
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080
 ```
 
 #### InferenceService Reference
@@ -902,19 +831,20 @@ spec:
 apiVersion: ome.io/v1beta1
 kind: InferenceService
 metadata:
-  name: qwen3-14b
-  namespace: llm
+  name: qwen-cache
 spec:
+  deploymentMode: RawDeployment
   model:
-    name: qwen3-14b
+    kind: BaseModel
+    name: qwen2-5-0-5b
   runtime:
-    name: vllm-lmcache
+    kind: ServingRuntime
+    name: vllm-lmcache-mp
   kvCachePool:
-    name: lmcache-node-pool
-    kind: KVCachePool
-    apiGroup: ome.io
+    name: lmcache-node-local
   engine:
-    minReplicas: 2
+    minReplicas: 1
+    maxReplicas: 1
 ```
 
 ### Reconciliation Flow
@@ -928,9 +858,8 @@ spec:
 4. Validate provider and deployment-mode compatibility.
 5. Reconcile implementation resources:
    - `RawDeployment`: Deployment, Service, HPA, PDB as needed.
-   - `NodeLocal`: node-local workload implementation, likely DaemonSet-backed.
+   - `NodeLocal`: DaemonSet, node-local Service and connection ConfigMap.
    - `DistributedStore`: provider role workloads such as master and store.
-   - `ProviderManaged`: provider CRs and provider-owned status refs.
 6. Build normalized `status.connection`.
 7. Update `Ready` and workload status.
 
@@ -1046,7 +975,7 @@ Provider validation should fail fast for:
 4. missing required workload roles for a mode;
 5. missing runner image when a workload requires one;
 6. provider config that cannot be decoded by the selected adapter; and
-7. missing connection status from provider-managed resources.
+7. missing or stale pool connection information.
 
 ### Observability
 
@@ -1079,8 +1008,8 @@ ome.io/kvcache-provider=<provider-name>
    provider config values.
 4. NetworkPolicy integration should be possible through stable labels.
 5. Cross-namespace pool references are not supported in alpha.
-6. `ProviderManaged` adapters must not blindly copy arbitrary user config into
-   privileged provider CR fields without validation.
+6. Restrict permission to create and update LMCache pools to administrators
+   trusted to deploy GPU-visible servers with host IPC.
 
 ### Backward Compatibility
 
@@ -1115,7 +1044,6 @@ This proposal is backward compatible:
 3. Add `KVCachePool` controller:
    - provider adapter registry
    - direct workload reconciliation
-   - provider-managed reconciliation
    - status connection normalization
 
 4. Add `InferenceService` integration:
@@ -1126,12 +1054,10 @@ This proposal is backward compatible:
 
 5. Add provider adapters:
    - LMCache `NodeLocal`
-   - LMCache `ProviderManaged`
    - Mooncake `DistributedStore` design/validation
 
 6. Add samples:
    - LMCache NodeLocal
-   - LMCache ProviderManaged
    - Mooncake DistributedStore
    - vLLM runtime with `kvCacheConnectors`
    - InferenceService referencing a pool
@@ -1160,7 +1086,6 @@ references without changing behavior when the field is absent.
 - API validation for `ServingRuntime.spec.kvCacheConnectors`.
 - Provider adapter selection and validation.
 - LMCache `NodeLocal` resource construction.
-- LMCache `ProviderManaged` child-resource construction.
 - Mooncake `DistributedStore` workload validation.
 - Status connection normalization.
 - Runtime connector matching by provider and deployment mode.
@@ -1193,14 +1118,14 @@ references without changing behavior when the field is absent.
 1. `KVCachePool` CRD is available.
 2. `InferenceService.spec.kvCachePool` reference is available.
 3. `ServingRuntime.spec.kvCacheConnectors` is available.
-4. LMCache `NodeLocal` or `ProviderManaged` path works end-to-end for vLLM.
+4. LMCache `NodeLocal` works end-to-end for vLLM.
 5. Pool status publishes connection information.
 6. Connector injection respects merge precedence.
 7. Samples and basic troubleshooting documentation exist.
 
 #### Beta
 
-1. Both LMCache `NodeLocal` and `ProviderManaged` paths are validated.
+1. LMCache NodeLocal rollout, deletion and server restart behavior are validated.
 2. Mooncake `DistributedStore` design is implemented or explicitly deferred
    with a validated sample.
 3. Engine and decoder role injection is covered by integration tests.
@@ -1211,8 +1136,7 @@ references without changing behavior when the field is absent.
 
 1. At least two provider or provider/backend combinations are validated.
 2. Failure-mode guidance is documented for production use.
-3. API fields have proven sufficient for direct and provider-managed pool
-   reconciliation.
+3. API fields have proven sufficient for the supported pool implementations.
 4. External pool binding is either added in a follow-up OEP or explicitly left
    out of scope.
 
@@ -1235,11 +1159,6 @@ Runtime connector injection adds complexity to the inference controller. The
 merge order must be carefully tested to avoid overwriting user-provided engine
 or decoder settings.
 
-Provider-managed mode adds another ownership boundary. OME owns the
-`KVCachePool`, while the provider controller owns implementation resources. The
-status contract must be clear enough for users to diagnose failures without
-knowing every provider internals.
-
 ## Alternatives
 
 ### Inline `InferenceService.spec.kvCache`
@@ -1248,17 +1167,16 @@ The initial design added `kvCache` as a component parallel to engine, decoder,
 and router.
 
 This proposal rejects that approach because KV cache pools may be created and
-operated independently, may be shared by multiple serving instances, and may be
-implemented by provider-managed controllers or distributed stores that do not
-fit the `InferenceService` component lifecycle.
+operated independently. Multiple services can share a pool and release their
+references at different times.
 
 ### `KVCacheServer` CRD
 
 OME could expose a `KVCacheServer` resource.
 
 This proposal rejects that name because many valid implementations are not one
-server process. `KVCachePool` better describes node-local deployments,
-distributed stores, and provider-managed resources.
+server process. A `KVCachePool` can run a server on each selected node or
+coordinate a distributed store.
 
 ### Cluster-scoped `ClusterKVCachePool`
 
@@ -1278,12 +1196,11 @@ such as Mooncake. All pod and container configuration lives under
 
 ### Separate `managementMode`
 
-OME could add a `managementMode` field with values like native, delegated, and
-external.
+OME could add a `managementMode` field to distinguish OME-managed pools
+from external pools.
 
 This proposal rejects that field. Following the existing `InferenceService`
-pattern, `deploymentMode` carries the reconciliation strategy. The
-`ProviderManaged` deployment mode covers provider-controller-backed resources.
+pattern, `deploymentMode` carries the reconciliation strategy. The first release implements `NodeLocal`.
 
 ### External Pools in Alpha
 

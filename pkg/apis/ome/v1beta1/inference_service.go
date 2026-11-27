@@ -76,6 +76,10 @@ type InferenceServiceSpec struct {
 	// +optional
 	Runtime *ServingRuntimeRef `json:"runtime,omitempty"`
 
+	// KVCachePool references the cache pool in this service's namespace.
+	// +optional
+	KVCachePool *KVCachePoolRef `json:"kvCachePool,omitempty"`
+
 	// Router defines the router spec
 	// +optional
 	Router *RouterSpec `json:"router,omitempty"`

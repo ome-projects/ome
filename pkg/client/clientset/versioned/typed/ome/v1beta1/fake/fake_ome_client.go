@@ -52,6 +52,10 @@ func (c *FakeOmeV1beta1) InferenceServices(namespace string) v1beta1.InferenceSe
 	return newFakeInferenceServices(c, namespace)
 }
 
+func (c *FakeOmeV1beta1) KVCachePools(namespace string) v1beta1.KVCachePoolInterface {
+	return newFakeKVCachePools(c, namespace)
+}
+
 func (c *FakeOmeV1beta1) ServingRuntimes(namespace string) v1beta1.ServingRuntimeInterface {
 	return newFakeServingRuntimes(c, namespace)
 }

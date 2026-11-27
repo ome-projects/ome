@@ -131,6 +131,22 @@ func GetOpenAPIDefinitions(ref common.ReferenceCallback) map[string]common.OpenA
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusPhaseGroup":           schema_pkg_apis_ome_v1beta1_InstanceStatusPhaseGroup(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceStatusRevisionGroup":        schema_pkg_apis_ome_v1beta1_InstanceStatusRevisionGroup(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.InstanceTermination":                schema_pkg_apis_ome_v1beta1_InstanceTermination(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorComponents":         schema_pkg_apis_ome_v1beta1_KVCacheConnectorComponents(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorConfig":             schema_pkg_apis_ome_v1beta1_KVCacheConnectorConfig(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorSpec":               schema_pkg_apis_ome_v1beta1_KVCacheConnectorSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheEngineConnector":             schema_pkg_apis_ome_v1beta1_KVCacheEngineConnector(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePool":                        schema_pkg_apis_ome_v1beta1_KVCachePool(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolConnectionStatus":        schema_pkg_apis_ome_v1beta1_KVCachePoolConnectionStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolList":                    schema_pkg_apis_ome_v1beta1_KVCachePoolList(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolPolicy":                  schema_pkg_apis_ome_v1beta1_KVCachePoolPolicy(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolRef":                     schema_pkg_apis_ome_v1beta1_KVCachePoolRef(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolSpec":                    schema_pkg_apis_ome_v1beta1_KVCachePoolSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolStatus":                  schema_pkg_apis_ome_v1beta1_KVCachePoolStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkload":                schema_pkg_apis_ome_v1beta1_KVCachePoolWorkload(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkloadStatus":          schema_pkg_apis_ome_v1beta1_KVCachePoolWorkloadStatus(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderConfig":              schema_pkg_apis_ome_v1beta1_KVCacheProviderConfig(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderSpec":                schema_pkg_apis_ome_v1beta1_KVCacheProviderSpec(ref),
+		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheServerRunner":                schema_pkg_apis_ome_v1beta1_KVCacheServerRunner(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KedaAutoscaler":                     schema_pkg_apis_ome_v1beta1_KedaAutoscaler(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KedaConfig":                         schema_pkg_apis_ome_v1beta1_KedaConfig(ref),
 		"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KedaPolicyTemplate":                 schema_pkg_apis_ome_v1beta1_KedaPolicyTemplate(ref),
@@ -8254,6 +8270,12 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef"),
 						},
 					},
+					"kvCachePool": {
+						SchemaProps: spec.SchemaProps{
+							Description: "KVCachePool references the cache pool in this service's namespace.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolRef"),
+						},
+					},
 					"router": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Router defines the router spec",
@@ -8313,7 +8335,7 @@ func schema_pkg_apis_ome_v1beta1_InferenceServiceSpec(ref common.ReferenceCallba
 			},
 		},
 		Dependencies: []string{
-			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRefs", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorSelector", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.PlacementSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ReplicaRefs", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RolloutSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RoutingSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ServingRuntimeRef", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.TrafficSpec"},
 	}
 }
 
@@ -9167,6 +9189,600 @@ func schema_pkg_apis_ome_v1beta1_InstanceTermination(ref common.ReferenceCallbac
 		},
 		Dependencies: []string{
 			"k8s.io/apimachinery/pkg/apis/meta/v1.Time"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheConnectorComponents(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"engine": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheEngineConnector"),
+						},
+					},
+				},
+				Required: []string{"engine"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheEngineConnector"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheConnectorConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"connectorClass": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ConnectorClass is the implementation loaded by the runtime. The LMCache multiprocess connector uses the connection published by the pool.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+				Required: []string{"connectorClass"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheConnectorSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "KVCacheConnectorSpec advertises a runtime's engine connector for a provider.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"provider": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"deploymentModes": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "set",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"components": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorComponents"),
+						},
+					},
+				},
+				Required: []string{"provider", "deploymentModes", "components"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorComponents"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheEngineConnector(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"connectorConfig": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorConfig"),
+						},
+					},
+				},
+				Required: []string{"connectorConfig"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorConfig"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePool(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "KVCachePool manages cache infrastructure shared by services in its namespace.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("k8s.io/apimachinery/pkg/apis/meta/v1.ObjectMeta"),
+						},
+					},
+					"spec": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolSpec"),
+						},
+					},
+					"status": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolStatus"),
+						},
+					},
+				},
+				Required: []string{"spec"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.ObjectMeta", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolStatus"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolConnectionStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"configMapRef": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ConfigMapRef names the pool-managed connection ConfigMap in the pool's namespace.",
+							Default:     map[string]interface{}{},
+							Ref:         ref("k8s.io/api/core/v1.LocalObjectReference"),
+						},
+					},
+				},
+				Required: []string{"configMapRef"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/api/core/v1.LocalObjectReference"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolList(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#types-kinds",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"apiVersion": {
+						SchemaProps: spec.SchemaProps{
+							Description: "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#resources",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"metadata": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("k8s.io/apimachinery/pkg/apis/meta/v1.ListMeta"),
+						},
+					},
+					"items": {
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePool"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"items"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.ListMeta", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePool"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolPolicy(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "KVCachePoolPolicy describes pool-wide policy shared by providers.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"capacity": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Capacity is the target capacity across the entire pool. LMCache NodeLocal accepts a per-node budget only.",
+							Ref:         ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
+						},
+					},
+					"evictionPolicy": {
+						SchemaProps: spec.SchemaProps{
+							Description: "EvictionPolicy selects the policy for reclaiming cache entries.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/api/resource.Quantity"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolRef(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Description: "KVCachePoolRef identifies a KVCachePool in the service's namespace.",
+				Type:        []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"kind": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+					"apiGroup": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"provider": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderSpec"),
+						},
+					},
+					"deploymentMode": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"cache": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Cache configures pool-wide policy.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolPolicy"),
+						},
+					},
+					"workloads": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Workloads selects the nodes on which OME runs its cache servers.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkload"),
+									},
+								},
+							},
+						},
+					},
+				},
+				Required: []string{"provider", "deploymentMode", "workloads"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkload", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderSpec"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"observedGeneration": {
+						SchemaProps: spec.SchemaProps{
+							Description: "ObservedGeneration identifies the pool spec reflected by this status.",
+							Type:        []string{"integer"},
+							Format:      "int64",
+						},
+					},
+					"conditions": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"type",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/apimachinery/pkg/apis/meta/v1.Condition"),
+									},
+								},
+							},
+						},
+					},
+					"connection": {
+						SchemaProps: spec.SchemaProps{
+							Ref: ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolConnectionStatus"),
+						},
+					},
+					"workloads": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"name",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Type: []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkloadStatus"),
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/apis/meta/v1.Condition", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolConnectionStatus", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCachePoolWorkloadStatus"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolWorkload(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Name identifies the provider workload role.",
+							Default:     "",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"nodeSelector": {
+						SchemaProps: spec.SchemaProps{
+							Description: "NodeSelector explicitly selects the nodes eligible for one cache server each.",
+							Type:        []string{"object"},
+							AdditionalProperties: &spec.SchemaOrBool{
+								Allows: true,
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: "",
+										Type:    []string{"string"},
+										Format:  "",
+									},
+								},
+							},
+						},
+					},
+					"tolerations": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-type": "atomic",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "Tolerations apply to cache server Pods.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("k8s.io/api/core/v1.Toleration"),
+									},
+								},
+							},
+						},
+					},
+					"runtimeClassName": {
+						SchemaProps: spec.SchemaProps{
+							Description: "RuntimeClassName selects the NVIDIA runtime for the server; defaults to nvidia.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"runner": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Runner overrides the LMCache server container on each selected node.",
+							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheServerRunner"),
+						},
+					},
+				},
+				Required: []string{"name", "nodeSelector"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/api/core/v1.Toleration", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheServerRunner"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCachePoolWorkloadStatus(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"desiredReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+					"readyReplicas": {
+						SchemaProps: spec.SchemaProps{
+							Default: 0,
+							Type:    []string{"integer"},
+							Format:  "int32",
+						},
+					},
+				},
+				Required: []string{"name", "desiredReplicas", "readyReplicas"},
+			},
+		},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheProviderConfig(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"l1CapacityPerNode": {
+						SchemaProps: spec.SchemaProps{
+							Description: "L1CapacityPerNode is the host-memory cache budget for each LMCache server. Adding an eligible node adds one server with the same budget.",
+							Ref:         ref("k8s.io/apimachinery/pkg/api/resource.Quantity"),
+						},
+					},
+				},
+				Required: []string{"l1CapacityPerNode"},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/apimachinery/pkg/api/resource.Quantity"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheProviderSpec(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"name": {
+						SchemaProps: spec.SchemaProps{
+							Default: "",
+							Type:    []string{"string"},
+							Format:  "",
+						},
+					},
+					"config": {
+						SchemaProps: spec.SchemaProps{
+							Default: map[string]interface{}{},
+							Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderConfig"),
+						},
+					},
+				},
+				Required: []string{"name", "config"},
+			},
+		},
+		Dependencies: []string{
+			"sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheProviderConfig"},
+	}
+}
+
+func schema_pkg_apis_ome_v1beta1_KVCacheServerRunner(ref common.ReferenceCallback) common.OpenAPIDefinition {
+	return common.OpenAPIDefinition{
+		Schema: spec.Schema{
+			SchemaProps: spec.SchemaProps{
+				Type: []string{"object"},
+				Properties: map[string]spec.Schema{
+					"image": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Image is the server container image, including an optional tag or digest.",
+							Type:        []string{"string"},
+							Format:      "",
+						},
+					},
+					"resources": {
+						SchemaProps: spec.SchemaProps{
+							Description: "Resources replaces the server's default container requests and limits.",
+							Ref:         ref("k8s.io/api/core/v1.ResourceRequirements"),
+						},
+					},
+				},
+			},
+		},
+		Dependencies: []string{
+			"k8s.io/api/core/v1.ResourceRequirements"},
 	}
 }
 
@@ -16011,6 +16627,28 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeSpec(ref common.ReferenceCallback
 							Ref:         ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec"),
 						},
 					},
+					"kvCacheConnectors": {
+						VendorExtensible: spec.VendorExtensible{
+							Extensions: spec.Extensions{
+								"x-kubernetes-list-map-keys": []interface{}{
+									"provider",
+								},
+								"x-kubernetes-list-type": "map",
+							},
+						},
+						SchemaProps: spec.SchemaProps{
+							Description: "KVCacheConnectors lists the cache providers the engine can connect to.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorSpec"),
+									},
+								},
+							},
+						},
+					},
 					"decoderConfig": {
 						SchemaProps: spec.SchemaProps{
 							Description: "Decoder configuration for this runtime",
@@ -16232,7 +16870,7 @@ func schema_pkg_apis_ome_v1beta1_ServingRuntimeSpec(ref common.ReferenceCallback
 			},
 		},
 		Dependencies: []string{
-			"k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.Volume", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorRequirements", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SupportedModelFormat"},
+			"k8s.io/api/core/v1.Affinity", "k8s.io/api/core/v1.Container", "k8s.io/api/core/v1.LocalObjectReference", "k8s.io/api/core/v1.Toleration", "k8s.io/api/core/v1.Volume", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.AcceleratorRequirements", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.DecoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EncoderSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.EngineSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.KVCacheConnectorSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ModelSizeRangeSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.RouterSpec", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.ScalingPolicy", "sigs.k8s.io/ome/pkg/apis/ome/v1beta1.SupportedModelFormat"},
 	}
 }
 

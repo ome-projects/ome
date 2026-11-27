@@ -222,6 +222,12 @@ type ServingRuntimeSpec struct {
 	// Engine configuration for this runtime
 	// +optional
 	EngineConfig *EngineSpec `json:"engineConfig,omitempty"`
+
+	// KVCacheConnectors lists the cache providers the engine can connect to.
+	// +listType=map
+	// +listMapKey=provider
+	// +optional
+	KVCacheConnectors []KVCacheConnectorSpec `json:"kvCacheConnectors,omitempty"`
 	// Decoder configuration for this runtime
 	// +optional
 	DecoderConfig *DecoderSpec `json:"decoderConfig,omitempty"`

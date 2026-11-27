@@ -1,0 +1,247 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  annotations:
+    controller-gen.kubebuilder.io/version: v0.18.0
+  name: kvcachepools.ome.io
+spec:
+  group: ome.io
+  names:
+    kind: KVCachePool
+    listKind: KVCachePoolList
+    plural: kvcachepools
+    singular: kvcachepool
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.provider.name
+      name: Provider
+      type: string
+    - jsonPath: .status.conditions[?(@.type=='Ready')].status
+      name: Ready
+      type: string
+    name: v1beta1
+    schema:
+      openAPIV3Schema:
+        properties:
+          apiVersion:
+            type: string
+          kind:
+            type: string
+          metadata:
+            type: object
+          spec:
+            properties:
+              cache:
+                properties:
+                  capacity:
+                    anyOf:
+                    - type: integer
+                    - type: string
+                    pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                    x-kubernetes-int-or-string: true
+                  evictionPolicy:
+                    enum:
+                    - LRU
+                    type: string
+                type: object
+                x-kubernetes-validations:
+                - message: LMCache NodeLocal uses spec.provider.config.l1CapacityPerNode;
+                    it cannot enforce a total pool capacity
+                  rule: '!has(self.capacity)'
+              deploymentMode:
+                enum:
+                - NodeLocal
+                type: string
+              provider:
+                properties:
+                  config:
+                    properties:
+                      l1CapacityPerNode:
+                        anyOf:
+                        - type: integer
+                        - type: string
+                        pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                        x-kubernetes-int-or-string: true
+                        x-kubernetes-validations:
+                        - message: l1CapacityPerNode must be positive
+                          rule: quantity(string(self)).isGreaterThan(quantity('0'))
+                    required:
+                    - l1CapacityPerNode
+                    type: object
+                  name:
+                    enum:
+                    - LMCache
+                    type: string
+                required:
+                - config
+                - name
+                type: object
+              workloads:
+                items:
+                  properties:
+                    name:
+                      enum:
+                      - server
+                      type: string
+                    nodeSelector:
+                      additionalProperties:
+                        type: string
+                      minProperties: 1
+                      type: object
+                    runner:
+                      properties:
+                        image:
+                          type: string
+                        resources:
+                          properties:
+                            claims:
+                              items:
+                                properties:
+                                  name:
+                                    type: string
+                                  request:
+                                    type: string
+                                required:
+                                - name
+                                type: object
+                              type: array
+                              x-kubernetes-list-map-keys:
+                              - name
+                              x-kubernetes-list-type: map
+                            limits:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              type: object
+                            requests:
+                              additionalProperties:
+                                anyOf:
+                                - type: integer
+                                - type: string
+                                pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+                                x-kubernetes-int-or-string: true
+                              type: object
+                          type: object
+                      type: object
+                    runtimeClassName:
+                      type: string
+                    tolerations:
+                      items:
+                        properties:
+                          effect:
+                            type: string
+                          key:
+                            type: string
+                          operator:
+                            type: string
+                          tolerationSeconds:
+                            format: int64
+                            type: integer
+                          value:
+                            type: string
+                        type: object
+                      type: array
+                      x-kubernetes-list-type: atomic
+                  required:
+                  - name
+                  - nodeSelector
+                  type: object
+                maxItems: 1
+                minItems: 1
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            required:
+            - deploymentMode
+            - provider
+            - workloads
+            type: object
+          status:
+            properties:
+              conditions:
+                items:
+                  properties:
+                    lastTransitionTime:
+                      format: date-time
+                      type: string
+                    message:
+                      maxLength: 32768
+                      type: string
+                    observedGeneration:
+                      format: int64
+                      minimum: 0
+                      type: integer
+                    reason:
+                      maxLength: 1024
+                      minLength: 1
+                      pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+                      type: string
+                    status:
+                      enum:
+                      - "True"
+                      - "False"
+                      - Unknown
+                      type: string
+                    type:
+                      maxLength: 316
+                      pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+                      type: string
+                  required:
+                  - lastTransitionTime
+                  - message
+                  - reason
+                  - status
+                  - type
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - type
+                x-kubernetes-list-type: map
+              connection:
+                properties:
+                  configMapRef:
+                    properties:
+                      name:
+                        default: ""
+                        type: string
+                    type: object
+                    x-kubernetes-map-type: atomic
+                required:
+                - configMapRef
+                type: object
+              observedGeneration:
+                format: int64
+                type: integer
+              workloads:
+                items:
+                  properties:
+                    desiredReplicas:
+                      format: int32
+                      type: integer
+                    name:
+                      type: string
+                    readyReplicas:
+                      format: int32
+                      type: integer
+                  required:
+                  - desiredReplicas
+                  - name
+                  - readyReplicas
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
+            type: object
+        required:
+        - spec
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}

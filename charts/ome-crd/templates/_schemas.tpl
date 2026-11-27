@@ -145,6 +145,198 @@ required:
 - modelFramework
 type: object
 {{- end }}
+{{- define "ome-crd.schema.10530cf680e8" -}}
+properties:
+  acceleratorRequirements:
+    properties:
+      acceleratorClasses:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+      minArchitectureVersion:
+        type: string
+      minComputePerformanceTFLOPS:
+        format: int64
+        minimum: 0
+        type: integer
+      minMemory:
+        format: int64
+        minimum: 0
+        type: integer
+      preferredPrecisions:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+      requiredFeatures:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+    type: object
+  affinity:
+{{- include "ome-crd.schema.c228fd20cb73" . | nindent 4 }}
+  annotations:
+    additionalProperties:
+      type: string
+    type: object
+  containers:
+{{- include "ome-crd.schema.49fc672a34b1" . | nindent 4 }}
+  decoderConfig:
+{{- include "ome-crd.schema.29c39f8614f9" . | nindent 4 }}
+  disabled:
+    type: boolean
+  dnsPolicy:
+    type: string
+  encoderConfig:
+{{- include "ome-crd.schema.c2b6795de281" . | nindent 4 }}
+  engineConfig:
+{{- include "ome-crd.schema.29c39f8614f9" . | nindent 4 }}
+  hostIPC:
+    type: boolean
+  hostNetwork:
+    type: boolean
+  imagePullSecrets:
+    items:
+      properties:
+        name:
+          default: ""
+          type: string
+      type: object
+      x-kubernetes-map-type: atomic
+    type: array
+    x-kubernetes-list-map-keys:
+    - name
+    x-kubernetes-list-type: map
+  kvCacheConnectors:
+    items:
+      properties:
+        components:
+          properties:
+            engine:
+              properties:
+                connectorConfig:
+                  properties:
+                    connectorClass:
+                      enum:
+                      - LMCacheMPConnector
+                      type: string
+                  required:
+                  - connectorClass
+                  type: object
+              required:
+              - connectorConfig
+              type: object
+          required:
+          - engine
+          type: object
+        deploymentModes:
+          items:
+            enum:
+            - NodeLocal
+            type: string
+          minItems: 1
+          type: array
+          x-kubernetes-list-type: set
+        provider:
+          enum:
+          - LMCache
+          type: string
+      required:
+      - components
+      - deploymentModes
+      - provider
+      type: object
+    type: array
+    x-kubernetes-list-map-keys:
+    - provider
+    x-kubernetes-list-type: map
+  labels:
+    additionalProperties:
+      type: string
+    type: object
+  modelSizeRange:
+    properties:
+      max:
+        type: string
+      min:
+        type: string
+    type: object
+  nodeSelector:
+    additionalProperties:
+      type: string
+    type: object
+  protocolVersions:
+    items:
+      type: string
+    type: array
+    x-kubernetes-list-type: atomic
+  routerConfig:
+{{- include "ome-crd.schema.74dcd6e7d4a3" . | nindent 4 }}
+  scalingPolicy:
+    properties:
+      mode:
+        allOf:
+        - enum:
+          - Independent
+          - Proportional
+          - Pinned
+        - enum:
+          - Independent
+          - Proportional
+          - Pinned
+        default: Independent
+        type: string
+      proportional:
+        properties:
+          anchor:
+            default: engine
+            enum:
+            - engine
+            - decoder
+            - encoder
+            - router
+            type: string
+          ratios:
+            additionalProperties:
+              anyOf:
+              - type: integer
+              - type: string
+              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
+              x-kubernetes-int-or-string: true
+            type: object
+        required:
+        - anchor
+        type: object
+    required:
+    - mode
+    type: object
+  schedulerName:
+    type: string
+  supportedModelFormats:
+{{- include "ome-crd.schema.403ea1197adf" . | nindent 4 }}
+  tolerations:
+    items:
+      properties:
+        effect:
+          type: string
+        key:
+          type: string
+        operator:
+          type: string
+        tolerationSeconds:
+          format: int64
+          type: integer
+        value:
+          type: string
+      type: object
+    type: array
+    x-kubernetes-list-type: atomic
+  volumes:
+{{- include "ome-crd.schema.f929430e068e" . | nindent 4 }}
+type: object
+{{- end }}
 {{- define "ome-crd.schema.10810099e6d4" -}}
 properties:
   downloadPolicy:
@@ -4604,214 +4796,6 @@ properties:
     type: string
 type: object
 {{- end }}
-{{- define "ome-crd.schema.caf3d2272402" -}}
-properties:
-  acceleratorRequirements:
-    properties:
-      acceleratorClasses:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-      minArchitectureVersion:
-        type: string
-      minComputePerformanceTFLOPS:
-        format: int64
-        minimum: 0
-        type: integer
-      minMemory:
-        format: int64
-        minimum: 0
-        type: integer
-      preferredPrecisions:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-      requiredFeatures:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-    type: object
-  affinity:
-{{- include "ome-crd.schema.c228fd20cb73" . | nindent 4 }}
-  annotations:
-    additionalProperties:
-      type: string
-    type: object
-  containers:
-{{- include "ome-crd.schema.49fc672a34b1" . | nindent 4 }}
-  decoderConfig:
-{{- include "ome-crd.schema.29c39f8614f9" . | nindent 4 }}
-  disabled:
-    type: boolean
-  dnsPolicy:
-    type: string
-  encoderConfig:
-{{- include "ome-crd.schema.c2b6795de281" . | nindent 4 }}
-  engineConfig:
-{{- include "ome-crd.schema.29c39f8614f9" . | nindent 4 }}
-  hostIPC:
-    type: boolean
-  hostNetwork:
-    type: boolean
-  imagePullSecrets:
-    items:
-      properties:
-        name:
-          default: ""
-          type: string
-      type: object
-      x-kubernetes-map-type: atomic
-    type: array
-    x-kubernetes-list-map-keys:
-    - name
-    x-kubernetes-list-type: map
-  labels:
-    additionalProperties:
-      type: string
-    type: object
-  modelSizeRange:
-    properties:
-      max:
-        type: string
-      min:
-        type: string
-    type: object
-  nodeSelector:
-    additionalProperties:
-      type: string
-    type: object
-  protocolVersions:
-    items:
-      type: string
-    type: array
-    x-kubernetes-list-type: atomic
-  routerConfig:
-{{- include "ome-crd.schema.74dcd6e7d4a3" . | nindent 4 }}
-  scalingPolicy:
-    properties:
-      mode:
-        allOf:
-        - enum:
-          - Independent
-          - Proportional
-          - Pinned
-        - enum:
-          - Independent
-          - Proportional
-          - Pinned
-        default: Independent
-        type: string
-      proportional:
-        properties:
-          anchor:
-            default: engine
-            enum:
-            - engine
-            - decoder
-            - encoder
-            - router
-            type: string
-          ratios:
-            additionalProperties:
-              anyOf:
-              - type: integer
-              - type: string
-              pattern: ^(\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))(([KMGTPE]i)|[numkMGTPE]|([eE](\+|-)?(([0-9]+(\.[0-9]*)?)|(\.[0-9]+))))?$
-              x-kubernetes-int-or-string: true
-            type: object
-        required:
-        - anchor
-        type: object
-    required:
-    - mode
-    type: object
-  schedulerName:
-    type: string
-  supportedModelFormats:
-{{- include "ome-crd.schema.403ea1197adf" . | nindent 4 }}
-  tolerations:
-    items:
-      properties:
-        effect:
-          type: string
-        key:
-          type: string
-        operator:
-          type: string
-        tolerationSeconds:
-          format: int64
-          type: integer
-        value:
-          type: string
-      type: object
-    type: array
-    x-kubernetes-list-type: atomic
-  volumes:
-{{- include "ome-crd.schema.f929430e068e" . | nindent 4 }}
-type: object
-{{- end }}
-{{- define "ome-crd.schema.cbcf4e6e989a" -}}
-properties:
-  apiVersion:
-    type: string
-  kind:
-    type: string
-  metadata:
-    type: object
-  spec:
-{{- include "ome-crd.schema.caf3d2272402" . | nindent 4 }}
-  status:
-    properties:
-      conditions:
-        items:
-          properties:
-            lastTransitionTime:
-              format: date-time
-              type: string
-            message:
-              maxLength: 32768
-              type: string
-            observedGeneration:
-              format: int64
-              minimum: 0
-              type: integer
-            reason:
-              maxLength: 1024
-              minLength: 1
-              pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
-              type: string
-            status:
-              enum:
-              - "True"
-              - "False"
-              - Unknown
-              type: string
-            type:
-              maxLength: 316
-              pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
-              type: string
-          required:
-          - lastTransitionTime
-          - message
-          - reason
-          - status
-          - type
-          type: object
-        type: array
-        x-kubernetes-list-map-keys:
-        - type
-        x-kubernetes-list-type: map
-      inheritanceChain:
-        items:
-          type: string
-        type: array
-        x-kubernetes-list-type: atomic
-    type: object
-type: object
-{{- end }}
 {{- define "ome-crd.schema.d5af2de30d7d" -}}
 properties:
   preferredDuringSchedulingIgnoredDuringExecution:
@@ -6442,6 +6426,65 @@ properties:
     x-kubernetes-list-type: map
   volumes:
 {{- include "ome-crd.schema.f929430e068e" . | nindent 4 }}
+type: object
+{{- end }}
+{{- define "ome-crd.schema.e1972fa01ad4" -}}
+properties:
+  apiVersion:
+    type: string
+  kind:
+    type: string
+  metadata:
+    type: object
+  spec:
+{{- include "ome-crd.schema.10530cf680e8" . | nindent 4 }}
+  status:
+    properties:
+      conditions:
+        items:
+          properties:
+            lastTransitionTime:
+              format: date-time
+              type: string
+            message:
+              maxLength: 32768
+              type: string
+            observedGeneration:
+              format: int64
+              minimum: 0
+              type: integer
+            reason:
+              maxLength: 1024
+              minLength: 1
+              pattern: ^[A-Za-z]([A-Za-z0-9_,:]*[A-Za-z0-9_])?$
+              type: string
+            status:
+              enum:
+              - "True"
+              - "False"
+              - Unknown
+              type: string
+            type:
+              maxLength: 316
+              pattern: ^([a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*/)?(([A-Za-z0-9][-A-Za-z0-9_.]*)?[A-Za-z0-9])$
+              type: string
+          required:
+          - lastTransitionTime
+          - message
+          - reason
+          - status
+          - type
+          type: object
+        type: array
+        x-kubernetes-list-map-keys:
+        - type
+        x-kubernetes-list-type: map
+      inheritanceChain:
+        items:
+          type: string
+        type: array
+        x-kubernetes-list-type: atomic
+    type: object
 type: object
 {{- end }}
 {{- define "ome-crd.schema.e6a256791bd2" -}}

@@ -6,14 +6,15 @@
   "BaseModel": 89,
   "BenchmarkJob": 162,
   "ClusterBaseModel": 89,
-  "ClusterServingRuntime": 232,
-  "FineTunedWeight": 234,
-  "InferenceReplica": 269,
-  "InferenceService": 371,
-  "RolloutPolicy": 374,
-  "ServingRuntime": 232,
-  "TrafficMap": 386,
-  "WorkloadCluster": 391
+  "ClusterServingRuntime": 237,
+  "FineTunedWeight": 239,
+  "InferenceReplica": 274,
+  "InferenceService": 376,
+  "KVCachePool": 388,
+  "RolloutPolicy": 391,
+  "ServingRuntime": 237,
+  "TrafficMap": 403,
+  "WorkloadCluster": 408
  },
  "nodes": [
   {},
@@ -1799,6 +1800,31 @@
   },
   {
    "properties": {
+    "connectorClass": 0
+   }
+  },
+  {
+   "properties": {
+    "connectorConfig": 220
+   }
+  },
+  {
+   "properties": {
+    "engine": 221
+   }
+  },
+  {
+   "properties": {
+    "components": 222,
+    "deploymentModes": 1,
+    "provider": 0
+   }
+  },
+  {
+   "items": 223
+  },
+  {
+   "properties": {
     "max": 0,
     "min": 0
    }
@@ -1817,7 +1843,7 @@
     "automountServiceAccountToken": 0,
     "autoscaler": 197,
     "autoscalerPolicyRef": 193,
-    "capacityEndpoint": 221,
+    "capacityEndpoint": 226,
     "config": 14,
     "containers": 189,
     "deploymentStrategy": 199,
@@ -1875,7 +1901,7 @@
   {
    "properties": {
     "mode": 0,
-    "proportional": 223
+    "proportional": 228
    }
   },
   {
@@ -1890,15 +1916,15 @@
     "environmentOverride": 14,
     "minMemoryPerBillionParams": 0,
     "runtimeArgsOverride": 1,
-    "tensorParallelismOverride": 225
+    "tensorParallelismOverride": 230
    }
   },
   {
-   "additionalProperties": 226
+   "additionalProperties": 231
   },
   {
    "properties": {
-    "acceleratorConfig": 227,
+    "acceleratorConfig": 232,
     "autoSelect": 0,
     "diffusionPipeline": 81,
     "modelArchitecture": 0,
@@ -1913,7 +1939,7 @@
    }
   },
   {
-   "items": 228
+   "items": 233
   },
   {
    "properties": {
@@ -1929,14 +1955,15 @@
     "hostIPC": 0,
     "hostNetwork": 0,
     "imagePullSecrets": 203,
+    "kvCacheConnectors": 224,
     "labels": 14,
-    "modelSizeRange": 220,
+    "modelSizeRange": 225,
     "nodeSelector": 14,
     "protocolVersions": 1,
-    "routerConfig": 222,
-    "scalingPolicy": 224,
+    "routerConfig": 227,
+    "scalingPolicy": 229,
     "schedulerName": 0,
-    "supportedModelFormats": 229,
+    "supportedModelFormats": 234,
     "tolerations": 107,
     "volumes": 157
    }
@@ -1952,8 +1979,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 230,
-    "status": 231
+    "spec": 235,
+    "status": 236
    }
   },
   {
@@ -1976,7 +2003,7 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 233,
+    "spec": 238,
     "status": 88
    }
   },
@@ -1989,7 +2016,7 @@
     "fineTunedWeights": 1,
     "kind": 0,
     "name": 0,
-    "overlays": 235
+    "overlays": 240
    }
   },
   {
@@ -2006,11 +2033,11 @@
    }
   },
   {
-   "items": 238
+   "items": 243
   },
   {
    "properties": {
-    "components": 239,
+    "components": 244,
     "fingerprint": 0
    }
   },
@@ -2021,15 +2048,15 @@
    }
   },
   {
-   "items": 241
+   "items": 246
   },
   {
    "properties": {
     "clusterUID": 0,
-    "demand": 240,
+    "demand": 245,
     "pauseSurge": 0,
     "planID": 0,
-    "replicaFloors": 242,
+    "replicaFloors": 247,
     "revision": 0,
     "sourceUID": 0
    }
@@ -2089,24 +2116,24 @@
     "tolerations": 107,
     "topologySpreadConstraints": 210,
     "volumes": 157,
-    "workloadRef": 245
+    "workloadRef": 250
    }
   },
   {
    "properties": {
-    "metadata": 244,
-    "spec": 246
+    "metadata": 249,
+    "spec": 251
    }
   },
   {
    "properties": {
     "name": 0,
     "size": 0,
-    "template": 247
+    "template": 252
    }
   },
   {
-   "items": 248
+   "items": 253
   },
   {
    "properties": {
@@ -2123,18 +2150,18 @@
     "component": 0,
     "lifecycle": 216,
     "minReadySeconds": 0,
-    "modelRef": 236,
-    "pacing": 237,
+    "modelRef": 241,
+    "pacing": 242,
     "pairingProtocol": 0,
     "parentRef": 36,
     "pauseMode": 0,
     "paused": 0,
-    "placementExecution": 243,
+    "placementExecution": 248,
     "placementReplicaLimit": 0,
     "replicas": 0,
     "revisionHistoryLimit": 0,
-    "runners": 249,
-    "runtimeRef": 250,
+    "runners": 254,
+    "runtimeRef": 255,
     "topologyKey": 0,
     "topologySpread": 0,
     "topologySpreadKey": 0
@@ -2147,7 +2174,7 @@
    }
   },
   {
-   "items": 252
+   "items": 257
   },
   {
    "properties": {
@@ -2185,31 +2212,31 @@
     "announced": 1,
     "conditions": 28,
     "index": 0,
-    "lastFailure": 254,
-    "operation": 255,
+    "lastFailure": 259,
+    "operation": 260,
     "readySince": 0
    }
   },
   {
-   "items": 256
+   "items": 261
   },
   {
    "properties": {
     "activeOrdinalOne": 0,
     "admitted": 0,
-    "availablePodCounts": 253,
-    "entries": 257,
-    "incarnations": 253,
+    "availablePodCounts": 258,
+    "entries": 262,
+    "incarnations": 258,
     "members": 0,
-    "phases": 253,
-    "podCounts": 253,
+    "phases": 258,
+    "podCounts": 258,
     "readySinceBase": 0,
     "readySinceIndexes": 0,
     "readySinceOffsets": 1,
     "rowOrder": 1,
-    "runningRevisions": 253,
-    "servingPodCounts": 253,
-    "targetRevisions": 253
+    "runningRevisions": 258,
+    "servingPodCounts": 258,
+    "targetRevisions": 258
    }
   },
   {
@@ -2221,9 +2248,9 @@
     "conditions": 28,
     "incarnation": 0,
     "index": 0,
-    "lastFailure": 254,
+    "lastFailure": 259,
     "nodesOccupied": 1,
-    "operation": 255,
+    "operation": 260,
     "phase": 0,
     "podCount": 0,
     "readyPodCount": 0,
@@ -2235,7 +2262,7 @@
    }
   },
   {
-   "items": 259
+   "items": 264
   },
   {
    "properties": {
@@ -2257,7 +2284,7 @@
    }
   },
   {
-   "items": 261
+   "items": 266
   },
   {
    "properties": {
@@ -2271,7 +2298,7 @@
    }
   },
   {
-   "items": 263
+   "items": 268
   },
   {
    "properties": {
@@ -2291,7 +2318,7 @@
    }
   },
   {
-   "items": 266
+   "items": 271
   },
   {
    "properties": {
@@ -2300,20 +2327,20 @@
     "conditions": 28,
     "coordinationGroupRef": 0,
     "currentRevision": 0,
-    "instanceStatusColumns": 258,
+    "instanceStatusColumns": 263,
     "instanceStatusEncoding": 0,
-    "instanceStatuses": 260,
+    "instanceStatuses": 265,
     "labelSelector": 0,
-    "migrations": 262,
+    "migrations": 267,
     "observedGeneration": 0,
     "observedTemplateHash": 0,
     "placementObservedGeneration": 0,
     "readyReplicas": 0,
     "replicas": 0,
-    "retryBlocks": 264,
-    "rolloutHold": 265,
+    "retryBlocks": 269,
+    "rolloutHold": 270,
     "servingReplicas": 0,
-    "traffic": 267,
+    "traffic": 272,
     "updateRevision": 0,
     "updatedReadyReplicas": 0,
     "updatedReplicas": 0
@@ -2324,27 +2351,27 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 251,
-    "status": 268
+    "spec": 256,
+    "status": 273
    }
   },
   {
    "properties": {
-    "decoder": 220,
-    "default": 220,
-    "engine": 220,
-    "router": 220
+    "decoder": 225,
+    "default": 225,
+    "engine": 225,
+    "router": 225
    }
   },
   {
    "properties": {
     "matchExpressions": 7,
     "matchFields": 7,
-    "weights": 270
+    "weights": 275
    }
   },
   {
-   "items": 271
+   "items": 276
   },
   {
    "properties": {
@@ -2356,18 +2383,18 @@
   },
   {
    "properties": {
-    "maxPerCluster": 273,
+    "maxPerCluster": 278,
     "replicas": 0
    }
   },
   {
    "properties": {
-    "clusterAffinity": 272,
+    "clusterAffinity": 277,
     "maxSurge": 0,
     "mode": 0,
     "policy": 0,
     "replacementTimeout": 0,
-    "split": 274
+    "split": 279
    }
   },
   {
@@ -2394,14 +2421,14 @@
    }
   },
   {
-   "items": 278
+   "items": 283
   },
   {
    "properties": {
     "failureLimit": 0,
     "initialDelay": 0,
     "interval": 0,
-    "metrics": 279,
+    "metrics": 284,
     "onInconclusive": 0
    }
   },
@@ -2412,21 +2439,21 @@
   },
   {
    "properties": {
-    "analysis": 280,
+    "analysis": 285,
     "capacity": 0,
-    "pause": 281,
+    "pause": 286,
     "traffic": 0
    }
   },
   {
-   "items": 282
+   "items": 287
   },
   {
    "properties": {
-    "prometheus": 277,
+    "prometheus": 282,
     "readyTimeout": 0,
     "scaleDownDelaySeconds": 0,
-    "steps": 283
+    "steps": 288
    }
   },
   {
@@ -2444,22 +2471,22 @@
   {
    "properties": {
     "blueGreen": 0,
-    "canary": 284,
+    "canary": 289,
     "components": 1,
-    "maintainRatio": 285,
+    "maintainRatio": 290,
     "order": 1,
-    "policyRef": 286,
+    "policyRef": 291,
     "rollingUpdate": 198,
     "soak": 0
    }
   },
   {
-   "items": 287
+   "items": 292
   },
   {
    "properties": {
     "groupOrdering": 0,
-    "groups": 288,
+    "groups": 293,
     "pairingProtocol": 0
    }
   },
@@ -2499,11 +2526,11 @@
   },
   {
    "properties": {
-    "capacity": 290,
+    "capacity": 295,
     "capacityFactors": 14,
     "enabled": 0,
-    "probe": 291,
-    "publisher": 292
+    "probe": 296,
+    "publisher": 297
    }
   },
   {
@@ -2514,7 +2541,7 @@
   },
   {
    "properties": {
-    "cookie": 294,
+    "cookie": 299,
     "headers": 203,
     "type": 0
    }
@@ -2528,8 +2555,8 @@
   {
    "properties": {
     "algorithm": 0,
-    "consistentHash": 295,
-    "endpointOverride": 296
+    "consistentHash": 300,
+    "endpointOverride": 301
    }
   },
   {
@@ -2539,15 +2566,16 @@
     "deploymentMode": 0,
     "encoder": 219,
     "engine": 218,
-    "model": 236,
-    "placement": 275,
-    "replicaRefs": 276,
-    "rollout": 289,
-    "router": 222,
-    "routing": 293,
-    "runtime": 250,
-    "scalingPolicy": 224,
-    "traffic": 297,
+    "kvCachePool": 123,
+    "model": 241,
+    "placement": 280,
+    "replicaRefs": 281,
+    "rollout": 294,
+    "router": 227,
+    "routing": 298,
+    "runtime": 255,
+    "scalingPolicy": 229,
+    "traffic": 302,
     "ttlSecondsAfterCreation": 0
    }
   },
@@ -2560,7 +2588,7 @@
    }
   },
   {
-   "items": 299
+   "items": 304
   },
   {
    "properties": {
@@ -2591,7 +2619,7 @@
    }
   },
   {
-   "items": 303
+   "items": 308
   },
   {
    "properties": {
@@ -2599,11 +2627,11 @@
     "canaryRevisionHash": 0,
     "capacityWaitSince": 0,
     "currentStep": 0,
-    "failed": 301,
-    "forced": 302,
+    "failed": 306,
+    "forced": 307,
     "lastConclusiveEvaluationTime": 0,
     "lastEvaluationTime": 0,
-    "metricResults": 304,
+    "metricResults": 309,
     "observedTrafficWeight": 0,
     "preStepHold": 0,
     "promotedThrough": 0,
@@ -2638,8 +2666,8 @@
     "desiredReplicas": 0,
     "lastScaleTime": 0,
     "managedBy": 0,
-    "policy": 306,
-    "shadowedPolicyRef": 307,
+    "policy": 311,
+    "shadowedPolicyRef": 312,
     "specSource": 0
    }
   },
@@ -2653,7 +2681,7 @@
     "observedGeneration": 0,
     "readyReplicas": 0,
     "replicas": 0,
-    "rolloutHold": 265,
+    "rolloutHold": 270,
     "servingReplicas": 0,
     "updateRevision": 0,
     "updatedReadyReplicas": 0,
@@ -2670,23 +2698,23 @@
   },
   {
    "properties": {
-    "address": 299,
-    "autoscaler": 308,
-    "canary": 305,
+    "address": 304,
+    "autoscaler": 313,
+    "canary": 310,
     "latestReadyRevision": 0,
     "latestRolledoutRevision": 0,
-    "lifecycle": 309,
+    "lifecycle": 314,
     "previousRolledoutRevision": 0,
     "restURL": 0,
     "rolloutPhase": 0,
     "scaleTargetRef": 62,
-    "selectedAccelerator": 310,
-    "traffic": 267,
+    "selectedAccelerator": 315,
+    "traffic": 272,
     "url": 0
    }
   },
   {
-   "additionalProperties": 311
+   "additionalProperties": 316
   },
   {
    "properties": {
@@ -2699,7 +2727,7 @@
    }
   },
   {
-   "items": 313
+   "items": 318
   },
   {
    "properties": {
@@ -2708,13 +2736,13 @@
    }
   },
   {
-   "items": 315
+   "items": 320
   },
   {
    "properties": {
     "completedAt": 0,
     "component": 0,
-    "events": 316,
+    "events": 321,
     "id": 0,
     "instance": 0,
     "mode": 0,
@@ -2728,7 +2756,7 @@
    }
   },
   {
-   "items": 317
+   "items": 322
   },
   {
    "properties": {
@@ -2754,9 +2782,9 @@
   },
   {
    "properties": {
-    "lastFailureInfo": 319,
-    "modelCopies": 320,
-    "modelRevisionStates": 321,
+    "lastFailureInfo": 324,
+    "modelCopies": 325,
+    "modelRevisionStates": 326,
     "transitionStatus": 0
    }
   },
@@ -2769,7 +2797,7 @@
    }
   },
   {
-   "items": 323
+   "items": 328
   },
   {
    "properties": {
@@ -2784,13 +2812,13 @@
    }
   },
   {
-   "items": 325
+   "items": 330
   },
   {
    "properties": {
-    "demandContract": 240,
+    "demandContract": 245,
     "demandFingerprint": 0,
-    "pools": 326,
+    "pools": 331,
     "replicas": 0
    }
   },
@@ -2803,22 +2831,22 @@
    }
   },
   {
-   "items": 328
+   "items": 333
   },
   {
    "properties": {
     "inputDigest": 0,
-    "replicaFloors": 242
+    "replicaFloors": 247
    }
   },
   {
    "properties": {
-    "capacity": 327,
+    "capacity": 332,
     "clusterUID": 0,
-    "componentMatches": 329,
-    "currentHome": 330,
+    "componentMatches": 334,
+    "currentHome": 335,
     "currentReplicas": 0,
-    "desiredHome": 330,
+    "desiredHome": 335,
     "desiredReplicas": 0,
     "drainRequested": 0,
     "homeInputsPending": 0,
@@ -2840,7 +2868,7 @@
    }
   },
   {
-   "additionalProperties": 332
+   "additionalProperties": 337
   },
   {
    "properties": {
@@ -2849,12 +2877,12 @@
    }
   },
   {
-   "items": 334
+   "items": 339
   },
   {
    "properties": {
-    "components": 333,
-    "policies": 335,
+    "components": 338,
+    "policies": 340,
     "ready": 0
    }
   },
@@ -2866,7 +2894,7 @@
    }
   },
   {
-   "items": 337
+   "items": 342
   },
   {
    "properties": {
@@ -2876,7 +2904,7 @@
    }
   },
   {
-   "items": 339
+   "items": 344
   },
   {
    "properties": {
@@ -2886,29 +2914,29 @@
   },
   {
    "properties": {
-    "activeGroups": 340,
+    "activeGroups": 345,
     "activeRunID": 0,
-    "lastRun": 341
+    "lastRun": 346
    }
   },
   {
    "properties": {
     "admittedReplicas": 0,
-    "allocation": 331,
+    "allocation": 336,
     "appliedPlanID": 0,
-    "autoscaling": 336,
+    "autoscaling": 341,
     "cluster": 0,
-    "componentFloors": 338,
+    "componentFloors": 343,
     "endpoint": 0,
     "observationFailingSince": 0,
     "observationKnown": 0,
     "phase": 0,
     "readyReplicas": 0,
-    "rollout": 342
+    "rollout": 347
    }
   },
   {
-   "items": 343
+   "items": 348
   },
   {
    "properties": {
@@ -2928,7 +2956,7 @@
     "pauseSurge": 0,
     "requestedReplicas": 0,
     "revision": 0,
-    "singleMove": 345,
+    "singleMove": 350,
     "sourceUID": 0,
     "unassignedReplicas": 0,
     "winner": 0
@@ -2936,28 +2964,28 @@
   },
   {
    "properties": {
-    "candidates": 344,
+    "candidates": 349,
     "cluster": 0,
     "endpoint": 0,
     "phase": 0,
-    "plan": 346
+    "plan": 351
    }
   },
   {
    "properties": {
-    "group": 287,
+    "group": 292,
     "policyGeneration": 0,
-    "policyRef": 286,
+    "policyRef": 291,
     "portableDigest": 0,
     "source": 0
    }
   },
   {
-   "items": 348
+   "items": 353
   },
   {
    "properties": {
-    "groups": 349
+    "groups": 354
    }
   },
   {
@@ -2968,15 +2996,15 @@
    }
   },
   {
-   "items": 351
+   "items": 356
   },
   {
    "properties": {
     "openedAt": 0,
     "pinnedAt": 0,
-    "plan": 350,
+    "plan": 355,
     "runID": 0,
-    "targetRevisions": 352
+    "targetRevisions": 357
    }
   },
   {
@@ -2989,39 +3017,39 @@
    "properties": {
     "index": 0,
     "observedDigest": 0,
-    "policyRef": 286,
-    "shadowedPolicyRef": 354,
+    "policyRef": 291,
+    "shadowedPolicyRef": 359,
     "source": 0
    }
   },
   {
-   "items": 355
+   "items": 360
   },
   {
    "properties": {
-    "policyRef": 286,
+    "policyRef": 291,
     "portableDigest": 0,
     "source": 0
    }
   },
   {
-   "items": 357
+   "items": 362
   },
   {
    "properties": {
     "closedAt": 0,
-    "groups": 358,
+    "groups": 363,
     "openedAt": 0,
     "outcome": 0,
     "runID": 0,
-    "targetRevisions": 352
+    "targetRevisions": 357
    }
   },
   {
    "properties": {
-    "activeRun": 353,
-    "groups": 356,
-    "lastRun": 359
+    "activeRun": 358,
+    "groups": 361,
+    "lastRun": 364
    }
   },
   {
@@ -3043,12 +3071,12 @@
     "compositePhase": 0,
     "currentComponent": 0,
     "lastTransitionTime": 0,
-    "memberFinished": 361,
+    "memberFinished": 366,
     "memberNotReady": 0,
     "message": 0,
     "mixedPairing": 0,
     "name": 0,
-    "observedRatio": 362,
+    "observedRatio": 367,
     "observedSurge": 0,
     "order": 1,
     "phase": 0,
@@ -3058,11 +3086,11 @@
    }
   },
   {
-   "items": 363
+   "items": 368
   },
   {
    "properties": {
-    "groups": 364
+    "groups": 369
    }
   },
   {
@@ -3076,14 +3104,14 @@
    }
   },
   {
-   "items": 366
+   "items": 371
   },
   {
    "properties": {
     "anchor": 0,
     "anchorDesired": 0,
     "conditions": 28,
-    "followers": 367,
+    "followers": 372,
     "mode": 0,
     "source": 0
    }
@@ -3098,23 +3126,23 @@
   },
   {
    "properties": {
-    "address": 299,
-    "addresses": 300,
+    "address": 304,
+    "addresses": 305,
     "annotations": 14,
-    "canary": 305,
-    "components": 312,
-    "conditions": 314,
+    "canary": 310,
+    "components": 317,
+    "conditions": 319,
     "lastRuntimeSyncToken": 0,
-    "migrationHistory": 318,
-    "modelStatus": 322,
-    "mountedOverlays": 324,
+    "migrationHistory": 323,
+    "modelStatus": 327,
+    "mountedOverlays": 329,
     "observedGeneration": 0,
     "pinnedRevisionName": 0,
-    "placement": 347,
-    "rollout": 360,
-    "rolloutCoordination": 365,
-    "scalingPolicy": 368,
-    "traffic": 369,
+    "placement": 352,
+    "rollout": 365,
+    "rolloutCoordination": 370,
+    "scalingPolicy": 373,
+    "traffic": 374,
     "url": 0
    },
    "x-kubernetes-preserve-unknown-fields": true
@@ -3124,14 +3152,89 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 298,
-    "status": 370
+    "spec": 303,
+    "status": 375
+   }
+  },
+  {
+   "properties": {
+    "capacity": 0,
+    "evictionPolicy": 0
+   }
+  },
+  {
+   "properties": {
+    "l1CapacityPerNode": 0
+   }
+  },
+  {
+   "properties": {
+    "config": 378,
+    "name": 0
+   }
+  },
+  {
+   "properties": {
+    "image": 0,
+    "resources": 105
+   }
+  },
+  {
+   "properties": {
+    "name": 0,
+    "nodeSelector": 14,
+    "runner": 380,
+    "runtimeClassName": 0,
+    "tolerations": 107
+   }
+  },
+  {
+   "items": 381
+  },
+  {
+   "properties": {
+    "cache": 377,
+    "deploymentMode": 0,
+    "provider": 379,
+    "workloads": 382
+   }
+  },
+  {
+   "properties": {
+    "configMapRef": 36
+   }
+  },
+  {
+   "properties": {
+    "desiredReplicas": 0,
+    "name": 0,
+    "readyReplicas": 0
+   }
+  },
+  {
+   "items": 385
+  },
+  {
+   "properties": {
+    "conditions": 28,
+    "connection": 384,
+    "observedGeneration": 0,
+    "workloads": 386
+   }
+  },
+  {
+   "properties": {
+    "apiVersion": 0,
+    "kind": 0,
+    "metadata": 0,
+    "spec": 383,
+    "status": 387
    }
   },
   {
    "properties": {
     "blueGreen": 0,
-    "canary": 284,
+    "canary": 289,
     "rollingUpdate": 198
    }
   },
@@ -3148,8 +3251,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 372,
-    "status": 373
+    "spec": 389,
+    "status": 390
    }
   },
   {
@@ -3175,22 +3278,22 @@
   },
   {
    "properties": {
-    "capacity": 375,
+    "capacity": 392,
     "cluster": 0,
     "drainRefs": 1,
     "endpoint": 0,
     "healthy": 0,
-    "probe": 376,
+    "probe": 393,
     "weight": 0
    }
   },
   {
-   "items": 377
+   "items": 394
   },
   {
    "properties": {
     "capacityMode": 0,
-    "entries": 378,
+    "entries": 395,
     "mode": 0,
     "observedISVCGeneration": 0,
     "placementPlanID": 0,
@@ -3212,20 +3315,20 @@
    }
   },
   {
-   "items": 381
+   "items": 398
   },
   {
    "properties": {
     "observedISVCGeneration": 0,
     "planCompatibilityDigest": 0,
-    "targets": 382,
+    "targets": 399,
     "trafficMapGeneration": 0
    }
   },
   {
    "properties": {
     "claimedTargets": 1,
-    "lastPositive": 383,
+    "lastPositive": 400,
     "observedOptionsDigest": 0,
     "publisherName": 0
    }
@@ -3233,10 +3336,10 @@
   {
    "properties": {
     "conditions": 28,
-    "gatewayRef": 380,
+    "gatewayRef": 397,
     "observedTrafficMapGeneration": 0,
     "published": 0,
-    "publisher": 384,
+    "publisher": 401,
     "sourceUID": 0
    }
   },
@@ -3245,8 +3348,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 379,
-    "status": 385
+    "spec": 396,
+    "status": 402
    }
   },
   {
@@ -3258,12 +3361,12 @@
   {
    "properties": {
     "clusterProfileRef": 36,
-    "kubeConfig": 387
+    "kubeConfig": 404
    }
   },
   {
    "properties": {
-    "clusterSource": 388
+    "clusterSource": 405
    }
   },
   {
@@ -3276,8 +3379,8 @@
     "apiVersion": 0,
     "kind": 0,
     "metadata": 0,
-    "spec": 389,
-    "status": 390
+    "spec": 406,
+    "status": 407
    }
   }
  ]

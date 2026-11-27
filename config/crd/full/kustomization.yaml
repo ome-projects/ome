@@ -5,6 +5,7 @@ resources:
   # Keep this list to the core CRDs. AutoscalerPolicy and RolloutPolicy are
   # intentionally excluded because their CRD presence activates optional controllers.
   - ome.io_inferenceservices.yaml
+  - ome.io_kvcachepools.yaml
   - ome.io_inferencereplicas.yaml
   - ome.io_clusterservingruntimes.yaml
   - ome.io_servingruntimes.yaml
