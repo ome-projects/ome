@@ -14,9 +14,10 @@ Service and connection ConfigMap in the pool namespace.
   in the pool. Both workloads must tolerate node taints. The server uses the
   NVIDIA RuntimeClass (`nvidia` by default, configurable with
   `spec.workloads[].runtimeClassName`), sees all GPUs and shares them with
-  vLLM through host IPC. Its Pod runs privileged and uses the host's shared
-  memory. Grant pool write access only to trusted administrators. Keep engines
-  sharing nodes and host IPC within one trust domain.
+  vLLM through host IPC. OME sets `privileged: false` on the server container.
+  The namespace must allow `hostIPC: true` for both the server and vLLM Pods.
+  Grant pool write access only to trusted administrators.
+  Keep engines sharing nodes and host IPC within one trust domain.
 - Use a driver compatible with the two images. The sample pins the CUDA 12.9
   standalone server digest and selects a matching LMCache v0.5.1 client
   image on the vLLM ServingRuntime. The server reserves the per-node L1

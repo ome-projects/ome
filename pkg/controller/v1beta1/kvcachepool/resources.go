@@ -100,8 +100,9 @@ func serverDaemonSet(pool *ome.KVCachePool) (*appsv1.DaemonSet, error) {
 			{Name: "NVIDIA_VISIBLE_DEVICES", Value: "all"},
 			{Name: "NVIDIA_DRIVER_CAPABILITIES", Value: "all"},
 		},
-		Resources:       resources,
-		SecurityContext: &corev1.SecurityContext{Privileged: ptr.To(true)},
+		Resources: resources,
+		// Set false explicitly so existing DaemonSets also drop privileged mode on upgrade.
+		SecurityContext: &corev1.SecurityContext{Privileged: ptr.To(false)},
 		Ports: []corev1.ContainerPort{
 			{Name: "transfer", ContainerPort: kvcache.TransferPort},
 			{Name: "http", ContainerPort: 8080},

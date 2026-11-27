@@ -64,6 +64,12 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 		require.NoError(t, err)
 	}
 	read := func() { t.Helper(); require.NoError(t, cl.Get(ctx, key, pool)) }
+	// Seed a DaemonSet as created and applied by the previous controller.
+	legacy, err := serverDaemonSet(pool)
+	require.NoError(t, err)
+	legacy.Spec.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Privileged: ptr.To(true)}
+	require.NoError(t, cl.Create(ctx, legacy.DeepCopy(), client.FieldOwner("ome-kvcachepool")))
+	require.NoError(t, r.applyChild(ctx, legacy))
 	reconcile()
 	reconcile()
 	read()
@@ -84,6 +90,9 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 	require.NotContains(t, svc.Spec.Selector, kvcache.PoolUIDLabel)
 	require.Equal(t, pool.Spec.Workloads[0].NodeSelector, ds.Spec.Template.Spec.NodeSelector)
 	require.Equal(t, defaultServerImage, ds.Spec.Template.Spec.Containers[0].Image)
+	sc := ds.Spec.Template.Spec.Containers[0].SecurityContext
+	require.NotNil(t, sc)
+	require.Equal(t, ptr.To(false), sc.Privileged)
 	require.True(t, ds.Spec.Template.Spec.HostIPC)
 	require.False(t, ds.Spec.Template.Spec.HostNetwork)
 	require.Equal(t, "nvidia", *ds.Spec.Template.Spec.RuntimeClassName)
@@ -222,12 +231,18 @@ func TestNodeLocalBudgetAndOwnership(t *testing.T) {
 			DeploymentMode: ome.KVCachePoolNodeLocal,
 			Provider: ome.KVCacheProviderSpec{Name: ome.KVCacheProviderLMCache,
 				Config: ome.KVCacheProviderConfig{L1CapacityPerNode: resource.MustParse("512Mi")}},
-			Workloads: []ome.KVCachePoolWorkload{{Name: "server", NodeSelector: map[string]string{"pool": "test"}}},
+			Workloads: []ome.KVCachePoolWorkload{{
+				Name: "server", NodeSelector: map[string]string{"pool": "test"}, RuntimeClassName: "gpu-runtime",
+			}},
 		},
 	}
 	ds, err := serverDaemonSet(pool)
 	require.NoError(t, err)
 	c := ds.Spec.Template.Spec.Containers[0]
+	require.NotNil(t, c.SecurityContext)
+	require.Equal(t, ptr.To(false), c.SecurityContext.Privileged)
+	require.True(t, ds.Spec.Template.Spec.HostIPC)
+	require.Equal(t, "gpu-runtime", ptr.Deref(ds.Spec.Template.Spec.RuntimeClassName, ""))
 	require.Contains(t, c.Args, "0.5")
 	require.Greater(t, c.Resources.Requests.Memory().Cmp(pool.Spec.Provider.Config.L1CapacityPerNode), 0)
 	require.True(t, belongsToPool(ds, pool))
