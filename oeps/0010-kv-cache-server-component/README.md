@@ -1011,9 +1011,8 @@ ome.io/kvcache-provider=<provider-name>
 6. Restrict permission to create and update LMCache pools to administrators
    trusted to deploy GPU-visible servers with host IPC. The NodeLocal server
    uses the workload's `runtimeClassName` (default `nvidia`) for GPU access.
-   OME sets `privileged: false` on the server container, including when
-   reconciling an existing pool. Both the server and the vLLM engine
-   require `hostIPC: true` for CUDA IPC.
+   OME omits `securityContext.privileged` from the server container.
+   Both the server and the vLLM engine require `hostIPC: true` for CUDA IPC.
 
 ### Backward Compatibility
 

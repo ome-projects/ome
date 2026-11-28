@@ -64,12 +64,6 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 		require.NoError(t, err)
 	}
 	read := func() { t.Helper(); require.NoError(t, cl.Get(ctx, key, pool)) }
-	// Seed a DaemonSet as created and applied by the previous controller.
-	legacy, err := serverDaemonSet(pool)
-	require.NoError(t, err)
-	legacy.Spec.Template.Spec.Containers[0].SecurityContext = &corev1.SecurityContext{Privileged: ptr.To(true)}
-	require.NoError(t, cl.Create(ctx, legacy.DeepCopy(), client.FieldOwner("ome-kvcachepool")))
-	require.NoError(t, r.applyChild(ctx, legacy))
 	reconcile()
 	reconcile()
 	read()
@@ -91,8 +85,7 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 	require.Equal(t, pool.Spec.Workloads[0].NodeSelector, ds.Spec.Template.Spec.NodeSelector)
 	require.Equal(t, defaultServerImage, ds.Spec.Template.Spec.Containers[0].Image)
 	sc := ds.Spec.Template.Spec.Containers[0].SecurityContext
-	require.NotNil(t, sc)
-	require.Equal(t, ptr.To(false), sc.Privileged)
+	require.False(t, sc != nil && ptr.Deref(sc.Privileged, false), "the LMCache server must run without privileged mode")
 	require.True(t, ds.Spec.Template.Spec.HostIPC)
 	require.False(t, ds.Spec.Template.Spec.HostNetwork)
 	require.Equal(t, "nvidia", *ds.Spec.Template.Spec.RuntimeClassName)
@@ -239,8 +232,9 @@ func TestNodeLocalBudgetAndOwnership(t *testing.T) {
 	ds, err := serverDaemonSet(pool)
 	require.NoError(t, err)
 	c := ds.Spec.Template.Spec.Containers[0]
-	require.NotNil(t, c.SecurityContext)
-	require.Equal(t, ptr.To(false), c.SecurityContext.Privileged)
+	if c.SecurityContext != nil {
+		require.Nil(t, c.SecurityContext.Privileged, "the server template should omit privileged")
+	}
 	require.True(t, ds.Spec.Template.Spec.HostIPC)
 	require.Equal(t, "gpu-runtime", ptr.Deref(ds.Spec.Template.Spec.RuntimeClassName, ""))
 	require.Contains(t, c.Args, "0.5")

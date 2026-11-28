@@ -14,7 +14,7 @@ Service and connection ConfigMap in the pool namespace.
   in the pool. Both workloads must tolerate node taints. The server uses the
   NVIDIA RuntimeClass (`nvidia` by default, configurable with
   `spec.workloads[].runtimeClassName`), sees all GPUs and shares them with
-  vLLM through host IPC. OME sets `privileged: false` on the server container.
+  vLLM through host IPC. OME leaves `privileged` unset on the server container.
   The namespace must allow `hostIPC: true` for both the server and vLLM Pods.
   Grant pool write access only to trusted administrators.
   Keep engines sharing nodes and host IPC within one trust domain.
