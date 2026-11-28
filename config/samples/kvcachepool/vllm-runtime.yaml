@@ -1,0 +1,46 @@
+apiVersion: ome.io/v1beta1
+kind: ServingRuntime
+metadata:
+  name: vllm-lmcache-mp
+spec:
+  supportedModelFormats:
+    - modelFormat:
+        name: safetensors
+        version: "1.0.0"
+      modelArchitecture: Qwen2ForCausalLM
+      autoSelect: false
+  kvCacheConnectors:
+    - provider: LMCache
+      deploymentModes: [NodeLocal]
+      components:
+        engine:
+          connectorConfig:
+            connectorClass: LMCacheMPConnector
+  engineConfig:
+    hostIPC: true
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+    runner:
+      name: ome-container
+      image: lmcache/vllm-openai:v0.5.1-cu129
+      command: [vllm, serve]
+      args:
+        - $(MODEL_PATH)
+        - --served-model-name
+        - qwen
+        - --port
+        - "8080"
+        - --max-model-len
+        - "4096"
+      resources:
+        limits:
+          nvidia.com/gpu: "1"
+      ports:
+        - name: http1
+          containerPort: 8080
+      readinessProbe:
+        httpGet:
+          path: /health
+          port: 8080

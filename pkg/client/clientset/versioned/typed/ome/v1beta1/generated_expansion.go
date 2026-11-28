@@ -22,6 +22,8 @@ type InferenceReplicaExpansion interface{}
 
 type InferenceServiceExpansion interface{}
 
+type KVCachePoolExpansion interface{}
+
 type ServingRuntimeExpansion interface{}
 
 type TrafficMapExpansion interface{}

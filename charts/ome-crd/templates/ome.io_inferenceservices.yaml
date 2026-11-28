@@ -617,6 +617,26 @@ spec:
                 type: object
               engine:
 {{- include "ome-crd.schema.d899cc2d59bf" . | nindent 16 }}
+              kvCachePool:
+                properties:
+                  apiGroup:
+                    default: ome.io
+                    enum:
+                    - ome.io
+                    type: string
+                  kind:
+                    default: KVCachePool
+                    enum:
+                    - KVCachePool
+                    type: string
+                  name:
+                    maxLength: 253
+                    minLength: 1
+                    pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                    type: string
+                required:
+                - name
+                type: object
               model:
                 properties:
                   apiGroup:

@@ -62,6 +62,14 @@ type InferenceServiceListerExpansion interface{}
 // InferenceServiceNamespaceLister.
 type InferenceServiceNamespaceListerExpansion interface{}
 
+// KVCachePoolListerExpansion allows custom methods to be added to
+// KVCachePoolLister.
+type KVCachePoolListerExpansion interface{}
+
+// KVCachePoolNamespaceListerExpansion allows custom methods to be added to
+// KVCachePoolNamespaceLister.
+type KVCachePoolNamespaceListerExpansion interface{}
+
 // ServingRuntimeListerExpansion allows custom methods to be added to
 // ServingRuntimeLister.
 type ServingRuntimeListerExpansion interface{}

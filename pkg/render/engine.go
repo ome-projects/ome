@@ -31,6 +31,11 @@ func RenderEngine(ctx context.Context, p *Piece, service *v1beta1.InferenceServi
 	if err != nil {
 		return Rendered{}, err
 	}
+	if service.Spec.KVCachePool != nil {
+		if err := bindCache(ctx, p, service, spec, primary, &meta); err != nil {
+			return Rendered{}, &CacheBindingError{Cause: err}
+		}
+	}
 	worker, err := EngineWorkerPodSpec(p, service, spec, &meta)
 	if err != nil {
 		return Rendered{}, err

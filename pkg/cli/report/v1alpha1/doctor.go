@@ -173,6 +173,7 @@ func DoctorAPICatalog() []DoctorAPI {
 	add("ome.io/v1beta1", "clusterbasemodels", "ClusterBaseModel", false, true)
 	add("ome.io/v1beta1", "clusterservingruntimes", "ClusterServingRuntime", false, true)
 	add("ome.io/v1beta1", "inferencereplicas", "InferenceReplica", true, false)
+	add("ome.io/v1beta1", "kvcachepools", "KVCachePool", true, false)
 	add("ome.io/v1beta1", "autoscalerpolicies", "AutoscalerPolicy", true, false)
 	add("ome.io/v1beta1", "rolloutpolicies", "RolloutPolicy", true, false)
 	add("ome.io/v1beta1", "trafficmaps", "TrafficMap", true, false)

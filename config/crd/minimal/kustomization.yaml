@@ -3,6 +3,7 @@ kind: Kustomization
 
 resources:
   - ome.io_inferenceservices.yaml
+  - ome.io_kvcachepools.yaml
   - ome.io_clusterservingruntimes.yaml
   - ome.io_servingruntimes.yaml
   - ome.io_basemodels.yaml

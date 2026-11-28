@@ -349,6 +349,9 @@ const (
 const (
 	// EngineReady is set when engine pods are ready.
 	EngineReady apis.ConditionType = "EngineReady"
+	// KVCacheConfigured reports whether the required pool connection was
+	// rendered into the engine workload. It does not measure cache hits.
+	KVCacheConfigured apis.ConditionType = "KVCacheConfigured"
 	// DecoderReady is set when decoder pods are ready.
 	DecoderReady apis.ConditionType = "DecoderReady"
 	// EncoderReady is set when encoder pods are ready. Like DecoderReady, it
@@ -559,6 +562,9 @@ func readyConditionsBesideTheEngine() []apis.ConditionType {
 // its own.
 func (ss *InferenceServiceStatus) readyConditionSet(writing apis.ConditionType) apis.ConditionSet {
 	dependents := []apis.ConditionType{IngressReady, EngineReady}
+	if writing == KVCacheConfigured || ss.Status.GetCondition(KVCacheConfigured) != nil {
+		dependents = append(dependents, KVCacheConfigured)
+	}
 	for _, t := range optionalComponentReadyConditions {
 		if t == writing || ss.Status.GetCondition(t) != nil {
 			dependents = append(dependents, t)

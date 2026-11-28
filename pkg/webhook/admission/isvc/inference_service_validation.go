@@ -168,6 +168,9 @@ func (v *InferenceServiceValidator) ValidateCreate(ctx context.Context, isvc *v1
 	if err := v.validateReplicaRefs(ctx, nil, isvc); err != nil {
 		return nil, err
 	}
+	if err := v.validateNewPoolRef(ctx, nil, isvc); err != nil {
+		return nil, err
+	}
 	warnings, err := v.validateInferenceService(ctx, isvc)
 	if err != nil {
 		return warnings, err
@@ -221,6 +224,9 @@ func (v *InferenceServiceValidator) ValidateUpdate(ctx context.Context, oldIsvc,
 		return nil, err
 	}
 	if err := v.validateReplicaRefs(ctx, oldIsvc, isvc); err != nil {
+		return nil, err
+	}
+	if err := v.validateNewPoolRef(ctx, oldIsvc, isvc); err != nil {
 		return nil, err
 	}
 	// Ratchet: only a newly-set or changed scaling policy is validated,
@@ -421,8 +427,47 @@ func placementMaxSurgeWarnings(isvc *v1beta1.InferenceService) admission.Warning
 	return admission.Warnings{"spec.placement.maxSurge is deprecated and ignored; a placement move may hold one extra full copy of the desired allocation"}
 }
 
+// A forward reference may wait for pool creation. Once deletion starts, no
+// new consumer should extend the lifetime of the retiring pool.
+func (v *InferenceServiceValidator) validateNewPoolRef(ctx context.Context, old, current *v1beta1.InferenceService) error {
+	ref := current.Spec.KVCachePool
+	if ref == nil || (old != nil && old.Spec.KVCachePool != nil && old.Spec.KVCachePool.Name == ref.Name) {
+		return nil
+	}
+	reader := v.Reader
+	if reader == nil {
+		reader = v.Client
+	}
+	if reader == nil {
+		return fmt.Errorf("spec.kvCachePool cannot be checked without a Kubernetes client")
+	}
+	var pool v1beta1.KVCachePool
+	if err := reader.Get(ctx, client.ObjectKey{Namespace: current.Namespace, Name: ref.Name}, &pool); err != nil {
+		return client.IgnoreNotFound(err)
+	}
+	if !pool.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("spec.kvCachePool references terminating pool %q", pool.Name)
+	}
+	return nil
+}
+
 func (v *InferenceServiceValidator) validateInferenceService(ctx context.Context, isvc *v1beta1.InferenceService) (admission.Warnings, error) {
 	var allWarnings admission.Warnings
+
+	if isvc.Spec.KVCachePool != nil {
+		spec := &isvc.Spec
+		modeAnnotation := isvc.Annotations[constants.DeploymentMode]
+		if (spec.DeploymentMode != nil && *spec.DeploymentMode != constants.RawDeployment) ||
+			(modeAnnotation != "" && modeAnnotation != string(constants.RawDeployment)) {
+			return nil, fmt.Errorf("spec.kvCachePool requires RawDeployment")
+		}
+		if spec.Placement != nil || spec.ReplicaRefs != nil {
+			return nil, fmt.Errorf("spec.kvCachePool requires an engine deployed by this service in its own namespace")
+		}
+		if spec.Decoder != nil || spec.Encoder != nil || (spec.Engine != nil && (spec.Engine.Leader != nil || spec.Engine.Worker != nil)) {
+			return nil, fmt.Errorf("spec.kvCachePool supports a single-pod engine without separate decoder or encoder components")
+		}
+	}
 
 	if err := validation.ValidateInferenceServiceName(isvc.Name); err != nil {
 		return allWarnings, err

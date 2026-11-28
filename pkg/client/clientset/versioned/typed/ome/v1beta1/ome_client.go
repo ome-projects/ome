@@ -22,6 +22,7 @@ type OmeV1beta1Interface interface {
 	FineTunedWeightsGetter
 	InferenceReplicasGetter
 	InferenceServicesGetter
+	KVCachePoolsGetter
 	ServingRuntimesGetter
 	TrafficMapsGetter
 	WorkloadClustersGetter
@@ -70,6 +71,10 @@ func (c *OmeV1beta1Client) InferenceReplicas(namespace string) InferenceReplicaI
 
 func (c *OmeV1beta1Client) InferenceServices(namespace string) InferenceServiceInterface {
 	return newInferenceServices(c, namespace)
+}
+
+func (c *OmeV1beta1Client) KVCachePools(namespace string) KVCachePoolInterface {
+	return newKVCachePools(c, namespace)
 }
 
 func (c *OmeV1beta1Client) ServingRuntimes(namespace string) ServingRuntimeInterface {

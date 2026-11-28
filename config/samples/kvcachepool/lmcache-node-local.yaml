@@ -1,0 +1,20 @@
+apiVersion: ome.io/v1beta1
+kind: KVCachePool
+metadata:
+  name: lmcache-node-local
+spec:
+  provider:
+    name: LMCache
+    config:
+      l1CapacityPerNode: 60Gi
+  deploymentMode: NodeLocal
+  workloads:
+    - name: server
+      runner:
+        image: lmcache/standalone:v0.5.1-cu129@sha256:c64d5704427e0c21e8b12d460f01a6cf33971ee2fdee2fbced268e4aa10d7d12
+      nodeSelector:
+        node-type: gpu
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule

@@ -29497,6 +29497,49 @@ spec:
                   x-kubernetes-list-map-keys:
                     - name
                   x-kubernetes-list-type: map
+                kvCacheConnectors:
+                  items:
+                    properties:
+                      components:
+                        properties:
+                          engine:
+                            properties:
+                              connectorConfig:
+                                properties:
+                                  connectorClass:
+                                    enum:
+                                      - LMCacheMPConnector
+                                    type: string
+                                required:
+                                  - connectorClass
+                                type: object
+                            required:
+                              - connectorConfig
+                            type: object
+                        required:
+                          - engine
+                        type: object
+                      deploymentModes:
+                        items:
+                          enum:
+                            - NodeLocal
+                          type: string
+                        minItems: 1
+                        type: array
+                        x-kubernetes-list-type: set
+                      provider:
+                        enum:
+                          - LMCache
+                        type: string
+                    required:
+                      - components
+                      - deploymentModes
+                      - provider
+                    type: object
+                  type: array
+                  x-kubernetes-list-map-keys:
+                    - provider
+                  x-kubernetes-list-type: map
                 labels:
                   additionalProperties:
                     type: string

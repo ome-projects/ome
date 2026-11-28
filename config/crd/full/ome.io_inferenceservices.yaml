@@ -28274,6 +28274,26 @@ spec:
                           x-kubernetes-list-type: map
                       type: object
                   type: object
+                kvCachePool:
+                  properties:
+                    apiGroup:
+                      default: ome.io
+                      enum:
+                        - ome.io
+                      type: string
+                    kind:
+                      default: KVCachePool
+                      enum:
+                        - KVCachePool
+                      type: string
+                    name:
+                      maxLength: 253
+                      minLength: 1
+                      pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                      type: string
+                  required:
+                    - name
+                  type: object
                 model:
                   properties:
                     apiGroup:

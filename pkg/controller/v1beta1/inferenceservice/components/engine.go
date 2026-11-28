@@ -7,6 +7,7 @@ import (
 	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	knapis "knative.dev/pkg/apis"
 	ctrl "sigs.k8s.io/controller-runtime"
 
 	"sigs.k8s.io/ome/pkg/apis/ome/v1beta1"
@@ -94,6 +95,12 @@ func (e *Engine) Reconcile(ctx context.Context, isvc *v1beta1.InferenceService) 
 	deploymentResult, err := e.reconcileDeployment(ctx, isvc, objectMeta, podSpec, size, workerPodSpec, pdbRequest)
 	if err != nil {
 		return deploymentResult, err
+	}
+	if isvc.Spec.KVCachePool != nil {
+		isvc.Status.SetCondition(v1beta1.KVCacheConfigured, &knapis.Condition{
+			Type: v1beta1.KVCacheConfigured, Status: v1.ConditionTrue, Reason: "EngineConfigured",
+			Message: "The engine workload uses the connection from KVCachePool " + isvc.Spec.KVCachePool.Name,
+		})
 	}
 
 	// Per-Component stable Service + PodMonitor for OMENative. Inlined

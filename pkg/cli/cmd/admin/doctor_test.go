@@ -523,7 +523,7 @@ func TestDoctorProductionCollectorEmitsOnlyFixedExactGETs(t *testing.T) {
 			if err := json.Unmarshal(data, &value); err != nil {
 				t.Fatal(err)
 			}
-			if len(value.Content.APIs) != 27 || value.Content.HasViolations() {
+			if len(value.Content.APIs) != 28 || value.Content.HasViolations() {
 				t.Fatal("wrong production discovery projection")
 			}
 			for _, api := range value.Content.APIs {
