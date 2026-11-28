@@ -10,11 +10,16 @@ Install the OME CRDs and manager from this branch. Creating the pool starts
 one LMCache server per selected node. OME creates the DaemonSet, ClusterIP
 Service and connection ConfigMap in the pool namespace.
 
+- Before creating the pool, run `kubectl get runtimeclass nvidia`. The server
+  Pod requests this class whenever `spec.workloads[].runtimeClassName` is
+  omitted or empty. If your NVIDIA RuntimeClass has a different name, set
+  that field to its name. The named RuntimeClass must exist and its handler
+  must be configured on every selected node, even if NVIDIA is already the
+  node's default runtime.
 - Label the intended NVIDIA GPU nodes and set their selector and tolerations
-  in the pool. Both workloads must tolerate node taints. The server uses the
-  NVIDIA RuntimeClass (`nvidia` by default, configurable with
-  `spec.workloads[].runtimeClassName`), sees all GPUs and shares them with
-  vLLM through host IPC. OME leaves `privileged` unset on the server container.
+  in the pool. Both workloads must tolerate node taints. The server sees all
+  GPUs and shares them with vLLM through host IPC. OME leaves `privileged`
+  unset on the server container.
   The namespace must allow `hostIPC: true` for both the server and vLLM Pods.
   Grant pool write access only to trusted administrators.
   Keep engines sharing nodes and host IPC within one trust domain.

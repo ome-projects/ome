@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 
+	"github.com/distribution/reference"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -43,6 +44,9 @@ func serverDaemonSet(pool *ome.KVCachePool) (*appsv1.DaemonSet, error) {
 	resources := corev1.ResourceRequirements{}
 	if runner := workload.Runner; runner != nil {
 		if runner.Image != "" {
+			if _, err := reference.ParseNormalizedNamed(runner.Image); err != nil {
+				return nil, fmt.Errorf("invalid server runner.image %q: %w", runner.Image, err)
+			}
 			image = runner.Image
 		}
 		if runner.Resources != nil {

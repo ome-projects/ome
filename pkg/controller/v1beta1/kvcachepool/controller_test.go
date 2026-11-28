@@ -55,6 +55,8 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 	unsupported.Name = "unsupported-mode"
 	unsupported.Spec.DeploymentMode = "Unsupported"
 	require.True(t, apierrors.IsInvalid(cl.Create(ctx, unsupported)))
+	sampleImage := pool.Spec.Workloads[0].Runner.Image
+	pool.Spec.Workloads[0].Runner.Image = "example.invalid/LMCache:test"
 	require.NoError(t, cl.Create(ctx, pool))
 	key := client.ObjectKeyFromObject(pool)
 	r := Reconciler{cl, cl}
@@ -73,6 +75,15 @@ func TestLMCachePoolLifecycle(t *testing.T) {
 	ds := &appsv1.DaemonSet{}
 	svc := &corev1.Service{}
 	cm := &corev1.ConfigMap{}
+	ready := meta.FindStatusCondition(pool.Status.Conditions, "Ready")
+	require.NotNil(t, ready)
+	require.Equal(t, "InvalidSpec", ready.Reason)
+	require.Contains(t, ready.Message, "runner.image")
+	require.True(t, apierrors.IsNotFound(cl.Get(ctx, childKey, ds)))
+	pool.Spec.Workloads[0].Runner.Image = sampleImage
+	require.NoError(t, cl.Update(ctx, pool))
+	reconcile()
+	read()
 	require.NoError(t, cl.Get(ctx, childKey, ds))
 	require.NoError(t, cl.Get(ctx, childKey, svc))
 	require.NoError(t, cl.Get(ctx, cmKey, cm))
@@ -232,6 +243,7 @@ func TestNodeLocalBudgetAndOwnership(t *testing.T) {
 	ds, err := serverDaemonSet(pool)
 	require.NoError(t, err)
 	c := ds.Spec.Template.Spec.Containers[0]
+	require.Equal(t, defaultServerImage, c.Image)
 	if c.SecurityContext != nil {
 		require.Nil(t, c.SecurityContext.Privileged, "the server template should omit privileged")
 	}
